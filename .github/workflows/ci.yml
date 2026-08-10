@@ -1,0 +1,69 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  # --- userspace: daemon + mock, no kernel module and no root needed ---
+  userspace:
+    name: userspace build + mock suite
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build with warnings-as-errors, run the full mock suite
+        run: make ci
+
+      - name: Shellcheck the shell scripts
+        run: |
+          command -v shellcheck >/dev/null 2>&1 || \
+            { sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck; }
+          shellcheck test.sh diag.sh test/mock_test.sh
+
+  # --- kernel module: compile smoke test against a pinned modern tree ---
+  # The module targets kernels >= 6.12 (uses sized_strscpy, the _noprof
+  # allocators, for_class_mod_mem_type, maple-tree VMA iteration).  CI
+  # prepares a linux-6.12 LTS source tree with defconfig and builds the LKM
+  # against it, so the build is deterministic and independent of the runner's
+  # own (older) kernel headers.
+  module:
+    name: kernel module build (linux-6.12 headers)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq bc flex bison libelf-dev libssl-dev dwarves
+
+      - name: Fetch and prepare kernel headers (6.12 LTS, x86_64)
+        run: |
+          curl -fsSL https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.12.tar.xz | tar -xJ
+          make -C linux-6.12 ARCH=x86_64 defconfig
+          make -C linux-6.12 ARCH=x86_64 scripts
+          make -C linux-6.12 ARCH=x86_64 modules_prepare
+
+      - name: Build the LKM
+        run: |
+          # First pass compiles the module; the final modpost link fails only
+          # because the prepared tree has no Module.symvers.  Synthesize one
+          # from the object's undefined symbols so the link (a compile smoke
+          # test) succeeds.  Real load-time symbol resolution is validated on
+          # a live kernel (see diag.sh).
+          make KDIR="$PWD/linux-6.12" module 2>&1 | tail -3 || true
+          nm -u src/anticheat_module.o | awk '{print $2}' | sort -u | \
+            awk '{printf "0x00000000\t%s\tvmlinux\tEXPORT_SYMBOL\t\n", $1}' \
+            > "$PWD/ksymvers"
+          make KDIR="$PWD/linux-6.12" KBUILD_EXTRA_SYMBOLS="$PWD/ksymvers" module
+          test -s anticheat.ko
+          modinfo ./anticheat.ko | head -6
+
+      - name: Upload module artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: anticheat-ko
+          path: anticheat.ko
+          if-no-files-found: error
