@@ -168,9 +168,9 @@ static void do_scan(int pid)
         if (strchr(perms, 'r'))
             flags |= 0x1;   /* VM_READ */
         if (strchr(perms, 'w'))
-            flags |= 0x2;   /* VM_WRITE */
+            flags |= AC_VM_WRITE;   /* VM_WRITE */
         if (strchr(perms, 'x'))
-            flags |= 0x4;   /* VM_EXEC */
+            flags |= AC_VM_EXEC;     /* VM_EXEC */
         vi.start = start;
         vi.end = end;
         vi.offset = off;
@@ -295,9 +295,9 @@ static int do_ioctl(unsigned long req, void *arg)
         b->rwx_count = 0;
         b->exec_count = 0;
         for (i = 0; i < snap_n; i++) {
-            if (snap[i].flags & 0x4)
+            if (snap[i].flags & AC_VM_EXEC)
                 b->exec_count++;
-            if ((snap[i].flags & 0x6) == 0x6)
+            if ((snap[i].flags & (AC_VM_WRITE | AC_VM_EXEC)) == (AC_VM_WRITE | AC_VM_EXEC))
                 b->rwx_count++;
         }
         b->truncated = 0;

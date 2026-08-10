@@ -211,8 +211,9 @@ To run the same userspace checks locally: `make ci`.
   to log-and-deny only.
 - `lock` pins the module globally, not per-fd: the pin intentionally survives
   the locking process exiting or crashing (that is the point of the panic
-  button). Recovery is always possible — any privileged caller can run
-  `anticheat unlock`, which balances the count and releases the reference.
+  button). If the locking daemon crashes or is killed without unlocking,
+  run `sudo ./anticheat unlock` from any privileged shell — it balances the
+  global count and releases the reference so `rmmod` succeeds again.
 - The device checks `CAP_SYS_ADMIN` at `open()` only. Do not pass an open
   fd to an unprivileged process (SCM_RIGHTS, inherited fds): the receiver
   would get full ioctl access. The daemon/CLI never does this.
