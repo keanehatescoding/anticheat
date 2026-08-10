@@ -742,10 +742,15 @@ static int cmd_start(int argc, char **argv)
             die("fork: %s", strerror(errno));
         if (pid > 0)
             _exit(0);
-        chdir("/");
-        freopen("/dev/null", "r", stdin);
-        freopen("/var/log/anticheat.log", "a", stdout);
-        freopen("/var/log/anticheat.log", "a", stderr);
+        /* best-effort daemonization; failures are not fatal */
+        if (chdir("/") < 0)
+            fprintf(stderr, "daemon: chdir failed: %s\n", strerror(errno));
+        if (!freopen("/dev/null", "r", stdin))
+            fprintf(stderr, "daemon: stdin redirect failed\n");
+        if (!freopen("/var/log/anticheat.log", "a", stdout))
+            fprintf(stderr, "daemon: stdout redirect failed\n");
+        if (!freopen("/var/log/anticheat.log", "a", stderr))
+            fprintf(stderr, "daemon: stderr redirect failed\n");
     }
 
     openlog("anticheat", LOG_PID | LOG_NDELAY, LOG_AUTH);
