@@ -68,7 +68,8 @@ static void load_state(void)
     memset(&S, 0, sizeof(S));
     f = fopen(state_path, "rb");
     if (f) {
-        (void)fread(&S, sizeof(S), 1, f);
+        if (fread(&S, sizeof(S), 1, f) != 1)
+            memset(&S, 0, sizeof(S));   /* empty/corrupt state: start fresh */
         fclose(f);
     }
 }
@@ -78,7 +79,12 @@ static void save_state(void)
     FILE *f = fopen(state_path, "wb");
 
     if (f) {
-        (void)fwrite(&S, sizeof(S), 1, f);
+        if (fwrite(&S, sizeof(S), 1, f) != 1) {
+            /* short write: drop the partial state; load_state resets
+             * corrupt files, so a failed unlink is harmless */
+            int rc = unlink(state_path);
+            (void)rc;
+        }
         fclose(f);
     }
 }
