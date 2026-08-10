@@ -3,7 +3,7 @@
 # Requires root (loads a kernel module). Run:  sudo ./test.sh
 set -u
 
-cd "$(dirname "$0")"
+cd "$(dirname "$0")" || exit 1
 VICTIM_PID=""
 FAILED=0
 
@@ -11,6 +11,8 @@ say()  { printf '\033[1;34m[TEST]\033[0m %s\n' "$*"; }
 ok()   { printf '\033[1;32m  PASS\033[0m  %s\n' "$*"; }
 bad()  { printf '\033[1;31m  FAIL\033[0m  %s\n' "$*"; FAILED=1; }
 
+# cleanup is invoked via trap below; shellcheck cannot always see that
+# shellcheck disable=SC2317,SC2329
 cleanup() {
     [ -n "$VICTIM_PID" ] && kill "$VICTIM_PID" 2>/dev/null
     sleep 0.2
@@ -35,12 +37,16 @@ say "syscall table integrity"
 if ./anticheat syscalls; then ok "syscall table clean"; else bad "syscall check"; fi
 
 say "module enumeration"
-./anticheat modules >/dev/null && ok "modules listed" || bad "modules"
+if ./anticheat modules >/dev/null; then ok "modules listed"; else bad "modules"; fi
 
 say "protecting a victim process (a bash that will fork a child)"
 bash -c 'sleep 300 & echo $! > /tmp/ac_child.pid; wait' &
 VICTIM_PID=$!
-./anticheat protect --pid "$VICTIM_PID" >/dev/null && ok "protected pid $VICTIM_PID" || bad "protect"
+if ./anticheat protect --pid "$VICTIM_PID" >/dev/null; then
+    ok "protected pid $VICTIM_PID"
+else
+    bad "protect"
+fi
 
 say "fork inheritance: child of protected process should inherit"
 sleep 0.5
@@ -70,23 +76,31 @@ if printf '%s' "$EVENTS" | grep -q "PTRACE-DENIED"; then ok "PTRACE-DENIED event
 if printf '%s' "$EVENTS" | grep -q "FORK"; then ok "FORK event logged"; else bad "no fork event"; fi
 
 say "memory scan (RWX detection)"
-./anticheat scan --pid "$VICTIM_PID" >/dev/null && ok "scan ok" || bad "scan"
+if ./anticheat scan --pid "$VICTIM_PID" >/dev/null; then ok "scan ok"; else bad "scan"; fi
 
 say "memory integrity baseline"
-./anticheat scan --pid "$VICTIM_PID" --hash --save >/dev/null 2>&1 && ok "baseline saved" || bad "baseline save"
-./anticheat scan --pid "$VICTIM_PID" --hash --check >/dev/null 2>&1 && ok "baseline verified" || bad "baseline check"
+if ./anticheat scan --pid "$VICTIM_PID" --hash --save >/dev/null 2>&1; then
+    ok "baseline saved"
+else
+    bad "baseline save"
+fi
+if ./anticheat scan --pid "$VICTIM_PID" --hash --check >/dev/null 2>&1; then
+    ok "baseline verified"
+else
+    bad "baseline check"
+fi
 
 say "unprotect + cleanup"
-./anticheat unprotect --pid "$VICTIM_PID" >/dev/null && ok "unprotected" || bad "unprotect"
+if ./anticheat unprotect --pid "$VICTIM_PID" >/dev/null; then ok "unprotected"; else bad "unprotect"; fi
 [ -n "$CHILD_PID" ] && kill "$CHILD_PID" 2>/dev/null
 
 say "locking the module (rmmod must fail while locked)"
-./anticheat lock >/dev/null && ok "locked" || bad "lock"
+if ./anticheat lock >/dev/null; then ok "locked"; else bad "lock"; fi
 if rmmod anticheat 2>/dev/null; then bad "rmmod succeeded while locked"; else ok "rmmod correctly refused"; fi
-./anticheat unlock >/dev/null && ok "unlocked" || bad "unlock"
+if ./anticheat unlock >/dev/null; then ok "unlocked"; else bad "unlock"; fi
 
 say "unloading"
-rmmod anticheat && ok "module unloaded" || bad "rmmod"
+if rmmod anticheat; then ok "module unloaded"; else bad "rmmod"; fi
 
 echo
 if [ "$FAILED" -eq 0 ]; then

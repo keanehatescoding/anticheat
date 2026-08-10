@@ -10,7 +10,7 @@
 # Build:  make test-mock
 set -u
 
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/.." || exit 1
 
 export LD_PRELOAD="$PWD/test/libmock_anticheat.so"
 export AC_MOCK_ROOT=1
@@ -47,6 +47,8 @@ mkdir -p "$AC_BASELINE_DIR"
 
 # scan + hash the anticheat binary *itself*: after `exec`, the process is the
 # scanner, so /proc/PID/mem is readable without ptrace privileges (yama scope).
+# $BASHPID must expand inside the daemon's eval'd context, not here
+# shellcheck disable=SC2016
 SELFSCAN='exec ./anticheat scan --pid $BASHPID'
 
 echo "== basic CLI =="
@@ -102,11 +104,17 @@ echo "== monitoring daemon (start --foreground) =="
 # SIGTERM is rc=0, a hang is caught by -k (SIGKILL -> 137).
 out=$(timeout -k 2 --preserve-status 4 env AC_MOCK_ATTACK=1 ./anticheat start --foreground 2>&1)
 rc=$?
-[ "$rc" -eq 0 ] && pass "start: clean exit on SIGTERM" || fail "start (rc=$rc)"
-printf '%s' "$out" | grep -q "PTRACE-DENIED" && pass "start: PTRACE alert logged" \
-    || fail "start: no PTRACE alert"
-printf '%s' "$out" | grep -q "hidden from /proc/modules" && pass "start: hidden-module alert" \
-    || fail "start: no hidden-module alert"
+if [ "$rc" -eq 0 ]; then pass "start: clean exit on SIGTERM"; else fail "start (rc=$rc)"; fi
+if printf '%s' "$out" | grep -q "PTRACE-DENIED"; then
+    pass "start: PTRACE alert logged"
+else
+    fail "start: no PTRACE alert"
+fi
+if printf '%s' "$out" | grep -q "hidden from /proc/modules"; then
+    pass "start: hidden-module alert"
+else
+    fail "start: no hidden-module alert"
+fi
 
 echo
 if [ "$FAIL" -eq 0 ]; then

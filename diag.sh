@@ -3,7 +3,7 @@
 # Shows which kprobes registered, the resolved text bounds, the syscall
 # table discovery result, and the failing commands' real output.
 set -u
-cd "$(dirname "$0")"
+cd "$(dirname "$0")" || exit 1
 
 echo "== environment =="
 echo "kernel: $(uname -r) $(uname -v)"
@@ -73,6 +73,6 @@ echo "== dmesg: post-attempt =="
 dmesg | tail -30 | grep -iE "anticheat|probe|kprobe|ptrace|kill" | tail -15
 
 ./anticheat unprotect --pid $V >/dev/null 2>&1
-kill $V $C 2>/dev/null
+kill "$V" "$C" 2>/dev/null
 rmmod anticheat 2>/dev/null
 echo "== done =="
