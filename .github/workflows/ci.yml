@@ -11,7 +11,7 @@ jobs:
     name: userspace build + mock suite
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Build with warnings-as-errors, run the full mock suite
         run: make ci
@@ -32,7 +32,7 @@ jobs:
     name: kernel module build (linux-6.12 headers)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install toolchain
         run: |
