@@ -37,6 +37,7 @@
 #include <linux/mm.h>
 #include <linux/mmap_lock.h>
 #include <linux/kprobes.h>
+#include <linux/mutex.h>
 #include <linux/slab.h>
 #include <linux/spinlock.h>
 #include <linux/string.h>
@@ -288,8 +289,11 @@ static unsigned long ac_find_syscall_table(void)
         }
     }
 
-    /* Fallback: classic backward scan from the read handler. */
-    for (addr = rh; addr > rh - 0x100000UL; addr -= sizeof(unsigned long)) {
+    /* Fallback: backward scan from the read handler.  Rarely taken (the
+     * table is normally right after .text), so mirror the forward window
+     * rather than skimping on it: some layouts place the table below the
+     * first handler. */
+    for (addr = rh; addr > rh - 0x2000000UL; addr -= sizeof(unsigned long)) {
         if (ac_kread(&v1, (void *)addr, sizeof(v1)))
             continue;
         if (v1 != rh)
@@ -607,9 +611,12 @@ static int ac_ptrace_pre(struct kprobe *p, struct pt_regs *regs)
     bool deny = false, kill = false;
 
     if (request == PTRACE_TRACEME) {
-        /* the protected process itself asks to be traced */
+        /* the protected process itself asks to be traced; PTRACE_TRACEME
+         * ignores its arguments, so args->si holds whatever was in the
+         * register — report current->pid, not stale garbage */
         if (ac_is_protected_task(current)) {
             strscpy(tcomm, current->comm, sizeof(tcomm));
+            target = current->pid;
             deny = true;
         }
     } else if (target > 0) {
@@ -713,7 +720,8 @@ static struct kprobe *ac_kprobes[] = {
     &ac_kp_ptrace, &ac_kp_ptrace32,
     &ac_kp_exit, &ac_kp_execve, &ac_kp_execveat,
 };
-static unsigned int ac_kprobes_registered;
+static bool ac_kp_ok[ARRAY_SIZE(ac_kprobes)];  /* per-slot registration state */
+static unsigned int ac_kprobes_registered;     /* count, for the log line */
 
 static void ac_register_kprobes(void)
 {
@@ -722,6 +730,7 @@ static void ac_register_kprobes(void)
     for (i = 0; i < ARRAY_SIZE(ac_kprobes); i++) {
         int ret = register_kprobe(ac_kprobes[i]);
 
+        ac_kp_ok[i] = (ret == 0);
         if (ret == 0) {
             ac_kprobes_registered++;
         } else if (ac_verbose) {
@@ -739,9 +748,13 @@ static void ac_unregister_kprobes(void)
 {
     unsigned int i;
 
-    for (i = 0; i < ac_kprobes_registered; i++)
-        unregister_kprobe(ac_kprobes[i]);
+    /* unregister only the probes that actually registered: a failed probe
+     * (e.g. no IA32 support) must not be passed to unregister_kprobe() */
+    for (i = 0; i < ARRAY_SIZE(ac_kprobes); i++)
+        if (ac_kp_ok[i])
+            unregister_kprobe(ac_kprobes[i]);
     ac_kprobes_registered = 0;
+    memset(ac_kp_ok, 0, sizeof(ac_kp_ok));
     if (ac_kp_clone_ok) {
         unregister_kretprobe(&ac_kp_clone);
         ac_kp_clone_ok = false;
@@ -752,6 +765,9 @@ static void ac_unregister_kprobes(void)
 /* VMA scan (snapshot per file-description)                            */
 /* ------------------------------------------------------------------ */
 struct ac_fd_state {
+    struct mutex lock;          /* serializes SCAN/MODS snapshot access:
+                                 * a shared/dup'd fd must not race a GET
+                                 * against a concurrent BEGIN/END */
     struct ac_vma_info *vmas;   /* SCAN snapshot */
     unsigned int n_vmas;
     unsigned int rwx_count;
@@ -776,8 +792,10 @@ static struct ac_fd_state *ac_get_fd_state(struct file *file)
 
     if (!st) {
         st = kzalloc(sizeof(*st), GFP_KERNEL);
-        if (st)
+        if (st) {
+            mutex_init(&st->lock);
             file->private_data = st;
+        }
     }
     return st;
 }
@@ -981,15 +999,19 @@ static long ac_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
             pr_warn("scan: fd state alloc failed\n");
             return -ENOMEM;
         }
+        mutex_lock(&st->lock);
         ret = ac_build_vma_snapshot(st, b.pid, b.emit_events);
+        if (!ret) {
+            b.n_vmas = st->n_vmas;
+            b.rwx_count = st->rwx_count;
+            b.exec_count = st->exec_count;
+            b.truncated = st->truncated;
+        }
+        mutex_unlock(&st->lock);
         if (ret) {
             pr_warn("scan: build_vma_snapshot(pid=%d) = %d\n", b.pid, ret);
             return ret;
         }
-        b.n_vmas = st->n_vmas;
-        b.rwx_count = st->rwx_count;
-        b.exec_count = st->exec_count;
-        b.truncated = st->truncated;
         if (copy_to_user(uarg, &b, sizeof(b)))
             return -EFAULT;
         return 0;
@@ -997,12 +1019,22 @@ static long ac_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
     case AC_IOCTL_SCAN_GET: {
         struct ac_scan_get g;
         struct ac_fd_state *st = file->private_data;
+        int rc = 0;
 
         if (copy_from_user(&g, uarg, sizeof(g)))
             return -EFAULT;
-        if (!st || g.index >= st->n_vmas)
-            return -EINVAL;
-        g.vma = st->vmas[g.index];
+        if (!st) {
+            rc = -EINVAL;
+        } else {
+            mutex_lock(&st->lock);
+            if (g.index >= st->n_vmas)
+                rc = -EINVAL;
+            else
+                g.vma = st->vmas[g.index];
+            mutex_unlock(&st->lock);
+        }
+        if (rc)
+            return rc;
         if (copy_to_user(uarg, &g, sizeof(g)))
             return -EFAULT;
         return 0;
@@ -1011,9 +1043,11 @@ static long ac_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
         if (file->private_data) {
             struct ac_fd_state *st = file->private_data;
 
+            mutex_lock(&st->lock);
             kvfree(st->vmas);
             st->vmas = NULL;
             st->n_vmas = 0;
+            mutex_unlock(&st->lock);
         }
         return 0;
     case AC_IOCTL_CHECK_SYSCALLS: {
@@ -1033,10 +1067,13 @@ static long ac_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
         st = ac_get_fd_state(file);
         if (!st)
             return -ENOMEM;
+        mutex_lock(&st->lock);
         ret = ac_build_mod_snapshot(st);
+        if (!ret)
+            count = st->n_mods;
+        mutex_unlock(&st->lock);
         if (ret)
             return ret;
-        count = st->n_mods;
         if (copy_to_user(uarg, &count, sizeof(count)))
             return -EFAULT;
         return 0;
@@ -1044,12 +1081,22 @@ static long ac_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
     case AC_IOCTL_MODS_GET: {
         struct ac_mod_get g;
         struct ac_fd_state *st = file->private_data;
+        int rc = 0;
 
         if (copy_from_user(&g, uarg, sizeof(g)))
             return -EFAULT;
-        if (!st || g.index >= st->n_mods)
-            return -EINVAL;
-        g.mod = st->mods[g.index];
+        if (!st) {
+            rc = -EINVAL;
+        } else {
+            mutex_lock(&st->lock);
+            if (g.index >= st->n_mods)
+                rc = -EINVAL;
+            else
+                g.mod = st->mods[g.index];
+            mutex_unlock(&st->lock);
+        }
+        if (rc)
+            return rc;
         if (copy_to_user(uarg, &g, sizeof(g)))
             return -EFAULT;
         return 0;
@@ -1058,9 +1105,11 @@ static long ac_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
         if (file->private_data) {
             struct ac_fd_state *st = file->private_data;
 
+            mutex_lock(&st->lock);
             kvfree(st->mods);
             st->mods = NULL;
             st->n_mods = 0;
+            mutex_unlock(&st->lock);
         }
         return 0;
     case AC_IOCTL_GET_EVENTS: {
@@ -1089,6 +1138,12 @@ static long ac_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
         return 0;
     }
     case AC_IOCTL_LOCK:
+        /* Pin the module until a matching UNLOCK.  The reference is taken
+         * globally (not per-fd), so the pin intentionally outlives the
+         * locking process (crash, kill, or a CLI that opens/closes the
+         * device).  Recovery is always possible: any CAP_SYS_ADMIN caller
+         * can issue UNLOCK, which balances the count and releases the
+         * reference. */
         if (try_module_get(THIS_MODULE)) {
             atomic_inc(&ac_lock_count);
             return 0;
@@ -1115,6 +1170,9 @@ static int ac_open(struct inode *inode, struct file *file)
 
 static int ac_release(struct inode *inode, struct file *file)
 {
+    /* Deliberately no module_put() here: the lock pin taken by
+     * AC_IOCTL_LOCK is global and outlives this fd.  It is released by a
+     * later AC_IOCTL_UNLOCK, which any privileged caller can issue. */
     ac_free_fd_state(file->private_data);
     file->private_data = NULL;
     return 0;

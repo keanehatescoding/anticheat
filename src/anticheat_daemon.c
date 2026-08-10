@@ -406,10 +406,10 @@ static int cmd_scan(int argc, char **argv)
             break;
         vi = &g.vma;
 
-        if ((vi->flags & 0x4) && (vi->flags & 0x2))
+        if ((vi->flags & AC_VM_EXEC) && (vi->flags & AC_VM_WRITE))
             printf("  [!] RWX [%#llx-%#llx] %s\n",
                    vi->start, vi->end, vi->path[0] ? vi->path : "(anonymous)");
-        else if ((vi->flags & 0x4) && g_verbose)
+        else if ((vi->flags & AC_VM_EXEC) && g_verbose)
             printf("  exec [%#llx-%#llx] %s\n",
                    vi->start, vi->end, vi->path[0] ? vi->path : "(anonymous)");
     }
@@ -438,7 +438,7 @@ static int cmd_scan(int argc, char **argv)
                 if (ioctl(dev_fd, AC_IOCTL_SCAN_GET, &g) < 0)
                     break;
                 vi = &g.vma;
-                if (!(vi->flags & 0x4) || !vi->is_file)
+                if (!(vi->flags & AC_VM_EXEC) || !vi->is_file)
                     continue;
                 size = vi->end - vi->start;
                 if (size > AC_HASH_CAP)
@@ -530,30 +530,39 @@ static int cmd_syscalls(void)
 /* ------------------------------------------------------------------ */
 /* command: modules                                                    */
 /* ------------------------------------------------------------------ */
-static int cmd_modules(void)
+/* Shared /proc/modules cross-check for the `modules` command and the
+ * periodic monitor.  The name table is static (256 KiB): the daemon is
+ * single-threaded, and a stack array that large is fragile under small
+ * ulimit -s / LimitSTACK=.  Returns the hidden-module count, or -1 if the
+ * kernel-side module list could not be read. */
+#define AC_MAX_PROC_MODS 4096
+static char proc_names[AC_MAX_PROC_MODS][AC_MOD_NAME_LEN];
+
+static unsigned int collect_proc_modules(unsigned int cap)
 {
-    unsigned int count, i;
-    FILE *f;
+    FILE *f = fopen("/proc/modules", "r");
     char line[256];
-    unsigned int hidden = 0;
-    char proc_names[4096][AC_MOD_NAME_LEN];
-    unsigned int proc_count = 0;
+    unsigned int n = 0;
 
-    ac_open();
-    if (ioctl_ok(AC_IOCTL_MODS_BEGIN, &count) < 0)
-        return 1;
-
-    /* names visible through procfs */
-    f = fopen("/proc/modules", "r");
     if (!f)
-        die("cannot open /proc/modules: %s", strerror(errno));
-    while (fgets(line, sizeof(line), f) && proc_count < 4096) {
-        if (sscanf(line, "%63s", proc_names[proc_count]) == 1)
-            proc_count++;
+        return 0;
+    while (fgets(line, sizeof(line), f) && n < cap) {
+        if (sscanf(line, "%63s", proc_names[n]) == 1)
+            n++;
     }
     fclose(f);
+    return n;
+}
 
-    printf("%u modules in kernel list:\n", count);
+static long crosscheck_modules(int verbose)
+{
+    unsigned int count, i, hidden = 0, proc_count;
+
+    if (ioctl(dev_fd, AC_IOCTL_MODS_BEGIN, &count) < 0)
+        return -1;
+    proc_count = collect_proc_modules(AC_MAX_PROC_MODS);
+    if (verbose)
+        printf("%u modules in kernel list:\n", count);
     for (i = 0; i < count; i++) {
         struct ac_mod_get g;
         unsigned int j;
@@ -569,15 +578,28 @@ static int cmd_modules(void)
                 break;
             }
         }
-        printf("  %-20s size=%-10llu state=%u %s\n",
-               g.mod.name, g.mod.size, g.mod.state,
-               visible ? "" : "[HIDDEN FROM /proc/modules!]");
+        if (verbose)
+            printf("  %-20s size=%-10llu state=%u %s\n",
+                   g.mod.name, g.mod.size, g.mod.state,
+                   visible ? "" : "[HIDDEN FROM /proc/modules!]");
         if (!visible)
             hidden++;
     }
     ioctl(dev_fd, AC_IOCTL_MODS_END, NULL);
-    printf("hidden modules: %u\n", hidden);
+    if (verbose)
+        printf("hidden modules: %u\n", hidden);
+    return hidden;
+}
+
+static int cmd_modules(void)
+{
+    long hidden;
+
+    ac_open();
+    hidden = crosscheck_modules(1);
     ac_close();
+    if (hidden < 0)
+        return 1;
     return hidden ? 2 : 0;
 }
 
@@ -650,45 +672,11 @@ static int check_syscalls_periodic(void)
 
 static int check_modules_periodic(void)
 {
-    unsigned int count, i;
-    FILE *f;
-    char line[256];
-    unsigned int hidden = 0;
-    char proc_names[4096][AC_MOD_NAME_LEN];
-    unsigned int proc_count = 0;
+    long hidden = crosscheck_modules(0);
 
-    if (ioctl(dev_fd, AC_IOCTL_MODS_BEGIN, &count) < 0)
-        return -1;
-    f = fopen("/proc/modules", "r");
-    if (f) {
-        while (fgets(line, sizeof(line), f) && proc_count < 4096) {
-            if (sscanf(line, "%63s", proc_names[proc_count]) == 1)
-                proc_count++;
-        }
-        fclose(f);
-    }
-    for (i = 0; i < count; i++) {
-        struct ac_mod_get g;
-        unsigned int j;
-        int visible = 0;
-
-        memset(&g, 0, sizeof(g));
-        g.index = i;
-        if (ioctl(dev_fd, AC_IOCTL_MODS_GET, &g) < 0)
-            break;
-        for (j = 0; j < proc_count; j++) {
-            if (strcmp(proc_names[j], g.mod.name) == 0) {
-                visible = 1;
-                break;
-            }
-        }
-        if (!visible)
-            hidden++;
-    }
-    ioctl(dev_fd, AC_IOCTL_MODS_END, NULL);
-    if (hidden)
-        logmsg(LOG_CRIT, "%u module(s) hidden from /proc/modules", hidden);
-    return hidden;
+    if (hidden > 0)
+        logmsg(LOG_CRIT, "%ld module(s) hidden from /proc/modules", hidden);
+    return (int)hidden;
 }
 
 static int scan_protected_periodic(void)

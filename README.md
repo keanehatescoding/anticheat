@@ -209,6 +209,13 @@ To run the same userspace checks locally: `make ci`.
 - `ac_policy` is read-only at runtime (module param, mode 0600): bit 0 = kill
   ptrace offenders (default on). Use `sudo insmod anticheat.ko ac_policy=0`
   to log-and-deny only.
+- `lock` pins the module globally, not per-fd: the pin intentionally survives
+  the locking process exiting or crashing (that is the point of the panic
+  button). Recovery is always possible — any privileged caller can run
+  `anticheat unlock`, which balances the count and releases the reference.
+- The device checks `CAP_SYS_ADMIN` at `open()` only. Do not pass an open
+  fd to an unprivileged process (SCM_RIGHTS, inherited fds): the receiver
+  would get full ioctl access. The daemon/CLI never does this.
 - ptrace denial works on the standard `__x64_sys_ptrace` / `__ia32_sys_ptrace`
   entries. A cheat that invokes the `ptrace` functionality through other
   kernel paths (e.g., `process_vm_readv` on an attached victim) is out of

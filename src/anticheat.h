@@ -64,6 +64,14 @@ enum {
 };
 
 /* ------------------------------------------------------------------ */
+/* VM flag values as seen by the daemon.  These are the Linux ABI bit
+ * numbers for VM_EXEC / VM_WRITE (stable for decades); the daemon uses
+ * these constants instead of pulling in kernel headers, and the module
+ * reports raw vma->vm_flags so the values must match the running kernel. */
+#define AC_VM_EXEC  0x4
+#define AC_VM_WRITE 0x2
+
+/* ------------------------------------------------------------------ */
 /* structs                                                             */
 /* ------------------------------------------------------------------ */
 struct ac_status {
