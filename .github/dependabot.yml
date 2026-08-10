@@ -1,0 +1,18 @@
+# Dependabot configuration.
+#
+# This project is C + shell + an LKM: there is no language dependency
+# manifest, so the only useful ecosystem is GitHub Actions itself
+# (keep checkout/upload-artifact tags current).
+#
+# The linux-6.12 kernel tarball pinned in ci.yml is a plain URL and is NOT
+# tracked by Dependabot — bump it manually when updating the CI baseline.
+
+version: 2
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "ci"
