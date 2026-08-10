@@ -151,6 +151,40 @@ sudo ./anticheat start            # run the monitor
 `sudo make install` installs the binary to `/usr/local/sbin` and the module
 to `/lib/modules/$(uname -r)/extra/`.
 
+### Automatic rebuild on kernel updates + Secure Boot (DKMS)
+
+`make install` puts a static build in place; it does **not** survive the
+next kernel upgrade, and it won't load at all under Secure Boot without a
+signature. For a normal desktop distro, use DKMS instead:
+
+```sh
+sudo ./scripts/dkms-install.sh
+```
+
+This registers the module with DKMS, which rebuilds it automatically every
+time a new kernel package is installed, and signs each build with a
+self-generated Machine Owner Key (see `scripts/dkms-sign-helper.sh`). The
+*first* build on a machine with Secure Boot enabled will ask you to reboot
+once and approve the key in the firmware's blue "MOK Management" screen —
+that's a UEFI requirement (no software can auto-approve a new trusted key,
+by design) and only happens once per machine, not per kernel update.
+
+### SteamOS / Steam Deck / other immutable distros
+
+`/lib/modules` and `/usr` are read-only on SteamOS and get replaced
+wholesale on every OTA update, so neither `make install` nor DKMS's
+kernel-postinst rebuild hook applies there. Use:
+
+```sh
+make install-deck        # installs under ~/.local/share/anticheat
+sudo insmod ~/.local/share/anticheat/anticheat.ko
+```
+
+This has to be rebuilt and reloaded manually after a SteamOS update (there
+is no on-device header package for DKMS to rebuild against); see the
+project notes on CI-prebuilding a `.ko` per SteamOS kernel release if you
+need this to survive updates unattended.
+
 ## Live test
 
 ```sh

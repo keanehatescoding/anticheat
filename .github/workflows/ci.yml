@@ -20,7 +20,8 @@ jobs:
         run: |
           command -v shellcheck >/dev/null 2>&1 || \
             { sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck; }
-          shellcheck test.sh diag.sh test/mock_test.sh
+          shellcheck test.sh diag.sh test/mock_test.sh \
+                     scripts/dkms-install.sh scripts/dkms-sign-helper.sh
 
   # --- kernel module: compile smoke test against a pinned modern tree ---
   # The module targets kernels >= 6.12 (uses sized_strscpy, the _noprof
