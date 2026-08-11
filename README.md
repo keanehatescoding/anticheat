@@ -162,12 +162,15 @@ sudo ./scripts/dkms-install.sh
 ```
 
 This registers the module with DKMS, which rebuilds it automatically every
-time a new kernel package is installed, and signs each build with a
-self-generated Machine Owner Key (see `scripts/dkms-sign-helper.sh`). The
-*first* build on a machine with Secure Boot enabled will ask you to reboot
-once and approve the key in the firmware's blue "MOK Management" screen —
-that's a UEFI requirement (no software can auto-approve a new trusted key,
-by design) and only happens once per machine, not per kernel update.
+time a new kernel package is installed. It also installs a small
+`/etc/dkms/framework.conf.d/anticheat.conf` fragment that points DKMS's
+*built-in* Secure Boot signing at a self-generated Machine Owner Key under
+`/var/lib/anticheat/mok/` (DKMS signs every build with it automatically from
+then on — no custom signing script needed). The *first* build on a machine
+with Secure Boot enabled will ask you to reboot once and approve the key in
+the firmware's blue "MOK Management" screen — that's a UEFI requirement (no
+software can auto-approve a new trusted key, by design) and only happens
+once per machine, not per kernel update.
 
 ### SteamOS / Steam Deck / other immutable distros
 

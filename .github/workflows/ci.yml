@@ -20,8 +20,7 @@ jobs:
         run: |
           command -v shellcheck >/dev/null 2>&1 || \
             { sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck; }
-          shellcheck test.sh diag.sh test/mock_test.sh \
-                     scripts/dkms-install.sh scripts/dkms-sign-helper.sh
+          shellcheck test.sh diag.sh test/mock_test.sh scripts/dkms-install.sh
 
   # --- kernel module: compile smoke test against a pinned modern tree ---
   # The module targets kernels >= 6.12 (uses sized_strscpy, the _noprof
@@ -68,3 +67,50 @@ jobs:
           name: anticheat-ko
           path: anticheat.ko
           if-no-files-found: error
+
+      # --- DKMS path: exercises dkms.conf + Secure Boot signing end to end ---
+      # This is the same packaging a player's machine actually uses (see
+      # scripts/dkms-install.sh), not just a raw `make module`. It reuses
+      # the already-prepared 6.12 tree above instead of the runner's own
+      # kernel, since DKMS always targets a specific kernel version's
+      # module tree and the runner's live kernel has no matching headers.
+      - name: DKMS build + signing smoke test
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq dkms
+
+          # Point DKMS at the prepared tree via a synthetic version + a
+          # /lib/modules/<ver>/build symlink -- the same shape a real
+          # kernel-postinst hook sees for a just-installed, not-yet-booted
+          # kernel.
+          KVER="$(make -s -C linux-6.12 kernelversion)-ci"
+          sudo mkdir -p "/lib/modules/${KVER}"
+          sudo ln -sf "$PWD/linux-6.12" "/lib/modules/${KVER}/build"
+
+          # Same setup scripts/dkms-install.sh does: a system-wide
+          # framework.conf.d fragment pointing DKMS's built-in signing at a
+          # key it will self-generate, plus the parent directory it won't
+          # create on its own. (DKMS ignores MOK_SIGNING_KEY/MOK_CERTIFICATE
+          # if set directly in dkms.conf -- verified against a real build;
+          # only the system-wide framework.conf(.d) path actually wires up
+          # signing. See the note in dkms.conf.)
+          sudo install -d -m 0700 /var/lib/anticheat/mok
+          sudo install -d -m 0755 /etc/dkms/framework.conf.d
+          printf 'mok_signing_key="/var/lib/anticheat/mok/mok.priv"\nmok_certificate="/var/lib/anticheat/mok/mok.der"\n' \
+            | sudo tee /etc/dkms/framework.conf.d/anticheat.conf >/dev/null
+
+          sudo mkdir -p /usr/src/anticheat-1.0.0
+          sudo cp -a Makefile dkms.conf src /usr/src/anticheat-1.0.0/
+
+          sudo dkms add -m anticheat -v 1.0.0
+
+          # Same undefined-symbol workaround as the manual build above: the
+          # prepared-but-never-linked tree has no Module.symvers.
+          sudo env KBUILD_EXTRA_SYMBOLS="$PWD/ksymvers" \
+            dkms build -m anticheat -v 1.0.0 -k "$KVER"
+
+          sudo dkms status -m anticheat
+          built_ko="$(find "/var/lib/dkms/anticheat/1.0.0/${KVER}" \
+            -name 'anticheat.ko' -print -quit)"
+          test -n "$built_ko" && test -s "$built_ko"
+          modinfo "$built_ko" | tee /dev/stderr | grep -q '^sig_id:\s*PKCS#7$'
