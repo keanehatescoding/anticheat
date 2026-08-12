@@ -294,16 +294,22 @@ static int do_ioctl(unsigned long req, void *arg)
         b->n_vmas = snap_n;
         b->rwx_count = 0;
         b->exec_count = 0;
+        b->anon_exec_count = 0;
         for (i = 0; i < snap_n; i++) {
             if (snap[i].flags & AC_VM_EXEC)
                 b->exec_count++;
             if ((snap[i].flags & (AC_VM_WRITE | AC_VM_EXEC)) == (AC_VM_WRITE | AC_VM_EXEC))
                 b->rwx_count++;
+            if (!snap[i].is_file && (snap[i].flags & AC_VM_EXEC))
+                b->anon_exec_count++;
         }
         b->truncated = 0;
         if (b->emit_events && b->rwx_count)
             push_event(AC_EV_RWX, b->pid, "", "mock: %u RWX mapping(s)",
                        b->rwx_count);
+        if (b->emit_events && b->anon_exec_count)
+            push_event(AC_EV_ANON_EXEC, b->pid, "",
+                       "mock: %u anon-exec mapping(s)", b->anon_exec_count);
         return 0;
     }
     case AC_IOCTL_SCAN_GET: {

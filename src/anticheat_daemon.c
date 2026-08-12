@@ -113,6 +113,7 @@ static const char *ev_type_str(unsigned int t)
     case AC_EV_PTRACE:      return "PTRACE-DENIED";
     case AC_EV_SYSCALL_HOOK:return "SYSCALL-HOOK";
     case AC_EV_RWX:         return "RWX";
+    case AC_EV_ANON_EXEC:   return "ANON-EXEC";
     case AC_EV_INFO:        return "INFO";
     default:                return "UNKNOWN";
     }
@@ -390,8 +391,12 @@ static int cmd_scan(int argc, char **argv)
     if (ioctl_ok(AC_IOCTL_SCAN_BEGIN, &b) < 0)
         return 1;
 
-    printf("scan of pid %d: %u VMA(s), %u executable, %u RWX\n",
-           pid, b.n_vmas, b.exec_count, b.rwx_count);
+    printf("scan of pid %d: %u VMA(s), %u executable, %u RWX, %u anon-exec\n",
+           pid, b.n_vmas, b.exec_count, b.rwx_count, b.anon_exec_count);
+    if (b.anon_exec_count)
+        printf("  (anon-exec = executable with no backing file; vdso/vvar are\n"
+               "   expected here -- treat a *growing* count across repeated\n"
+               "   scans as the signal, not the raw number)\n");
     if (b.truncated)
         printf("  (VMA snapshot truncated at %u entries)\n", AC_MAX_VMAS);
 
@@ -409,6 +414,8 @@ static int cmd_scan(int argc, char **argv)
         if ((vi->flags & AC_VM_EXEC) && (vi->flags & AC_VM_WRITE))
             printf("  [!] RWX [%#llx-%#llx] %s\n",
                    vi->start, vi->end, vi->path[0] ? vi->path : "(anonymous)");
+        else if ((vi->flags & AC_VM_EXEC) && !vi->is_file)
+            printf("  [?] anon-exec [%#llx-%#llx]\n", vi->start, vi->end);
         else if ((vi->flags & AC_VM_EXEC) && g_verbose)
             printf("  exec [%#llx-%#llx] %s\n",
                    vi->start, vi->end, vi->path[0] ? vi->path : "(anonymous)");
@@ -679,6 +686,65 @@ static int check_modules_periodic(void)
     return (int)hidden;
 }
 
+/* Per-pid baseline for AC_EV_ANON_EXEC-style detection: vdso/vvar are
+ * anonymous+executable from process start and never change, so recording
+ * whatever count we see on a pid's *first* scan as its baseline and only
+ * alerting when the count later grows cleanly separates "always there"
+ * kernel mappings from code that gets mapped in after we started watching
+ * -- without needing to identify vdso/vvar by name in the kernel (which
+ * would need arch-specific, harder-to-verify code; see the discussion in
+ * anticheat.h). This does mean a pid that gets reused for an unrelated
+ * process between two scans could show a spurious baseline reset; that's
+ * a known, accepted limitation for this pass, not a security hole -- the
+ * new process's own baseline just gets (re-)established on its first
+ * scan, same as any newly-protected pid. */
+struct ac_anon_baseline {
+    int          pid;
+    unsigned int count;
+    int          in_use;
+};
+static struct ac_anon_baseline g_anon_baseline[AC_MAX_PROTS];
+
+static void anon_baseline_forget_stale(const struct ac_prot_list *pl)
+{
+    unsigned int i, j;
+
+    for (i = 0; i < AC_MAX_PROTS; i++) {
+        if (!g_anon_baseline[i].in_use)
+            continue;
+        for (j = 0; j < pl->count; j++)
+            if (pl->items[j].pid == g_anon_baseline[i].pid)
+                break;
+        if (j == pl->count)
+            g_anon_baseline[i].in_use = 0;   /* no longer protected */
+    }
+}
+
+static void anon_baseline_check(int pid, const char *comm, unsigned int count)
+{
+    unsigned int i, free_slot = AC_MAX_PROTS;
+
+    for (i = 0; i < AC_MAX_PROTS; i++) {
+        if (g_anon_baseline[i].in_use && g_anon_baseline[i].pid == pid) {
+            if (count > g_anon_baseline[i].count)
+                logmsg(LOG_CRIT, "pid %d (%s): %u new anonymous executable "
+                       "mapping(s) since first observed (was %u, now %u) -- "
+                       "possible code injection after process start",
+                       pid, comm, count - g_anon_baseline[i].count,
+                       g_anon_baseline[i].count, count);
+            g_anon_baseline[i].count = count;
+            return;
+        }
+        if (free_slot == AC_MAX_PROTS && !g_anon_baseline[i].in_use)
+            free_slot = i;
+    }
+    if (free_slot != AC_MAX_PROTS) {
+        g_anon_baseline[free_slot].pid = pid;
+        g_anon_baseline[free_slot].count = count;
+        g_anon_baseline[free_slot].in_use = 1;
+    }
+}
+
 static int scan_protected_periodic(void)
 {
     struct ac_prot_list pl;
@@ -687,6 +753,7 @@ static int scan_protected_periodic(void)
     memset(&pl, 0, sizeof(pl));
     if (ioctl(dev_fd, AC_IOCTL_LIST_PROTECTED, &pl) < 0)
         return -1;
+    anon_baseline_forget_stale(&pl);
     for (i = 0; i < pl.count; i++) {
         struct ac_scan_begin b;
 
@@ -696,6 +763,8 @@ static int scan_protected_periodic(void)
             if (b.rwx_count > 0)
                 logmsg(LOG_WARNING, "pid %d (%s): %u RWX mapping(s) present",
                        pl.items[i].pid, pl.items[i].comm, b.rwx_count);
+            anon_baseline_check(pl.items[i].pid, pl.items[i].comm,
+                                 b.anon_exec_count);
             ioctl(dev_fd, AC_IOCTL_SCAN_END, NULL);
         }
     }
@@ -747,6 +816,23 @@ static int cmd_start(int argc, char **argv)
     signal(SIGHUP, SIG_IGN);
 
     logmsg(LOG_INFO, "anticheat daemon started (foreground=%d)", foreground);
+    {
+        struct ac_proc_id self;
+
+        /* Protect our own pid: a cheat that can ptrace-attach or debug the
+         * daemon away is a cheat that can bypass everything else here too.
+         * This only stops ptrace-based attacks (see the kernel module's
+         * ptrace-deny hook) -- it does not stop SIGKILL from a
+         * root-privileged attacker, which is outside what this module can
+         * defend against by design (see README's threat-model notes). */
+        memset(&self, 0, sizeof(self));
+        self.pid = getpid();
+        if (ioctl(dev_fd, AC_IOCTL_ADD_PROC, &self) < 0)
+            logmsg(LOG_WARNING, "failed to self-protect (pid %d): %s",
+                   self.pid, strerror(errno));
+        else
+            logmsg(LOG_INFO, "self-protected (pid %d)", self.pid);
+    }
     {
         time_t next_sys = 0, next_mod = 0, next_scan = 0;
 

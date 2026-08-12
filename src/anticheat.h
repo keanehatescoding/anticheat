@@ -60,6 +60,14 @@ enum {
     AC_EV_PTRACE,         /* ptrace attempt against a protected process (denied) */
     AC_EV_SYSCALL_HOOK,   /* syscall table entry outside core kernel text */
     AC_EV_RWX,            /* executable+writable mapping detected in protected proc */
+    AC_EV_ANON_EXEC,      /* executable mapping with no backing file (possible
+                            * injected code -- also catches write-then-mprotect(R-X),
+                            * which evades RWX-only detection since W and X are
+                            * never both set at once). vdso/vvar legitimately show
+                            * up here too; the daemon only alerts on an *increase*
+                            * in this count after a process is first observed, not
+                            * on the raw count, since vdso/vvar are present from
+                            * process start and never change. */
     AC_EV_INFO,           /* informational (module load/unload, ...) */
 };
 
@@ -105,6 +113,7 @@ struct ac_scan_begin {
     unsigned int n_vmas;        /* out */
     unsigned int rwx_count;     /* out */
     unsigned int exec_count;    /* out */
+    unsigned int anon_exec_count; /* out: executable, no backing file (see AC_EV_ANON_EXEC) */
     unsigned int truncated;     /* out: snapshot cap hit */
 };
 

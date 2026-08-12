@@ -5,6 +5,7 @@ set -u
 
 cd "$(dirname "$0")" || exit 1
 VICTIM_PID=""
+DAEMON_PID=""
 FAILED=0
 
 say()  { printf '\033[1;34m[TEST]\033[0m %s\n' "$*"; }
@@ -15,6 +16,7 @@ bad()  { printf '\033[1;31m  FAIL\033[0m  %s\n' "$*"; FAILED=1; }
 # shellcheck disable=SC2317,SC2329
 cleanup() {
     [ -n "$VICTIM_PID" ] && kill "$VICTIM_PID" 2>/dev/null
+    [ -n "$DAEMON_PID" ] && kill "$DAEMON_PID" 2>/dev/null
     sleep 0.2
     rmmod anticheat 2>/dev/null
 }
@@ -75,8 +77,18 @@ EVENTS=$(./anticheat events)
 if printf '%s' "$EVENTS" | grep -q "PTRACE-DENIED"; then ok "PTRACE-DENIED event logged"; else bad "no ptrace event"; fi
 if printf '%s' "$EVENTS" | grep -q "FORK"; then ok "FORK event logged"; else bad "no fork event"; fi
 
-say "memory scan (RWX detection)"
-if ./anticheat scan --pid "$VICTIM_PID" >/dev/null; then ok "scan ok"; else bad "scan"; fi
+say "memory scan (RWX + anon-exec detection)"
+SCAN_OUT=$(./anticheat scan --pid "$VICTIM_PID")
+if [ -n "$SCAN_OUT" ]; then ok "scan ok"; else bad "scan"; fi
+# vdso is present in every process's address space and has no backing
+# file, so a correct scan must find at least one anon-exec mapping here —
+# this is what makes AC_EV_ANON_EXEC's baseline-delta design testable
+# without actually injecting shellcode into the victim.
+if printf '%s' "$SCAN_OUT" | grep -qE 'anon-exec'; then
+    ok "anon-exec detection found at least one mapping (expect vdso)"
+else
+    bad "anon-exec detection found nothing (expected vdso at minimum)"
+fi
 
 say "memory integrity baseline"
 if ./anticheat scan --pid "$VICTIM_PID" --hash --save >/dev/null 2>&1; then
@@ -98,6 +110,26 @@ say "locking the module (rmmod must fail while locked)"
 if ./anticheat lock >/dev/null; then ok "locked"; else bad "lock"; fi
 if rmmod anticheat 2>/dev/null; then bad "rmmod succeeded while locked"; else ok "rmmod correctly refused"; fi
 if ./anticheat unlock >/dev/null; then ok "unlocked"; else bad "unlock"; fi
+
+say "self-protection: daemon should register its own pid"
+./anticheat start --foreground >/tmp/ac_daemon.log 2>&1 &
+DAEMON_PID=$!
+sleep 1
+if ./anticheat list | grep -q "$DAEMON_PID"; then
+    ok "daemon self-protected (pid $DAEMON_PID)"
+else
+    bad "daemon did not appear in protected list"
+fi
+timeout 3 strace -p "$DAEMON_PID" -e trace=none >/dev/null 2>&1
+rc=$?
+if [ "$rc" -ne 0 ] && [ "$rc" -ne 124 ]; then
+    ok "ptrace attach to daemon itself denied (rc=$rc)"
+else
+    bad "ptrace attach to daemon not denied (rc=$rc; 124 = hung attached)"
+fi
+kill "$DAEMON_PID" 2>/dev/null
+wait "$DAEMON_PID" 2>/dev/null
+DAEMON_PID=""
 
 say "unloading"
 if rmmod anticheat; then ok "module unloaded"; else bad "rmmod"; fi

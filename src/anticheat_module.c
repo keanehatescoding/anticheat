@@ -14,7 +14,9 @@
  *     the syscall fails with -EIO and has no side effects) and, per policy,
  *     the offending tracer is SIGKILLed from a workqueue.
  *  5. execve / exit monitoring of protected processes (kprobes).
- *  6. VMA-level memory scanning (RWX "code cave" detection).
+ *  6. VMA-level memory scanning (RWX "code cave" detection, plus anonymous
+ *     executable mappings -- catches the write-then-mprotect(R-X) injection
+ *     pattern that RWX-only detection misses).
  *  7. Event ring buffer consumed by the userspace daemon via ioctls.
  *
  * All symbol resolution is done through kprobes (kallsyms_lookup_name is not
@@ -772,6 +774,7 @@ struct ac_fd_state {
     unsigned int n_vmas;
     unsigned int rwx_count;
     unsigned int exec_count;
+    unsigned int anon_exec_count;
     unsigned int truncated;
     struct ac_mod_info *mods;   /* MODS snapshot */
     unsigned int n_mods;
@@ -836,7 +839,7 @@ static int ac_build_vma_snapshot(struct ac_fd_state *st, int pid,
 
     kvfree(st->vmas);
     st->vmas = NULL;
-    st->n_vmas = st->rwx_count = st->exec_count = st->truncated = 0;
+    st->n_vmas = st->rwx_count = st->exec_count = st->anon_exec_count = st->truncated = 0;
 
     task = ac_find_task(pid);
     if (!task)
@@ -893,6 +896,22 @@ static int ac_build_vma_snapshot(struct ac_fd_state *st, int pid,
                         "RWX mapping [0x%llx-0x%llx] %s",
                         vi->start, vi->end,
                         vi->path[0] ? vi->path : "(anonymous)");
+        }
+        if (!vi->is_file && (vma->vm_flags & VM_EXEC)) {
+            /* No backing file at all -- legitimate executable code is always
+             * backed by a file (the binary or a shared library) via mmap.
+             * Also catches shellcode written to a RW mapping and then
+             * mprotect()'d to R-X, which never trips the RWX check above
+             * since W and X are never both set at the same instant.
+             * vdso/vvar are expected, harmless members of this set (see the
+             * AC_EV_ANON_EXEC comment in anticheat.h) -- the daemon alerts
+             * on new entries appearing after a process is first observed,
+             * not on the raw count. */
+            st->anon_exec_count++;
+            if (emit_events)
+                ac_emit(AC_EV_ANON_EXEC, pid, "?",
+                        "anonymous executable mapping [0x%llx-0x%llx]",
+                        vi->start, vi->end);
         }
         if (vma->vm_flags & VM_EXEC)
             st->exec_count++;
@@ -1005,6 +1024,7 @@ static long ac_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
             b.n_vmas = st->n_vmas;
             b.rwx_count = st->rwx_count;
             b.exec_count = st->exec_count;
+            b.anon_exec_count = st->anon_exec_count;
             b.truncated = st->truncated;
         }
         mutex_unlock(&st->lock);

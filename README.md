@@ -22,7 +22,7 @@ userspace daemon/CLI that talks to it over a small ioctl interface
 └────────────────────────────┘        │  · protected process registry│
                                       │  · ptrace denial (kprobe)    │
                                       │  · fork/exec/exit tracing    │
-                                      │  · VMA scan (RWX detection)  │
+                                      │  · VMA scan (RWX + anon-exec)│
                                       │  · event ring buffer         │
                                       └──────────────────────────────┘
 ```
@@ -63,7 +63,17 @@ userspace daemon/CLI that talks to it over a small ioctl interface
    under the mmap read lock (maple-tree iterator) and served to userspace
    via begin/get/end ioctls (kept under the 14-bit ioctl size limit).
    Executable+writable ("RWX code cave") mappings are flagged — the classic
-   runtime code-injection signature.
+   runtime code-injection signature. Executable mappings with **no backing
+   file at all** are flagged too (`AC_EV_ANON_EXEC`): legitimate code is
+   always backed by a file (the binary or a shared library), so this also
+   catches the write-then-`mprotect(R-X)` pattern, where shellcode is
+   written to a RW mapping and then made executable — W and X are never
+   both set at the same instant, so it never trips the RWX check. `vdso`
+   and `vvar` legitimately show up in this category too (present from
+   process start, never changing); the daemon's periodic scan tracks each
+   protected pid's count from when it was first observed and only alerts
+   on a *later increase*, so those don't generate noise (see
+   `anon_baseline_check()` in the daemon).
 
 7. **Event ring buffer.** Fixed-size ring of security events consumed by the
    daemon (`events`, and periodically by `start`).
@@ -79,7 +89,7 @@ anticheat protect --pid N            protect a process (children inherit)
 anticheat protect --comm NAME        protect by comm name
 anticheat unprotect --pid N
 anticheat list                       list protected processes
-anticheat scan --pid N               VMA scan, RWX detection
+anticheat scan --pid N               VMA scan, RWX + anon-exec detection
 anticheat scan --pid N --hash --save    create memory-integrity baselines
 anticheat scan --pid N --hash --check   verify runtime memory vs baseline
 anticheat syscalls                   verify syscall table integrity
@@ -89,10 +99,15 @@ anticheat lock | unlock              pin / unpin the kernel module
 anticheat start [--foreground]       monitoring daemon (events + periodic checks)
 ```
 
-The daemon (`start`) polls security events, re-checks syscall integrity every
-5 s, module visibility every 10 s, and scans protected processes for RWX
-mappings every 30 s. Alerts go to syslog (`LOG_AUTH`) and
-`/var/log/anticheat.log`.
+The daemon (`start`) protects its own pid on startup (so it can't just be
+ptrace-attached or debugged away — see `AC_IOCTL_ADD_PROC` in `cmd_start`),
+polls security events, re-checks syscall integrity every 5 s, module
+visibility every 10 s, and scans protected processes every 30 s for RWX
+mappings and for anonymous-executable mappings appearing *after* a process
+was first observed (each pid's baseline count is recorded on first scan;
+`vdso`/`vvar` never trigger since they're present from process start and
+never change — see `anon_baseline_check()`). Alerts go to syslog
+(`LOG_AUTH`) and `/var/log/anticheat.log`.
 
 Baselines are stored in `/var/lib/anticheat/baselines/` (one SHA-256 per
 file-backed executable mapping; override the directory with the
@@ -264,8 +279,20 @@ To run the same userspace checks locally: `make ci`.
 - kprobes require `CONFIG_KPROBES` / `CONFIG_KALLSYMS_ALL` (both enabled on
   this kernel). If a probe cannot be registered the module still loads and
   logs the limitation.
-- Module loading may require signing if the kernel enforces module signatures
-  (Secure Boot); this kernel has `CONFIG_MODULE_SIG_FORCE` off.
+- Anonymous-executable detection (`AC_EV_ANON_EXEC`) flags *presence*, not
+  *content* — it has no signature scanning and cannot tell injected shellcode
+  from a legitimate JIT engine (V8, .NET, JVM) mapping freshly-generated
+  machine code the same way. The baseline-delta design (alert only on
+  growth after a pid is first observed) keeps `vdso`/`vvar` quiet, but a
+  JIT-heavy protected process will still show a legitimately growing count
+  over its lifetime — this is a detection *signal* to correlate with other
+  evidence, not a standalone verdict. Per-pid allowlisting for known
+  JIT-using binaries is future work.
+- Self-protection (the daemon registers its own pid on startup) only stops
+  ptrace-based attacks, via the same kprobe hook everything else uses. It
+  does not stop `SIGKILL` from a root-privileged attacker — nothing in this
+  design can, without a much larger effort to hide/harden the daemon process
+  itself, which brings its own detection-evasion tradeoffs.
 
 ## Files
 
