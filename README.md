@@ -102,12 +102,18 @@ anticheat start [--foreground]       monitoring daemon (events + periodic checks
 The daemon (`start`) protects its own pid on startup (so it can't just be
 ptrace-attached or debugged away — see `AC_IOCTL_ADD_PROC` in `cmd_start`),
 polls security events, re-checks syscall integrity every 5 s, module
-visibility every 10 s, and scans protected processes every 30 s for RWX
+visibility every 10 s, scans protected processes every 30 s for RWX
 mappings and for anonymous-executable mappings appearing *after* a process
 was first observed (each pid's baseline count is recorded on first scan;
 `vdso`/`vvar` never trigger since they're present from process start and
-never change — see `anon_baseline_check()`). Alerts go to syslog
-(`LOG_AUTH`) and `/var/log/anticheat.log`.
+never change — see `anon_baseline_check()`), and every 60 s re-hashes every
+protected process's executable, file-backed mappings against whatever
+baseline was already saved for them via `--hash --save`
+(`check_baselines_periodic()`). It never creates a baseline on its own —
+only an operator running `--save` on a binary they've already verified
+clean does that — so a process with no saved baseline is silently skipped,
+not auto-trusted. Alerts go to syslog (`LOG_AUTH`) and
+`/var/log/anticheat.log`.
 
 Baselines are stored in `/var/lib/anticheat/baselines/` (one SHA-256 per
 file-backed executable mapping; override the directory with the

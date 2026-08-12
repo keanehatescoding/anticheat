@@ -102,6 +102,27 @@ else
     bad "baseline check"
 fi
 
+say "automatic baseline re-check (daemon should detect tampering)"
+BLDIR="/var/lib/anticheat/baselines"
+if [ -d "$BLDIR" ]; then
+    for f in "$BLDIR"/*.txt; do
+        [ -f "$f" ] || continue
+        sed -i 's/[0-9a-f]\{64\}$/deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef/' "$f"
+    done
+fi
+AC_BASELINE_CHECK_INTERVAL=2 ./anticheat start --foreground >/tmp/ac_baseline_test.log 2>&1 &
+DAEMON_PID=$!
+sleep 4
+if grep -q "differs from saved baseline" /tmp/ac_baseline_test.log; then
+    ok "periodic baseline check detected tampering"
+else
+    bad "periodic baseline check did not detect tampering"
+fi
+kill "$DAEMON_PID" 2>/dev/null
+wait "$DAEMON_PID" 2>/dev/null
+DAEMON_PID=""
+rm -f /tmp/ac_baseline_test.log
+
 say "unprotect + cleanup"
 if ./anticheat unprotect --pid "$VICTIM_PID" >/dev/null; then ok "unprotected"; else bad "unprotect"; fi
 [ -n "$CHILD_PID" ] && kill "$CHILD_PID" 2>/dev/null

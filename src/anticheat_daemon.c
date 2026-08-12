@@ -341,6 +341,17 @@ static const char *ac_baseline_dir(void)
     return (e && *e) ? e : AC_BASELINE_DIR;
 }
 
+/* How often the daemon re-hashes protected processes' executables against
+ * saved baselines. Overridable via AC_BASELINE_CHECK_INTERVAL (seconds) so
+ * test.sh can exercise this on a live kernel without a real 60s wait. */
+static int ac_baseline_check_interval(void)
+{
+    const char *e = getenv("AC_BASELINE_CHECK_INTERVAL");
+    int v = e ? atoi(e) : 0;
+
+    return (v > 0) ? v : 60;
+}
+
 static void ac_mkdir_baselines(void)
 {
     const char *d = ac_baseline_dir();
@@ -771,6 +782,74 @@ static int scan_protected_periodic(void)
     return 0;
 }
 
+/* Re-verify every protected process's executable, file-backed mappings
+ * against whatever baseline was saved for them via `scan --hash --save`.
+ * Deliberately does NOT create a baseline here if one doesn't exist yet --
+ * silently adopting whatever's currently loaded as "known good" the first
+ * time the daemon happens to see a process would permanently hide a
+ * compromise that predates monitoring starting. Baselines only ever come
+ * from an explicit, operator-run `--save` on a binary already verified
+ * clean -- this only re-checks what someone already vouched for. */
+static int check_baselines_periodic(void)
+{
+    struct ac_prot_list pl;
+    unsigned int i;
+
+    memset(&pl, 0, sizeof(pl));
+    if (ioctl(dev_fd, AC_IOCTL_LIST_PROTECTED, &pl) < 0)
+        return -1;
+    for (i = 0; i < pl.count; i++) {
+        struct ac_scan_begin b;
+        unsigned int v;
+
+        memset(&b, 0, sizeof(b));
+        b.pid = pl.items[i].pid;
+        if (ioctl(dev_fd, AC_IOCTL_SCAN_BEGIN, &b) != 0)
+            continue;
+        for (v = 0; v < b.n_vmas; v++) {
+            struct ac_scan_get g;
+            struct ac_vma_info *vi;
+            char blpath[PATH_MAX], line[512], hex[65], bhex[65];
+            unsigned long long bs, bsz;
+            uint64_t size;
+            FILE *f;
+
+            memset(&g, 0, sizeof(g));
+            g.pid = pl.items[i].pid;
+            g.index = v;
+            if (ioctl(dev_fd, AC_IOCTL_SCAN_GET, &g) < 0)
+                break;
+            vi = &g.vma;
+            if (!(vi->flags & AC_VM_EXEC) || !vi->is_file)
+                continue;
+
+            baseline_path_for(vi->path, blpath);
+            f = fopen(blpath, "r");
+            if (!f)
+                continue; /* nothing saved for this file -- nothing to check */
+            if (!fgets(line, sizeof(line), f)) {
+                fclose(f);
+                continue;
+            }
+            fclose(f);
+            if (sscanf(line, "%llx %llx %64s", &bs, &bsz, bhex) != 3)
+                continue;
+
+            size = vi->end - vi->start;
+            if (size > AC_HASH_CAP)
+                size = AC_HASH_CAP;
+            if (hash_proc_mem(pl.items[i].pid, vi->start, size, hex) < 0)
+                continue;
+            if (strcmp(bhex, hex) != 0)
+                logmsg(LOG_CRIT, "pid %d (%s): memory content of %s differs "
+                       "from saved baseline (possible runtime patching)",
+                       pl.items[i].pid, pl.items[i].comm, vi->path);
+        }
+        ioctl(dev_fd, AC_IOCTL_SCAN_END, NULL);
+    }
+    return 0;
+}
+
 static int cmd_start(int argc, char **argv)
 {
     int foreground = 0, i;
@@ -834,7 +913,7 @@ static int cmd_start(int argc, char **argv)
             logmsg(LOG_INFO, "self-protected (pid %d)", self.pid);
     }
     {
-        time_t next_sys = 0, next_mod = 0, next_scan = 0;
+        time_t next_sys = 0, next_mod = 0, next_scan = 0, next_baseline = 0;
 
         while (!g_stop) {
             struct ac_event_list el;
@@ -866,6 +945,10 @@ static int cmd_start(int argc, char **argv)
             if (now >= next_scan) {
                 scan_protected_periodic();
                 next_scan = now + 30;
+            }
+            if (now >= next_baseline) {
+                check_baselines_periodic();
+                next_baseline = now + ac_baseline_check_interval();
             }
             sleep(1);
         }
