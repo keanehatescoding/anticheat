@@ -272,9 +272,14 @@ To run the same userspace checks locally: `make ci`.
   button). If the locking daemon crashes or is killed without unlocking,
   run `sudo ./anticheat unlock` from any privileged shell — it balances the
   global count and releases the reference so `rmmod` succeeds again.
-- The device checks `CAP_SYS_ADMIN` at `open()` only. Do not pass an open
-  fd to an unprivileged process (SCM_RIGHTS, inherited fds): the receiver
-  would get full ioctl access. The daemon/CLI never does this.
+- `CAP_SYS_ADMIN` is rechecked on every ioctl, not just at `open()` — a
+  process that opens the device privileged and later drops privileges (a
+  normal pattern), or one that receives the fd via `SCM_RIGHTS` or an
+  inherited `exec()`, does not retain access once it's no longer
+  privileged. `test/priv_drop_test.c` proves this directly: it opens the
+  device as root, drops all privileges on the same process while keeping
+  the fd open, and confirms the next ioctl is rejected with `-EPERM`
+  (`sudo ./test.sh` runs it as part of the live suite).
 - ptrace denial works on the standard `__x64_sys_ptrace` / `__ia32_sys_ptrace`
   entries. A cheat that invokes the `ptrace` functionality through other
   kernel paths (e.g., `process_vm_readv` on an attached victim) is out of
@@ -310,6 +315,8 @@ test.sh                  end-to-end live test (root)
 diag.sh                  root diagnostics (dmesg, discovery, module walk)
 test/mock_anticheat.c    LD_PRELOAD mock of /dev/anticheat (no-root tests)
 test/mock_test.sh        mock test suite: `make test-mock`
+test/priv_drop_test.c    live test: proves ac_ioctl() rechecks CAP_SYS_ADMIN
+                         (root, real module -- run via test.sh)
 src/anticheat.h          shared ioctl ABI
 src/anticheat_module.c   the kernel module
 src/anticheat_daemon.c   userspace daemon + CLI

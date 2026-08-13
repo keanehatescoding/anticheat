@@ -952,6 +952,13 @@ static int ac_build_mod_snapshot(struct ac_fd_state *st)
         if (n >= AC_MAX_MODS)
             break;
         mi = &st->mods[n];
+        /* memset first: name[]+size+state leaves 4 bytes of compiler
+         * padding for 8-byte struct alignment that strscpy/direct field
+         * assignment never touch. MODS_GET copies this struct to
+         * userspace verbatim, so unzeroed padding is a real (if small)
+         * kernel info leak -- same bug class as the GET_EVENTS fix above,
+         * found by the same audit. */
+        memset(mi, 0, sizeof(*mi));
         strscpy(mi->name, mod->name, sizeof(mi->name));
         mi->size = ac_module_size(mod);
         mi->state = mod->state;
@@ -969,6 +976,18 @@ static long ac_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 {
     void __user *uarg = (void __user *)arg;
     int ret = 0;
+
+    /* ac_open() already gated this fd to a CAP_SYS_ADMIN caller, but that
+     * check ran once, for whoever called open() -- it says nothing about
+     * who's calling ioctl() now. A process can legitimately open a
+     * privileged fd and then drop privileges for the rest of its life (a
+     * completely normal pattern), or the fd can cross a privilege boundary
+     * entirely via SCM_RIGHTS or an inherited exec(). Without rechecking
+     * here, whoever ends up holding the fd keeps full access -- including
+     * LOCK (pin the module permanently) and ADD_PROC/DEL_PROC (rewrite
+     * protection state) -- regardless of their current privilege. */
+    if (!capable(CAP_SYS_ADMIN))
+        return -EPERM;
 
     switch (cmd) {
     case AC_IOCTL_STATUS: {
@@ -1133,7 +1152,14 @@ static long ac_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
         }
         return 0;
     case AC_IOCTL_GET_EVENTS: {
-        struct ac_event_list *el = kmalloc(sizeof(*el), GFP_KERNEL);
+        /* kzalloc, not kmalloc: ac_drain_events() only fills events[0..count),
+         * leaving events[count..AC_MAX_EVENTS) untouched. The ioctl below
+         * copies the whole struct to userspace regardless of count, so an
+         * un-zeroed allocation would leak whatever uninitialized kernel heap
+         * data happened to be in that slab slot -- a real info-disclosure
+         * bug (CWE-457/CWE-200), not just a style nit. Found during an
+         * input-hardening audit of every ioctl handler, not by symptom. */
+        struct ac_event_list *el = kzalloc(sizeof(*el), GFP_KERNEL);
 
         if (!el)
             return -ENOMEM;

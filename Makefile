@@ -54,6 +54,15 @@ mock: test/libmock_anticheat.so
 test/libmock_anticheat.so: test/mock_anticheat.c src/anticheat.h
 	$(CC) $(CFLAGS) -fPIC -shared -o $@ $< -ldl
 
+# real (non-mock) live test helper: proves ac_ioctl() rechecks
+# CAP_SYS_ADMIN by opening /dev/anticheat as root, dropping privileges,
+# and confirming the ioctl is rejected. Needs the module loaded and root
+# to run -- see test.sh.
+priv-drop-test: test/priv_drop_test
+
+test/priv_drop_test: test/priv_drop_test.c src/anticheat.h
+	$(CC) $(CFLAGS) -o $@ $<
+
 # run the daemon CLI against the userspace mock (no kernel module, no root)
 test-mock: mock daemon
 	./test/mock_test.sh
@@ -68,7 +77,7 @@ ci:
 
 clean:
 	@if [ -d $(KDIR) ]; then $(MAKE) -C $(KDIR) M=$(PWD) clean; fi
-	rm -f anticheat test/libmock_anticheat.so
+	rm -f anticheat test/libmock_anticheat.so test/priv_drop_test
 
 install: all
 	install -D -m 0755 anticheat /usr/local/sbin/anticheat

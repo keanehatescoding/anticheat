@@ -26,6 +26,7 @@ trap cleanup EXIT
 
 say "building"
 make >/dev/null 2>&1 || { echo "build failed"; exit 1; }
+make priv-drop-test >/dev/null 2>&1 || { echo "priv-drop-test build failed"; exit 1; }
 
 say "loading anticheat.ko"
 rmmod anticheat 2>/dev/null
@@ -40,6 +41,18 @@ if ./anticheat syscalls; then ok "syscall table clean"; else bad "syscall check"
 
 say "module enumeration"
 if ./anticheat modules >/dev/null; then ok "modules listed"; else bad "modules"; fi
+
+say "ioctl hardening: fd opened as root, then privileges dropped"
+if ./test/priv_drop_test; then
+    ok "ioctl correctly rejected after privilege drop"
+else
+    rc=$?
+    if [ "$rc" -eq 2 ]; then
+        bad "priv_drop_test environment problem (see stderr above)"
+    else
+        bad "ioctl NOT rejected after privilege drop (see stderr above)"
+    fi
+fi
 
 say "protecting a victim process (a bash that will fork a child)"
 bash -c 'sleep 300 & echo $! > /tmp/ac_child.pid; wait' &

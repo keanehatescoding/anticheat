@@ -13,6 +13,7 @@ anticheat.mod.o
 Module.symvers
 modules.order
 test/libmock_anticheat.so
+test/priv_drop_test
 
 # runtime state
 *.log

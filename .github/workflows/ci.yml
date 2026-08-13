@@ -16,6 +16,9 @@ jobs:
       - name: Build with warnings-as-errors, run the full mock suite
         run: make ci
 
+      - name: Build the privilege-drop test helper (compile check only)
+        run: make CFLAGS="-O2 -Wall -Wextra -Werror" priv-drop-test
+
       - name: Shellcheck the shell scripts
         run: |
           command -v shellcheck >/dev/null 2>&1 || \
