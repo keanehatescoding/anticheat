@@ -11,6 +11,7 @@
  *   list                   list protected processes
  *   scan --pid N           VMA scan (RWX detection)
  *   scan --pid N --hash [--save|--check]   memory integrity baselines
+ *   scan --pid N --check-hooks             Vulkan present-call hook check
  *   syscalls               verify syscall table integrity
  *   modules                list modules + detect hidden modules
  *   events [--watch]       dump pending security events (--watch: poll)
@@ -33,6 +34,7 @@
 #include <time.h>
 #include <dirent.h>
 #include <ctype.h>
+#include <dlfcn.h>
 #include <sys/ioctl.h>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -373,11 +375,152 @@ static void baseline_path_for(const char *path, char out[PATH_MAX])
     snprintf(out, PATH_MAX, "%s/%s.txt", ac_baseline_dir(), hex);
 }
 
+/* ------------------------------------------------------------------ */
+/* render-hook detection (Vulkan present-call inline-hook check)       */
+/*                                                                      */
+/* ESP/wallhack/aimbot overlays typically work by hooking the graphics */
+/* API's frame-present call. On Linux this is a good, narrow target:   */
+/* native Vulkan games AND Proton D3D9/10/11/12 titles all route       */
+/* through libvulkan.so's vkQueuePresentKHR, since DXVK/VKD3D-Proton   */
+/* translate D3D down to Vulkan -- one check point, broad coverage.    */
+/*                                                                      */
+/* Detection needs no signature database: we dlopen() the exact same   */
+/* on-disk file the target has mapped, read vkQueuePresentKHR's first  */
+/* bytes out of *our own* fresh load of it, and compare against the    */
+/* same bytes read from the target's memory at the equivalent runtime  */
+/* address. A classic inline/trampoline hook (redirecting the function */
+/* to a jmp into injected code) changes those leading bytes; a clean   */
+/* process matches byte-for-byte. The "known good" copy can't go stale */
+/* across distros or loader versions since it's whatever the target    */
+/* itself is using, read fresh at check time.                          */
+/*                                                                      */
+/* Known blind spot, documented rather than silently missed: a cheat   */
+/* that hooks via LD_PRELOAD interposition or a malicious Vulkan layer */
+/* (VK_LAYER_*) rather than patching vkQueuePresentKHR's bytes in      */
+/* place is not caught by this check -- see README.                    */
+/* ------------------------------------------------------------------ */
+#define AC_HOOK_CHECK_BYTES 32
+
+/* dlopen()s libpath in *this* process to get a known-good reference
+ * copy of `symbol`, then compares its first AC_HOOK_CHECK_BYTES against
+ * the same offset in the target pid's mapping of the identical file
+ * (lib_base = that mapping's lowest VMA start, i.e. its file-offset-0
+ * load address). Returns 1 if hooked, 0 if clean, -1 if inconclusive
+ * (never treated as a positive detection -- an unreadable/unloadable
+ * library is a skip, not an alert). */
+static int compare_render_symbol(int pid, const char *libpath,
+                                  unsigned long long lib_base,
+                                  const char *symbol)
+{
+    void *handle;
+    void *sym;
+    Dl_info info;
+    uintptr_t offset;
+    unsigned char expected[AC_HOOK_CHECK_BYTES];
+    unsigned char actual[AC_HOOK_CHECK_BYTES];
+    char memp[64];
+    int fd;
+    ssize_t r;
+
+    handle = dlopen(libpath, RTLD_NOW | RTLD_LOCAL);
+    if (!handle) {
+        printf("  render-hook check: could not load %s locally (%s), skipping\n",
+               libpath, dlerror());
+        return -1;
+    }
+    sym = dlsym(handle, symbol);
+    if (!sym || !dladdr(sym, &info) || !info.dli_fbase) {
+        printf("  render-hook check: %s not found in %s, skipping\n",
+               symbol, libpath);
+        dlclose(handle);
+        return -1;
+    }
+    offset = (uintptr_t)sym - (uintptr_t)info.dli_fbase;
+    memcpy(expected, sym, AC_HOOK_CHECK_BYTES);
+    dlclose(handle);
+
+    snprintf(memp, sizeof(memp), "/proc/%d/mem", pid);
+    fd = open(memp, O_RDONLY);
+    if (fd < 0) {
+        printf("  render-hook check: cannot open %s (%s), skipping\n",
+               memp, strerror(errno));
+        return -1;
+    }
+    r = pread(fd, actual, AC_HOOK_CHECK_BYTES, (off_t)(lib_base + offset));
+    close(fd);
+    if (r != AC_HOOK_CHECK_BYTES) {
+        printf("  render-hook check: could not read target's %s, skipping\n",
+               symbol);
+        return -1;
+    }
+
+    if (memcmp(expected, actual, AC_HOOK_CHECK_BYTES) != 0) {
+        printf("  [!] render hook: %s in %s (target pid %d) differs from a\n"
+               "      freshly-loaded reference copy of the same file --\n"
+               "      possible ESP/overlay/render hijack\n",
+               symbol, libpath, pid);
+        return 1;
+    }
+    printf("  render-hook check: %s clean (%s)\n", symbol, libpath);
+    return 0;
+}
+
+/* Single streaming pass over the target's VMAs to find libvulkan.so*'s
+ * load base, without collecting the (potentially thousands-of-entries)
+ * VMA list into memory -- same "don't build a big buffer you don't
+ * need" discipline as the rest of this file. */
+static int check_vulkan_present_hook(int pid)
+{
+    struct ac_scan_begin b;
+    unsigned int v;
+    char libpath[AC_VMA_PATH] = "";
+    unsigned long long lib_base = 0;
+    int found = 0;
+
+    memset(&b, 0, sizeof(b));
+    b.pid = pid;
+    b.emit_events = 0;
+    if (ioctl(dev_fd, AC_IOCTL_SCAN_BEGIN, &b) < 0) {
+        printf("  render-hook check: scan failed (%s)\n", strerror(errno));
+        return -1;
+    }
+    for (v = 0; v < b.n_vmas; v++) {
+        struct ac_scan_get g;
+        struct ac_vma_info *vi;
+        const char *base;
+
+        memset(&g, 0, sizeof(g));
+        g.pid = pid;
+        g.index = v;
+        if (ioctl(dev_fd, AC_IOCTL_SCAN_GET, &g) < 0)
+            break;
+        vi = &g.vma;
+        if (!vi->is_file || !vi->path[0])
+            continue;
+        base = strrchr(vi->path, '/');
+        base = base ? base + 1 : vi->path;
+        if (strncmp(base, "libvulkan.so", 12) != 0)
+            continue;
+        if (!found || vi->start < lib_base) {
+            lib_base = vi->start;
+            snprintf(libpath, sizeof(libpath), "%s", vi->path);
+            found = 1;
+        }
+    }
+    ioctl(dev_fd, AC_IOCTL_SCAN_END, NULL);
+
+    if (!found) {
+        printf("  render-hook check: libvulkan not loaded in this process, skipping\n");
+        return 0;
+    }
+    return compare_render_symbol(pid, libpath, lib_base, "vkQueuePresentKHR");
+}
+
 static int cmd_scan(int argc, char **argv)
 {
     struct ac_scan_begin b;
     int pid = -1, i;
-    int do_hash = 0, do_save = 0, do_check = 0;
+    int do_hash = 0, do_save = 0, do_check = 0, do_hooks = 0;
     char exe[PATH_MAX] = "";
     char *exe_link;
     unsigned int v;
@@ -391,9 +534,11 @@ static int cmd_scan(int argc, char **argv)
             do_save = 1;
         else if (strcmp(argv[i], "--check") == 0)
             do_check = 1;
+        else if (strcmp(argv[i], "--check-hooks") == 0)
+            do_hooks = 1;
     }
     if (pid < 0)
-        die("usage: anticheat scan --pid N [--hash [--save|--check]]");
+        die("usage: anticheat scan --pid N [--hash [--save|--check]] [--check-hooks]");
 
     ac_open();
     memset(&b, 0, sizeof(b));
@@ -432,6 +577,9 @@ static int cmd_scan(int argc, char **argv)
                    vi->start, vi->end, vi->path[0] ? vi->path : "(anonymous)");
     }
     ioctl(dev_fd, AC_IOCTL_SCAN_END, NULL);
+
+    if (do_hooks)
+        check_vulkan_present_hook(pid);
 
     if (do_hash) {
         exe_link = proc_exe_path(pid);
@@ -968,7 +1116,7 @@ static void usage(const char *prog)
            "  protect --pid N | --comm NAME\n"
            "  unprotect --pid N\n"
            "  list                       list protected processes\n"
-           "  scan --pid N [--hash [--save|--check]]\n"
+           "  scan --pid N [--hash [--save|--check]] [--check-hooks]\n"
            "  syscalls                   verify syscall table integrity\n"
            "  modules                    kernel module list + hidden module check\n"
            "  events [--watch]           dump security events\n"

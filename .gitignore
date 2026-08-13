@@ -14,6 +14,7 @@ Module.symvers
 modules.order
 test/libmock_anticheat.so
 test/priv_drop_test
+test/render_hook_test
 
 # runtime state
 *.log

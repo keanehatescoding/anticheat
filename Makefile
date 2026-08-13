@@ -47,7 +47,7 @@ module:
 	$(MAKE) -C $(KDIR) M=$(PWD) LLVM=$(LLVM) modules
 
 daemon: src/anticheat_daemon.c src/sha256.c src/sha256.h src/anticheat.h
-	$(CC) $(CFLAGS) -o anticheat src/anticheat_daemon.c src/sha256.c
+	$(CC) $(CFLAGS) -o anticheat src/anticheat_daemon.c src/sha256.c -ldl
 
 mock: test/libmock_anticheat.so
 
@@ -63,6 +63,15 @@ priv-drop-test: test/priv_drop_test
 test/priv_drop_test: test/priv_drop_test.c src/anticheat.h
 	$(CC) $(CFLAGS) -o $@ $<
 
+# render-hook live test helper: self-hooks vkQueuePresentKHR in its own
+# process (harmless -- the patched bytes are never called) so `scan
+# --check-hooks` has a real, known-tampered target to detect. Needs root
+# to run the scan against it (uses the device) -- see test.sh.
+render-hook-test: test/render_hook_test
+
+test/render_hook_test: test/render_hook_test.c src/anticheat.h
+	$(CC) $(CFLAGS) -o $@ $< -ldl
+
 # run the daemon CLI against the userspace mock (no kernel module, no root)
 test-mock: mock daemon
 	./test/mock_test.sh
@@ -77,7 +86,7 @@ ci:
 
 clean:
 	@if [ -d $(KDIR) ]; then $(MAKE) -C $(KDIR) M=$(PWD) clean; fi
-	rm -f anticheat test/libmock_anticheat.so test/priv_drop_test
+	rm -f anticheat test/libmock_anticheat.so test/priv_drop_test test/render_hook_test
 
 install: all
 	install -D -m 0755 anticheat /usr/local/sbin/anticheat
@@ -106,4 +115,4 @@ install-deck: all
 uninstall-deck:
 	rm -rf $(DECK_PREFIX)
 
-.PHONY: all module daemon mock test-mock ci clean install uninstall install-deck uninstall-deck
+.PHONY: all module daemon mock test-mock priv-drop-test render-hook-test ci clean install uninstall install-deck uninstall-deck

@@ -19,6 +19,9 @@ jobs:
       - name: Build the privilege-drop test helper (compile check only)
         run: make CFLAGS="-O2 -Wall -Wextra -Werror" priv-drop-test
 
+      - name: Build the render-hook test helper (compile check only)
+        run: make CFLAGS="-O2 -Wall -Wextra -Werror" render-hook-test
+
       - name: Shellcheck the shell scripts
         run: |
           command -v shellcheck >/dev/null 2>&1 || \

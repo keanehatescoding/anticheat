@@ -92,6 +92,7 @@ anticheat list                       list protected processes
 anticheat scan --pid N               VMA scan, RWX + anon-exec detection
 anticheat scan --pid N --hash --save    create memory-integrity baselines
 anticheat scan --pid N --hash --check   verify runtime memory vs baseline
+anticheat scan --pid N --check-hooks    Vulkan present-call hook check
 anticheat syscalls                   verify syscall table integrity
 anticheat modules                    detect modules hidden from /proc/modules
 anticheat events [--watch]           dump security events
@@ -120,6 +121,43 @@ file-backed executable mapping; override the directory with the
 `AC_BASELINE_DIR` environment variable). `--check` reports mappings whose
 runtime content differs from the baseline — a strong signal of runtime code
 patching.
+
+### Render-hook detection (Vulkan present-call)
+
+`scan --pid N --check-hooks` checks for the classic ESP/overlay/aimbot
+technique of inline-hooking the graphics API's frame-present call. It
+targets **Vulkan only** (`vkQueuePresentKHR` in `libvulkan.so`), which on
+Linux is a deliberately narrow but broadly effective choice: native Vulkan
+games hit it directly, and Proton D3D9/10/11/12 titles hit it too, since
+DXVK/VKD3D-Proton translate D3D calls down to Vulkan — one check point, wide
+practical coverage, no separate GLX/OpenGL path needed for the common case.
+
+This needs no signature database and can't go stale across distros or
+Vulkan loader versions: the daemon `dlopen()`s the *exact same on-disk
+file* the target process has mapped, reads `vkQueuePresentKHR`'s first 32
+bytes out of that fresh local load (via `dladdr()` to resolve the symbol's
+file-relative offset), and compares them against the same offset read from
+the target's memory (`/proc/<pid>/mem`, the same mechanism `--hash` already
+uses — see `compare_render_symbol()` in the daemon). A classic
+inline/trampoline hook — patching the function's leading bytes to jump into
+injected code — changes those bytes; an unmodified process matches
+byte-for-byte. The reference copy is whatever the target itself is
+currently using, read fresh at check time, so there's nothing to maintain
+as Mesa/NVIDIA driver or Vulkan loader versions change.
+
+Known blind spot, not a bug: this catches in-place byte patching of the
+exported function, not a cheat that intercepts the call via `LD_PRELOAD`
+symbol interposition or a malicious Vulkan layer (`VK_LAYER_*`) — those
+never touch `vkQueuePresentKHR`'s actual bytes. Also, like the rest of this
+tool (see Design notes below), it isn't mount-namespace-aware: if the
+target resolves `libvulkan.so` to a path only visible inside its own
+container/sandbox, the daemon may be unable to open the identical file to
+build a reference copy, and the check is skipped rather than guessing.
+`--check-hooks` is currently a one-shot `scan` flag only, not yet wired
+into the periodic `start` monitoring loop — `test/render_hook_test.c`
+proves the detection itself works (self-hooks `vkQueuePresentKHR` in a
+throwaway process and confirms the scan flags it; run via `test.sh`
+against a real loaded module).
 
 ## Build
 
@@ -317,6 +355,9 @@ test/mock_anticheat.c    LD_PRELOAD mock of /dev/anticheat (no-root tests)
 test/mock_test.sh        mock test suite: `make test-mock`
 test/priv_drop_test.c    live test: proves ac_ioctl() rechecks CAP_SYS_ADMIN
                          (root, real module -- run via test.sh)
+test/render_hook_test.c  live test: self-hooks vkQueuePresentKHR, proves
+                         `scan --check-hooks` detects it (root, real module
+                         -- run via test.sh)
 src/anticheat.h          shared ioctl ABI
 src/anticheat_module.c   the kernel module
 src/anticheat_daemon.c   userspace daemon + CLI

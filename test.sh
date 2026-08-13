@@ -103,6 +103,60 @@ else
     bad "anon-exec detection found nothing (expected vdso at minimum)"
 fi
 
+say "render-hook check (Vulkan present-call) against a real, untampered process"
+# Find whatever process on this machine currently has libvulkan.so loaded --
+# game or not, this proves the check works against a real target rather than
+# only exercising the "not loaded, skip" path. Not every machine will have
+# one running; that's a skip, not a failure.
+VK_PID=""
+for m in /proc/[0-9]*/maps; do
+    if grep -q libvulkan "$m" 2>/dev/null; then
+        VK_PID=$(basename "$(dirname "$m")")
+        break
+    fi
+done
+if [ -n "$VK_PID" ]; then
+    HOOK_OUT=$(./anticheat scan --pid "$VK_PID" --check-hooks 2>&1)
+    if printf '%s' "$HOOK_OUT" | grep -q "render-hook check:.*clean"; then
+        ok "vkQueuePresentKHR matched reference copy (pid $VK_PID)"
+    elif printf '%s' "$HOOK_OUT" | grep -q "render hook"; then
+        bad "unexpected hook flagged on an untampered process (pid $VK_PID)"
+    else
+        bad "render-hook check produced neither clean nor hook result"
+    fi
+    say "render-hook check: does it actually catch a real hook?"
+    # The check above only proves the true-negative case (an untampered
+    # process reads as clean). A detector that never fires is useless, so
+    # also prove the true-positive case: self-hook vkQueuePresentKHR in a
+    # throwaway process and confirm the scan flags it. Gated on the same
+    # $VK_PID (i.e. this machine has a working Vulkan install) so a
+    # machine without libvulkan skips both checks together instead of
+    # this one failing for an unrelated environment reason.
+    make render-hook-test >/dev/null 2>&1
+    # render_hook_test loops forever once ready, so it can't be waited on
+    # normally; read its one line of startup output from a FIFO instead.
+    FIFO=$(mktemp -u)
+    mkfifo "$FIFO"
+    setsid ./test/render_hook_test >"$FIFO" 2>&1 &
+    HOOK_LINE=$(head -n1 "$FIFO")
+    rm -f "$FIFO"
+    HOOK_PID=$(printf '%s' "$HOOK_LINE" | sed -n 's/^READY pid=\([0-9]*\)$/\1/p')
+    if [ -n "$HOOK_PID" ]; then
+        DETECT_OUT=$(./anticheat scan --pid "$HOOK_PID" --check-hooks 2>&1)
+        if printf '%s' "$DETECT_OUT" | grep -q "render hook"; then
+            ok "self-hooked vkQueuePresentKHR correctly flagged (pid $HOOK_PID)"
+        else
+            bad "self-hooked vkQueuePresentKHR was NOT flagged (pid $HOOK_PID)"
+        fi
+        kill "$HOOK_PID" 2>/dev/null
+        wait "$HOOK_PID" 2>/dev/null
+    else
+        bad "render_hook_test did not report READY (output: $HOOK_LINE)"
+    fi
+else
+    say "no process with libvulkan loaded found on this machine, skipping both render-hook checks"
+fi
+
 say "memory integrity baseline"
 if ./anticheat scan --pid "$VICTIM_PID" --hash --save >/dev/null 2>&1; then
     ok "baseline saved"
