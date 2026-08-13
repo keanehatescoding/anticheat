@@ -117,7 +117,13 @@ baseline was already saved for them via `--hash --save`
 (`check_baselines_periodic()`). It never creates a baseline on its own —
 only an operator running `--save` on a binary they've already verified
 clean does that — so a process with no saved baseline is silently skipped,
-not auto-trusted. Alerts go to syslog (`LOG_AUTH`) and
+not auto-trusted. Every 30 s (override via `AC_RENDER_HOOK_CHECK_INTERVAL`)
+it also re-checks every protected process for the same
+`vkQueuePresentKHR` inline-hook this checks for on demand via `scan
+--check-hooks` (`check_render_hooks_periodic()`) — silent unless it
+actually finds a hook, same as the baseline/anon-exec checks, since a
+clean result every cycle for every protected process would be log noise
+rather than signal. Alerts go to syslog (`LOG_AUTH`) and
 `/var/log/anticheat.log`.
 
 Baselines are stored in `/var/lib/anticheat/baselines/` (one SHA-256 per
@@ -157,11 +163,14 @@ tool (see Design notes below), it isn't mount-namespace-aware: if the
 target resolves `libvulkan.so` to a path only visible inside its own
 container/sandbox, the daemon may be unable to open the identical file to
 build a reference copy, and the check is skipped rather than guessing.
-`--check-hooks` is currently a one-shot `scan` flag only, not yet wired
-into the periodic `start` monitoring loop — `test/render_hook_test.c`
-proves the detection itself works (self-hooks `vkQueuePresentKHR` in a
-throwaway process and confirms the scan flags it; run via `test.sh`
-against a real loaded module).
+`scan --check-hooks` is the on-demand, human-facing form; the same
+detection also runs automatically every 30 s against every protected
+process from the `start` monitoring loop (see above) — a hook installed
+mid-session gets caught without anyone running a manual scan.
+`test/render_hook_test.c` proves the detection itself works (self-hooks
+`vkQueuePresentKHR` in a throwaway process), and `test.sh` exercises both
+the one-shot `scan --check-hooks` path and the periodic monitoring-loop
+path against it, against a real loaded module.
 
 ### Ban-pipeline reporting (server-side)
 
@@ -182,7 +191,7 @@ AC_REPORT_KEY=<report-key>
 Unset (the default), reporting is a complete no-op — no network activity
 at all. When set, every detection the monitoring loop already logs at
 `LOG_ALERT`/`LOG_CRIT` (syscall hook, hidden module, ptrace deny, baseline
-tamper, anon-exec growth — see `logmsg()`) is also POSTed to the server as
+tamper, anon-exec growth, render hook — see `logmsg()`) is also POSTed to the server as
 `{client_id, event_type, detail, ts}`. `client_id` is `/etc/machine-id`
 (falls back to the hostname). A hung or unreachable server can't stall
 detection: the send/receive timeout is 3s, and a failed report only logs a

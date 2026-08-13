@@ -423,7 +423,10 @@ static void baseline_path_for(const char *path, char out[PATH_MAX])
  * (lib_base = that mapping's lowest VMA start, i.e. its file-offset-0
  * load address). Returns 1 if hooked, 0 if clean, -1 if inconclusive
  * (never treated as a positive detection -- an unreadable/unloadable
- * library is a skip, not an alert). */
+ * library is a skip, not an alert). Silent by design -- callers decide
+ * how (or whether) to surface the result, since the CLI's one-shot
+ * `scan --check-hooks` and the daemon's silent-unless-hooked periodic
+ * check want very different presentation of the same underlying check. */
 static int compare_render_symbol(int pid, const char *libpath,
                                   unsigned long long lib_base,
                                   const char *symbol)
@@ -439,15 +442,10 @@ static int compare_render_symbol(int pid, const char *libpath,
     ssize_t r;
 
     handle = dlopen(libpath, RTLD_NOW | RTLD_LOCAL);
-    if (!handle) {
-        printf("  render-hook check: could not load %s locally (%s), skipping\n",
-               libpath, dlerror());
+    if (!handle)
         return -1;
-    }
     sym = dlsym(handle, symbol);
     if (!sym || !dladdr(sym, &info) || !info.dli_fbase) {
-        printf("  render-hook check: %s not found in %s, skipping\n",
-               symbol, libpath);
         dlclose(handle);
         return -1;
     }
@@ -457,49 +455,37 @@ static int compare_render_symbol(int pid, const char *libpath,
 
     snprintf(memp, sizeof(memp), "/proc/%d/mem", pid);
     fd = open(memp, O_RDONLY);
-    if (fd < 0) {
-        printf("  render-hook check: cannot open %s (%s), skipping\n",
-               memp, strerror(errno));
+    if (fd < 0)
         return -1;
-    }
     r = pread(fd, actual, AC_HOOK_CHECK_BYTES, (off_t)(lib_base + offset));
     close(fd);
-    if (r != AC_HOOK_CHECK_BYTES) {
-        printf("  render-hook check: could not read target's %s, skipping\n",
-               symbol);
+    if (r != AC_HOOK_CHECK_BYTES)
         return -1;
-    }
 
-    if (memcmp(expected, actual, AC_HOOK_CHECK_BYTES) != 0) {
-        printf("  [!] render hook: %s in %s (target pid %d) differs from a\n"
-               "      freshly-loaded reference copy of the same file --\n"
-               "      possible ESP/overlay/render hijack\n",
-               symbol, libpath, pid);
-        return 1;
-    }
-    printf("  render-hook check: %s clean (%s)\n", symbol, libpath);
-    return 0;
+    return memcmp(expected, actual, AC_HOOK_CHECK_BYTES) != 0 ? 1 : 0;
 }
 
 /* Single streaming pass over the target's VMAs to find libvulkan.so*'s
  * load base, without collecting the (potentially thousands-of-entries)
  * VMA list into memory -- same "don't build a big buffer you don't
- * need" discipline as the rest of this file. */
-static int check_vulkan_present_hook(int pid)
+ * need" discipline as the rest of this file. Returns 1 if found (and
+ * fills libpath/lib_base), 0 if not loaded in this process, -1 on ioctl
+ * failure. */
+static int find_vulkan_lib(int pid, char *libpath, size_t libpath_sz,
+                            unsigned long long *lib_base)
 {
     struct ac_scan_begin b;
     unsigned int v;
-    char libpath[AC_VMA_PATH] = "";
-    unsigned long long lib_base = 0;
     int found = 0;
+
+    libpath[0] = '\0';
+    *lib_base = 0;
 
     memset(&b, 0, sizeof(b));
     b.pid = pid;
     b.emit_events = 0;
-    if (ioctl(dev_fd, AC_IOCTL_SCAN_BEGIN, &b) < 0) {
-        printf("  render-hook check: scan failed (%s)\n", strerror(errno));
+    if (ioctl(dev_fd, AC_IOCTL_SCAN_BEGIN, &b) < 0)
         return -1;
-    }
     for (v = 0; v < b.n_vmas; v++) {
         struct ac_scan_get g;
         struct ac_vma_info *vi;
@@ -517,19 +503,98 @@ static int check_vulkan_present_hook(int pid)
         base = base ? base + 1 : vi->path;
         if (strncmp(base, "libvulkan.so", 12) != 0)
             continue;
-        if (!found || vi->start < lib_base) {
-            lib_base = vi->start;
-            snprintf(libpath, sizeof(libpath), "%s", vi->path);
+        if (!found || vi->start < *lib_base) {
+            *lib_base = vi->start;
+            snprintf(libpath, libpath_sz, "%s", vi->path);
             found = 1;
         }
     }
     ioctl(dev_fd, AC_IOCTL_SCAN_END, NULL);
+    return found;
+}
 
-    if (!found) {
+/* render_hook_status(): the single source of truth both the one-shot CLI
+ * check and the periodic daemon check build on. Returns -2 (Vulkan not
+ * loaded in this process -- not an error, most processes), -1
+ * (inconclusive), 0 (clean), or 1 (hooked); fills libpath on any
+ * non-(-2) result. */
+static int render_hook_status(int pid, char *libpath, size_t libpath_sz)
+{
+    unsigned long long lib_base;
+    int found = find_vulkan_lib(pid, libpath, libpath_sz, &lib_base);
+
+    if (found < 0)
+        return -1;
+    if (found == 0)
+        return -2;
+    return compare_render_symbol(pid, libpath, lib_base, "vkQueuePresentKHR");
+}
+
+/* CLI-facing wrapper for `scan --check-hooks`: same detection as the
+ * periodic check below, but always prints a human-readable result. */
+static int check_vulkan_present_hook(int pid)
+{
+    char libpath[AC_VMA_PATH];
+    int status = render_hook_status(pid, libpath, sizeof(libpath));
+
+    switch (status) {
+    case -2:
         printf("  render-hook check: libvulkan not loaded in this process, skipping\n");
         return 0;
+    case -1:
+        printf("  render-hook check: could not verify vkQueuePresentKHR in %s, skipping\n",
+               libpath);
+        return -1;
+    case 1:
+        printf("  [!] render hook: vkQueuePresentKHR in %s (target pid %d) differs\n"
+               "      from a freshly-loaded reference copy of the same file --\n"
+               "      possible ESP/overlay/render hijack\n",
+               libpath, pid);
+        return 1;
+    default:
+        printf("  render-hook check: vkQueuePresentKHR clean (%s)\n", libpath);
+        return 0;
     }
-    return compare_render_symbol(pid, libpath, lib_base, "vkQueuePresentKHR");
+}
+
+/* Periodic daemon-loop counterpart: silent unless a hook is actually
+ * found (matching anon_baseline_check()/check_baselines_periodic()'s
+ * style -- a clean or skipped check every cycle for every protected
+ * process would be log noise, not signal). A detection here flows
+ * through logmsg() at LOG_CRIT, which -- via the ban-pipeline reporting
+ * hook in logmsg() -- also reports it if AC_REPORT_URL is configured,
+ * with no separate wiring needed. */
+static void check_render_hooks_periodic(void)
+{
+    struct ac_prot_list pl;
+    unsigned int i;
+
+    memset(&pl, 0, sizeof(pl));
+    if (ioctl(dev_fd, AC_IOCTL_LIST_PROTECTED, &pl) < 0)
+        return;
+    for (i = 0; i < pl.count; i++) {
+        char libpath[AC_VMA_PATH];
+        int status = render_hook_status(pl.items[i].pid, libpath, sizeof(libpath));
+
+        if (status == 1)
+            logmsg(LOG_CRIT, "pid %d (%s): render hook detected in %s "
+                   "(vkQueuePresentKHR differs from a freshly-loaded reference "
+                   "copy -- possible ESP/overlay/render hijack)",
+                   pl.items[i].pid, pl.items[i].comm, libpath);
+    }
+}
+
+/* Overridable the same way AC_BASELINE_CHECK_INTERVAL is, so test.sh can
+ * exercise this on a live kernel without a long real wait. Longer default
+ * than the other periodic checks: each protected process with Vulkan
+ * loaded costs a real dlopen()/dlsym()/dlclose() cycle, not just a cheap
+ * ioctl. */
+static int ac_render_hook_check_interval(void)
+{
+    const char *e = getenv("AC_RENDER_HOOK_CHECK_INTERVAL");
+    int v = e ? atoi(e) : 0;
+
+    return (v > 0) ? v : 30;
 }
 
 static int cmd_scan(int argc, char **argv)
@@ -1248,6 +1313,7 @@ static int cmd_start(int argc, char **argv)
     }
     {
         time_t next_sys = 0, next_mod = 0, next_scan = 0, next_baseline = 0;
+        time_t next_render = 0;
 
         while (!g_stop) {
             struct ac_event_list el;
@@ -1283,6 +1349,10 @@ static int cmd_start(int argc, char **argv)
             if (now >= next_baseline) {
                 check_baselines_periodic();
                 next_baseline = now + ac_baseline_check_interval();
+            }
+            if (now >= next_render) {
+                check_render_hooks_periodic();
+                next_render = now + ac_render_hook_check_interval();
             }
             sleep(1);
         }

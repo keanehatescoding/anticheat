@@ -150,6 +150,29 @@ if [ -n "$VK_PID" ]; then
         else
             bad "self-hooked vkQueuePresentKHR was NOT flagged (pid $HOOK_PID)"
         fi
+
+        say "render-hook check: periodic monitoring loop, not just one-shot scan"
+        # Both checks above only exercise `scan --check-hooks` on demand.
+        # Prove the daemon's own monitoring loop (start) catches the same
+        # hook on its own -- this is the actual deployed behavior, the
+        # one-shot command is a diagnostic tool on top of it.
+        if ./anticheat protect --pid "$HOOK_PID" >/dev/null 2>&1; then
+            AC_RENDER_HOOK_CHECK_INTERVAL=2 ./anticheat start --foreground \
+                >/tmp/ac_render_hook_test.log 2>&1 &
+            RENDER_DAEMON_PID=$!
+            sleep 4
+            if grep -q "render hook detected" /tmp/ac_render_hook_test.log; then
+                ok "periodic monitoring loop detected the self-hooked process"
+            else
+                bad "periodic monitoring loop did not detect the self-hooked process"
+            fi
+            kill "$RENDER_DAEMON_PID" 2>/dev/null
+            wait "$RENDER_DAEMON_PID" 2>/dev/null
+            rm -f /tmp/ac_render_hook_test.log
+        else
+            bad "could not protect render_hook_test pid for the periodic check"
+        fi
+
         kill "$HOOK_PID" 2>/dev/null
         wait "$HOOK_PID" 2>/dev/null
     else
