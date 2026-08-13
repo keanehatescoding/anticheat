@@ -276,6 +276,50 @@ else
     say "could not resolve a real libc path, skipping LD_PRELOAD positive-case checks"
 fi
 
+say "Vulkan-layer check: negative case (victim has none set)"
+VKLAYER_OUT=$(./anticheat scan --pid "$VICTIM_PID" --check-vklayers 2>&1)
+if printf '%s' "$VKLAYER_OUT" | grep -q "no layer-activation environment variables set"; then
+    ok "victim process correctly reports no Vulkan-layer env vars"
+else
+    bad "expected 'no layer-activation...' for a process with none set (got: $VKLAYER_OUT)"
+fi
+
+say "Vulkan-layer check: positive case (one-shot and periodic)"
+# VK_LAYER_PATH doesn't need to point at a real layer manifest for this
+# check -- it only reads the environment variable's value, it never
+# invokes the Vulkan loader. /tmp always exists, so this doesn't depend
+# on a Vulkan SDK being installed on the test machine.
+VK_LAYER_PATH=/tmp bash -c 'sleep 300' &
+VKLAYER_PID=$!
+sleep 0.3
+
+VKLAYER_OUT=$(./anticheat scan --pid "$VKLAYER_PID" --check-vklayers 2>&1)
+if printf '%s' "$VKLAYER_OUT" | grep -q "VK_LAYER_PATH=/tmp"; then
+    ok "one-shot check reports the VK_LAYER_PATH value"
+else
+    bad "one-shot check did not report VK_LAYER_PATH=/tmp (got: $VKLAYER_OUT)"
+fi
+
+if ./anticheat protect --pid "$VKLAYER_PID" >/dev/null 2>&1; then
+    AC_VK_LAYER_CHECK_INTERVAL=2 ./anticheat start --foreground \
+        >/tmp/ac_vklayer_test.log 2>&1 &
+    VKLAYER_DAEMON_PID=$!
+    sleep 4
+    if grep -q "VK_LAYER_PATH=/tmp" /tmp/ac_vklayer_test.log; then
+        ok "periodic monitoring loop detected VK_LAYER_PATH (LOG_WARNING, not a ban-pipeline report)"
+    else
+        bad "periodic monitoring loop did not detect VK_LAYER_PATH"
+    fi
+    kill "$VKLAYER_DAEMON_PID" 2>/dev/null
+    wait "$VKLAYER_DAEMON_PID" 2>/dev/null
+    rm -f /tmp/ac_vklayer_test.log
+else
+    bad "could not protect the VK_LAYER_PATH victim pid for the periodic check"
+fi
+
+kill "$VKLAYER_PID" 2>/dev/null
+wait "$VKLAYER_PID" 2>/dev/null
+
 say "memory integrity baseline"
 if ./anticheat scan --pid "$VICTIM_PID" --hash --save >/dev/null 2>&1; then
     ok "baseline saved"

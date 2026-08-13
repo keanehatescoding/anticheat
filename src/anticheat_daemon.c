@@ -13,6 +13,7 @@
  *   scan --pid N --hash [--save|--check]   memory integrity baselines
  *   scan --pid N --check-hooks             Vulkan present-call hook check
  *   scan --pid N --check-preload           LD_PRELOAD check (heuristic)
+ *   scan --pid N --check-vklayers          Vulkan-layer env var check (heuristic)
  *   syscalls               verify syscall table integrity
  *   modules                list modules + detect hidden modules
  *   events [--watch]       dump pending security events (--watch: poll)
@@ -726,10 +727,30 @@ static int ac_render_hook_check_interval(void)
     return (v > 0) ? v : 30;
 }
 
-/* Defined later alongside the periodic LD_PRELOAD checker; forward
- * declared here so the CLI wrapper below (and cmd_scan) can use it
- * without moving that whole section above this one. */
+/* Full implementations are defined later, alongside the periodic
+ * environment-based checks; forward declared here (plus the struct/data
+ * the CLI wrappers below need at compile time) so cmd_scan doesn't need
+ * that whole section moved above this one. */
+#define AC_ENVIRON_VAL_LEN 512
+
+struct ac_environ_query {
+    const char *name;                    /* variable name, no '=' */
+    char value[AC_ENVIRON_VAL_LEN];       /* out */
+    int found;                            /* out */
+};
+
+static int ac_read_environ_vars(int pid, struct ac_environ_query *vars,
+                                 unsigned int nvars);
 static int ac_read_ld_preload(int pid, char *out, size_t outsz);
+
+static const char *const AC_VK_LAYER_ENV_VARS[] = {
+    "VK_INSTANCE_LAYERS",
+    "VK_LOADER_LAYERS_ENABLE",
+    "VK_LAYER_PATH",
+    "VK_ADD_LAYER_PATH",
+};
+#define AC_VK_LAYER_ENV_VARS_COUNT \
+    (sizeof(AC_VK_LAYER_ENV_VARS) / sizeof(AC_VK_LAYER_ENV_VARS[0]))
 
 /* CLI-facing wrapper for `scan --check-preload`. */
 static int check_ld_preload(int pid)
@@ -753,11 +774,47 @@ static int check_ld_preload(int pid)
     return 1;
 }
 
+/* CLI-facing wrapper for `scan --check-vklayers`. Checks every candidate
+ * variable in one /proc/<pid>/environ pass (see ac_read_environ_vars()). */
+static int check_vk_layer_env(int pid)
+{
+    struct ac_environ_query vars[AC_VK_LAYER_ENV_VARS_COUNT];
+    unsigned int i;
+    int rc, found_any = 0;
+
+    for (i = 0; i < AC_VK_LAYER_ENV_VARS_COUNT; i++) {
+        memset(&vars[i], 0, sizeof(vars[i]));
+        vars[i].name = AC_VK_LAYER_ENV_VARS[i];
+    }
+    rc = ac_read_environ_vars(pid, vars, AC_VK_LAYER_ENV_VARS_COUNT);
+    if (rc < 0) {
+        printf("  Vulkan-layer check: could not fully read /proc/%d/environ (%s)\n",
+               pid, strerror(errno));
+        return -1;
+    }
+    for (i = 0; i < AC_VK_LAYER_ENV_VARS_COUNT; i++) {
+        if (!vars[i].found)
+            continue;
+        printf("  Vulkan-layer check: %s=%s\n", vars[i].name, vars[i].value);
+        found_any = 1;
+    }
+    if (!found_any) {
+        printf("  Vulkan-layer check: no layer-activation environment variables set\n");
+        return 0;
+    }
+    printf("    (informational only -- also used by legitimate overlay tools\n"
+           "     like MangoHud; not a verdict. An implicit layer manifest\n"
+           "     dropped into the loader's default search directories needs\n"
+           "     no environment variable and is not detected by this check)\n");
+    return 1;
+}
+
 static int cmd_scan(int argc, char **argv)
 {
     struct ac_scan_begin b;
     int pid = -1, i;
     int do_hash = 0, do_save = 0, do_check = 0, do_hooks = 0, do_preload = 0;
+    int do_vklayers = 0;
     char exe[PATH_MAX] = "";
     char *exe_link;
     unsigned int v;
@@ -775,10 +832,12 @@ static int cmd_scan(int argc, char **argv)
             do_hooks = 1;
         else if (strcmp(argv[i], "--check-preload") == 0)
             do_preload = 1;
+        else if (strcmp(argv[i], "--check-vklayers") == 0)
+            do_vklayers = 1;
     }
     if (pid < 0)
         die("usage: anticheat scan --pid N [--hash [--save|--check]] "
-            "[--check-hooks] [--check-preload]");
+            "[--check-hooks] [--check-preload] [--check-vklayers]");
 
     ac_open();
     memset(&b, 0, sizeof(b));
@@ -823,6 +882,9 @@ static int cmd_scan(int argc, char **argv)
 
     if (do_preload)
         check_ld_preload(pid);
+
+    if (do_vklayers)
+        check_vk_layer_env(pid);
 
     if (do_hash) {
         exe_link = proc_exe_path(pid);
@@ -1148,32 +1210,42 @@ static void anon_baseline_check(int pid, const char *comm, unsigned int count)
 }
 
 /* ------------------------------------------------------------------ */
-/* LD_PRELOAD detection                                                */
+/* environment-based hook-evasion detection (LD_PRELOAD, Vulkan layers)*/
 /*                                                                      */
-/* Catches library-interposition hooking -- the other documented blind */
-/* spot alongside malicious Vulkan layers (see the render-hook section  */
-/* in README): a cheat that intercepts vkQueuePresentKHR (or anything   */
-/* else) via LD_PRELOAD rather than inline-patching bytes never shows   */
-/* up in the render-hook check, since it never touches the target       */
-/* function's actual code.                                              */
-/*                                                                      */
-/* Deliberately a heuristic, not a verdict: MangoHud, gamemode,         */
-/* gamescope, and plenty of other completely legitimate tools also use  */
-/* LD_PRELOAD. This ships at LOG_WARNING, not LOG_ALERT/LOG_CRIT, so it  */
-/* does NOT flow through the ban-pipeline auto-report hook in logmsg()  */
-/* (scoped to pri <= LOG_CRIT) -- an operator sees it in the log, but   */
-/* it doesn't accumulate as a report against a client_id on its own.    */
+/* Both checks below share one primitive: catching hooking that never   */
+/* touches vkQueuePresentKHR's actual bytes, so the render-hook check   */
+/* above can't see it. Both are deliberately heuristics, not verdicts   */
+/* -- MangoHud, gamemode, gamescope, and other legitimate tools         */
+/* routinely use both LD_PRELOAD and Vulkan layers, this is literally   */
+/* how MangoHud's overlay works. Both ship at LOG_WARNING, not          */
+/* LOG_ALERT/LOG_CRIT, so neither flows through the ban-pipeline        */
+/* auto-report hook in logmsg() (scoped to pri <= LOG_CRIT) -- an       */
+/* operator sees them in the log, but they don't accumulate as a        */
+/* report against a client_id on their own.                             */
 /* ------------------------------------------------------------------ */
 #define AC_ENVIRON_BUF (256 * 1024)
+/* struct ac_environ_query, AC_ENVIRON_VAL_LEN, and the VK layer env var
+ * list are declared earlier (forward declarations before check_ld_preload)
+ * since the CLI wrappers there need them at compile time too. */
 
 /* /proc/<pid>/environ is populated once at exec() and never updated by
  * the process's own later setenv() calls -- exactly what's wanted here:
  * this shows what the process launched with, not whatever it might
  * claim about itself at runtime. NUL-separated KEY=VALUE entries.
- * Returns 1 (found, fills out), 0 (not set), -1 (unreadable, or too
- * large to read in full -- see below; errno is set in both cases so
- * callers can report why). */
-static int ac_read_ld_preload(int pid, char *out, size_t outsz)
+ *
+ * Reads environ exactly once and checks every entry against all of
+ * `vars` in the same pass (rather than making callers re-open/re-read
+ * the file once per variable name), filling vars[i].found/value for
+ * whichever are present. Returns 0 on success (some or none may be
+ * found; check vars[i].found individually), -1 if environ couldn't be
+ * read at all or was too large to read in full before hitting
+ * AC_ENVIRON_BUF -- in the latter case vars[i].found is only reliable
+ * for names that were actually matched (a variable that would have
+ * appeared past the truncation point is indistinguishable from one
+ * that was never set, so treat -1 as inconclusive, never a confident
+ * "not set"). errno is set on failure. */
+static int ac_read_environ_vars(int pid, struct ac_environ_query *vars,
+                                 unsigned int nvars)
 {
     char path[64];
     char *buf;
@@ -1181,7 +1253,11 @@ static int ac_read_ld_preload(int pid, char *out, size_t outsz)
     ssize_t n;
     int fd;
     size_t pos;
-    int truncated = 0;
+    unsigned int i;
+    int truncated;
+
+    for (i = 0; i < nvars; i++)
+        vars[i].found = 0;
 
     snprintf(path, sizeof(path), "/proc/%d/environ", pid);
     fd = open(path, O_RDONLY);
@@ -1195,10 +1271,7 @@ static int ac_read_ld_preload(int pid, char *out, size_t outsz)
 
     /* Loop to true EOF rather than trusting a single read() to capture
      * the whole file -- a real Steam/Proton/Flatpak launch environment
-     * can comfortably exceed one read's worth. If the buffer fills
-     * before EOF, this is inconclusive, not "not set": silently missing
-     * a real LD_PRELOAD that happens to sit past the cutoff would be
-     * exactly the false negative this check exists to avoid. */
+     * can comfortably exceed one read's worth. */
     while (total < AC_ENVIRON_BUF - 1) {
         n = read(fd, buf + total, AC_ENVIRON_BUF - 1 - total);
         if (n < 0) {
@@ -1215,10 +1288,7 @@ static int ac_read_ld_preload(int pid, char *out, size_t outsz)
         free(buf);
         return 0;
     }
-    if (total >= AC_ENVIRON_BUF - 1) {
-        truncated = 1;
-        errno = EMSGSIZE;
-    }
+    truncated = (total >= AC_ENVIRON_BUF - 1);
     buf[total] = '\0';
 
     for (pos = 0; pos < total; ) {
@@ -1227,16 +1297,59 @@ static int ac_read_ld_preload(int pid, char *out, size_t outsz)
 
         if (entry_len == 0)
             break;   /* malformed/truncated read -- stop rather than misread */
-        if (strncmp(entry, "LD_PRELOAD=", 11) == 0) {
-            snprintf(out, outsz, "%s", entry + 11);
-            free(buf);
-            return 1;
+        for (i = 0; i < nvars; i++) {
+            size_t nlen = strlen(vars[i].name);
+
+            if (!vars[i].found && entry_len > nlen &&
+                strncmp(entry, vars[i].name, nlen) == 0 && entry[nlen] == '=') {
+                snprintf(vars[i].value, sizeof(vars[i].value), "%s", entry + nlen + 1);
+                vars[i].found = 1;
+            }
         }
         pos += entry_len + 1;
     }
     free(buf);
-    return truncated ? -1 : 0;
+    if (truncated) {
+        errno = EMSGSIZE;
+        return -1;
+    }
+    return 0;
 }
+
+static int ac_read_ld_preload(int pid, char *out, size_t outsz)
+{
+    struct ac_environ_query q;
+    int rc;
+
+    memset(&q, 0, sizeof(q));
+    q.name = "LD_PRELOAD";
+    rc = ac_read_environ_vars(pid, &q, 1);
+    if (rc < 0)
+        return -1;
+    if (!q.found)
+        return 0;
+    snprintf(out, outsz, "%s", q.value);
+    return 1;
+}
+
+/* Vulkan-layer injection: the render-hook check above only catches
+ * in-place byte patching of vkQueuePresentKHR; a cheat can instead
+ * inject its hook via a Vulkan layer, which never touches those bytes
+ * at all. This covers only the environment-variable activation path:
+ * VK_INSTANCE_LAYERS (older loaders) / VK_LOADER_LAYERS_ENABLE (current
+ * loaders) force-enable a layer by name; VK_LAYER_PATH / VK_ADD_LAYER_PATH
+ * point the loader at additional manifest directories, which is how an
+ * attacker's own layer becomes discoverable at all.
+ *
+ * Known, honest gap: an *implicit* layer manifest dropped directly into
+ * one of the Vulkan loader's default search directories (e.g.
+ * ~/.local/share/vulkan/implicit_layer.d/) is auto-enabled by the
+ * loader with no environment variable involved at all, and is not
+ * caught by this check -- see README. Detecting that would mean parsing
+ * and cross-referencing layer manifest files against some notion of
+ * "expected", a meaningfully bigger feature than an environ heuristic.
+ * (AC_VK_LAYER_ENV_VARS itself is declared earlier, alongside
+ * struct ac_environ_query, for the same forward-declaration reason.) */
 
 /* Warn at most once per pid -- environ is static for the process's
  * lifetime, so re-checking every cycle would either always re-find
@@ -1318,6 +1431,99 @@ static void check_ld_preload_periodic(void)
 static int ac_ld_preload_check_interval(void)
 {
     const char *e = getenv("AC_LD_PRELOAD_CHECK_INTERVAL");
+    int v = e ? atoi(e) : 0;
+
+    return (v > 0) ? v : 10;
+}
+
+/* Same warn-at-most-once-per-pid reasoning and slot-tracking pattern as
+ * g_preload_warned above, kept as a separate array since a pid warned
+ * for one doesn't imply anything about the other. */
+struct ac_vklayer_warned {
+    int pid;
+    int in_use;
+};
+static struct ac_vklayer_warned g_vklayer_warned[AC_MAX_PROTS];
+
+static void vklayer_warned_forget_stale(const struct ac_prot_list *pl)
+{
+    unsigned int i, j;
+
+    for (i = 0; i < AC_MAX_PROTS; i++) {
+        if (!g_vklayer_warned[i].in_use)
+            continue;
+        for (j = 0; j < pl->count; j++)
+            if (pl->items[j].pid == g_vklayer_warned[i].pid)
+                break;
+        if (j == pl->count)
+            g_vklayer_warned[i].in_use = 0;
+    }
+}
+
+static int vklayer_already_warned(int pid)
+{
+    unsigned int i;
+
+    for (i = 0; i < AC_MAX_PROTS; i++)
+        if (g_vklayer_warned[i].in_use && g_vklayer_warned[i].pid == pid)
+            return 1;
+    return 0;
+}
+
+static void vklayer_mark_warned(int pid)
+{
+    unsigned int i, free_slot = AC_MAX_PROTS;
+
+    for (i = 0; i < AC_MAX_PROTS; i++) {
+        if (g_vklayer_warned[i].in_use && g_vklayer_warned[i].pid == pid)
+            return;
+        if (free_slot == AC_MAX_PROTS && !g_vklayer_warned[i].in_use)
+            free_slot = i;
+    }
+    if (free_slot != AC_MAX_PROTS) {
+        g_vklayer_warned[free_slot].pid = pid;
+        g_vklayer_warned[free_slot].in_use = 1;
+    }
+}
+
+static void check_vk_layers_periodic(void)
+{
+    struct ac_prot_list pl;
+    unsigned int i, j;
+
+    memset(&pl, 0, sizeof(pl));
+    if (ioctl(dev_fd, AC_IOCTL_LIST_PROTECTED, &pl) < 0)
+        return;
+    vklayer_warned_forget_stale(&pl);
+    for (i = 0; i < pl.count; i++) {
+        struct ac_environ_query vars[AC_VK_LAYER_ENV_VARS_COUNT];
+
+        if (vklayer_already_warned(pl.items[i].pid))
+            continue;
+        for (j = 0; j < AC_VK_LAYER_ENV_VARS_COUNT; j++) {
+            memset(&vars[j], 0, sizeof(vars[j]));
+            vars[j].name = AC_VK_LAYER_ENV_VARS[j];
+        }
+        if (ac_read_environ_vars(pl.items[i].pid, vars,
+                                  AC_VK_LAYER_ENV_VARS_COUNT) < 0)
+            continue;
+        for (j = 0; j < AC_VK_LAYER_ENV_VARS_COUNT; j++) {
+            if (!vars[j].found)
+                continue;
+            logmsg(LOG_WARNING, "pid %d (%s): %s=%s set at exec -- "
+                   "common for legitimate overlay tools (MangoHud) as well "
+                   "as Vulkan-layer-based hooking; informational only, not "
+                   "a verdict on its own",
+                   pl.items[i].pid, pl.items[i].comm,
+                   vars[j].name, vars[j].value);
+        }
+        vklayer_mark_warned(pl.items[i].pid);
+    }
+}
+
+static int ac_vk_layer_check_interval(void)
+{
+    const char *e = getenv("AC_VK_LAYER_CHECK_INTERVAL");
     int v = e ? atoi(e) : 0;
 
     return (v > 0) ? v : 10;
@@ -1728,7 +1934,7 @@ static int cmd_start(int argc, char **argv)
     }
     {
         time_t next_sys = 0, next_mod = 0, next_scan = 0, next_baseline = 0;
-        time_t next_render = 0, next_preload = 0;
+        time_t next_render = 0, next_preload = 0, next_vklayer = 0;
 
         while (!g_stop) {
             struct ac_event_list el;
@@ -1773,6 +1979,10 @@ static int cmd_start(int argc, char **argv)
                 check_ld_preload_periodic();
                 next_preload = now + ac_ld_preload_check_interval();
             }
+            if (now >= next_vklayer) {
+                check_vk_layers_periodic();
+                next_vklayer = now + ac_vk_layer_check_interval();
+            }
             sleep(1);
         }
     }
@@ -1791,7 +2001,8 @@ static void usage(const char *prog)
            "  protect --pid N | --comm NAME\n"
            "  unprotect --pid N\n"
            "  list                       list protected processes\n"
-           "  scan --pid N [--hash [--save|--check]] [--check-hooks] [--check-preload]\n"
+           "  scan --pid N [--hash [--save|--check]] [--check-hooks] "
+           "[--check-preload] [--check-vklayers]\n"
            "  syscalls                   verify syscall table integrity\n"
            "  modules                    kernel module list + hidden module check\n"
            "  events [--watch]           dump security events\n"

@@ -98,6 +98,7 @@ anticheat scan --pid N --hash --save    create memory-integrity baselines
 anticheat scan --pid N --hash --check   verify runtime memory vs baseline
 anticheat scan --pid N --check-hooks    Vulkan present-call hook check
 anticheat scan --pid N --check-preload  LD_PRELOAD check (heuristic, not a verdict)
+anticheat scan --pid N --check-vklayers Vulkan-layer env var check (heuristic, not a verdict)
 anticheat syscalls                   verify syscall table integrity
 anticheat modules                    detect modules hidden from /proc/modules
 anticheat events [--watch]           dump security events
@@ -125,11 +126,13 @@ it also re-checks every protected process for the same
 actually finds a hook, same as the baseline/anon-exec checks, since a
 clean result every cycle for every protected process would be log noise
 rather than signal. Every 10 s (override via
-`AC_LD_PRELOAD_CHECK_INTERVAL`) it also checks each newly-protected
-process's `LD_PRELOAD` (`check_ld_preload_periodic()`) — see below; unlike
-the other periodic checks this warns **at most once per pid**, since
+`AC_LD_PRELOAD_CHECK_INTERVAL` / `AC_VK_LAYER_CHECK_INTERVAL` respectively)
+it also checks each newly-protected process's `LD_PRELOAD`
+(`check_ld_preload_periodic()`) and Vulkan-layer-activation environment
+variables (`check_vk_layers_periodic()`) — see below; unlike the other
+periodic checks these warn **at most once per pid**, since
 `/proc/<pid>/environ` is fixed at `exec()` time and re-warning about the
-same unchanging value every cycle forever would be pure noise. Alerts go
+same unchanging values every cycle forever would be pure noise. Alerts go
 to syslog (`LOG_AUTH`) and `/var/log/anticheat.log`.
 
 Baselines are stored in `/var/lib/anticheat/baselines/` (one SHA-256 per
@@ -173,10 +176,11 @@ mount-namespace path does not run when the check reads it.
 
 Known blind spot, not a bug: this catches in-place byte patching of the
 exported function, not a cheat that intercepts the call via `LD_PRELOAD`
-symbol interposition or a malicious Vulkan layer (`VK_LAYER_*`) — those
-never touch `vkQueuePresentKHR`'s actual bytes. `--check-preload` below
-partially covers the `LD_PRELOAD` case (as a heuristic signal, not a
-verdict); `VK_LAYER_*` interception remains fully undetected.
+symbol interposition or a malicious Vulkan layer — those never touch
+`vkQueuePresentKHR`'s actual bytes. `--check-preload` and
+`--check-vklayers` below partially cover both cases, as heuristic signals,
+not verdicts — see the environment-variable-only caveat on the Vulkan-layer
+one specifically.
 
 **Mount-namespace aware.** The kernel-side VMA scan reports a path
 string for the target's library; opening that string directly from the
@@ -205,42 +209,64 @@ mid-session gets caught without anyone running a manual scan.
 the one-shot `scan --check-hooks` path and the periodic monitoring-loop
 path against it, against a real loaded module.
 
-### LD_PRELOAD detection
+### LD_PRELOAD and Vulkan-layer detection
 
-`scan --pid N --check-preload` reads a process's `/proc/<pid>/environ`
-for `LD_PRELOAD` and reports it if set. This is what closes one of the
-two documented render-hook blind spots above: a cheat that intercepts
-`vkQueuePresentKHR` (or anything else) via library interposition rather
-than inline-patching bytes never shows up in the render-hook check, since
-it never touches the target function's actual code — but it does have to
-set `LD_PRELOAD` to get loaded in the first place. (The other blind spot,
-a malicious `VK_LAYER_*` Vulkan layer, is a different mechanism and is
-still undetected.)
+`scan --pid N --check-preload` and `scan --pid N --check-vklayers` both
+read a process's `/proc/<pid>/environ` for specific variables and report
+them if set. Together these close the two documented render-hook blind
+spots above: a cheat that intercepts `vkQueuePresentKHR` via library
+interposition or a Vulkan layer, rather than inline-patching bytes, never
+shows up in the render-hook check, since neither ever touches the target
+function's actual code — but both require setting something in the
+process's environment to get loaded in the first place (with one caveat
+for layers — see below).
+
+`--check-preload` looks for `LD_PRELOAD`. `--check-vklayers` looks for
+`VK_INSTANCE_LAYERS`/`VK_LOADER_LAYERS_ENABLE` (force-enabling a layer by
+name — the older and current Vulkan loader mechanisms respectively) and
+`VK_LAYER_PATH`/`VK_ADD_LAYER_PATH` (pointing the loader at additional
+manifest directories, which is how an attacker's own layer becomes
+discoverable at all) — both share one internal primitive
+(`ac_read_environ_vars()`) that reads `environ` once and checks every
+candidate name in the same pass, rather than reopening the file per
+variable.
 
 `environ` is read directly rather than trusted from anywhere the process
 itself could have relabeled at runtime: it's populated once by the kernel
 at `exec()` and never updated by the process's own later `setenv()`
 calls, so this reflects what the process actually launched with.
 
-**Deliberately a heuristic, not a verdict.** `MangoHud`, `gamemode`,
-`gamescope`, and plenty of other completely legitimate tools also use
-`LD_PRELOAD` — a game running with an FPS overlay or a compatibility
-shim is normal, not suspicious, and this check says so explicitly in its
+**Deliberately heuristics, not verdicts.** `MangoHud`, `gamemode`,
+`gamescope`, and plenty of other completely legitimate tools use both
+`LD_PRELOAD` and Vulkan layers routinely — MangoHud's overlay *is* a
+Vulkan layer. A game running with an FPS overlay or a compatibility shim
+is normal, not suspicious, and both checks say so explicitly in their
 output rather than framing every hit as an alert. In the periodic
-monitoring loop it logs at `LOG_WARNING`, not `LOG_ALERT`/`LOG_CRIT` —
+monitoring loop both log at `LOG_WARNING`, not `LOG_ALERT`/`LOG_CRIT` —
 which matters beyond just log severity: the ban-pipeline auto-report hook
-in `logmsg()` only fires at `LOG_ALERT`/`LOG_CRIT`, so an `LD_PRELOAD`
-detection is visible to an operator in the log but does **not** by itself
-accumulate as a report against a `client_id`. It's a fact for a human
-reviewing other evidence to correlate against, the same design instinct
-as anon-exec detection flagging presence rather than passing judgment.
+in `logmsg()` only fires at `LOG_ALERT`/`LOG_CRIT`, so a detection here is
+visible to an operator in the log but does **not** by itself accumulate as
+a report against a `client_id`. It's a fact for a human reviewing other
+evidence to correlate against, the same design instinct as anon-exec
+detection flagging presence rather than passing judgment.
 
-`test.sh` exercises both a negative case (a plain victim process reports
-"not set") and a positive case (a victim launched with `LD_PRELOAD` set
-to, harmlessly, its own libc — inert since the dynamic linker already
-loads it regardless, just enough to make `LD_PRELOAD` non-empty) through
-both the one-shot `scan --check-preload` path and the periodic
-monitoring-loop path, against a real loaded module.
+**`--check-vklayers`'s own honest gap:** it only covers the
+environment-variable activation path. An *implicit* Vulkan layer manifest
+dropped directly into one of the loader's default search directories
+(e.g. `~/.local/share/vulkan/implicit_layer.d/`) is auto-enabled with no
+environment variable involved at all, and is not detected by this check.
+Catching that would mean parsing and cross-referencing layer manifest
+files against some notion of "expected", a meaningfully bigger feature
+than an environ heuristic — a real gap, not papered over.
+
+`test.sh` exercises both checks the same way: a negative case (a plain
+victim process reports nothing set) and a positive case (a victim
+launched with the relevant variable set to something harmless — for
+`LD_PRELOAD`, its own libc, inert since the dynamic linker already loads
+it regardless; for `VK_LAYER_PATH`, `/tmp`, since the check only reads the
+variable's value and never invokes the Vulkan loader) through both the
+one-shot `scan` path and the periodic monitoring-loop path, against a real
+loaded module.
 
 ### Ban-pipeline reporting (server-side)
 
