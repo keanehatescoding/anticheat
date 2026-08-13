@@ -12,6 +12,7 @@
  *   scan --pid N           VMA scan (RWX detection)
  *   scan --pid N --hash [--save|--check]   memory integrity baselines
  *   scan --pid N --check-hooks             Vulkan present-call hook check
+ *   scan --pid N --check-preload           LD_PRELOAD check (heuristic)
  *   syscalls               verify syscall table integrity
  *   modules                list modules + detect hidden modules
  *   events [--watch]       dump pending security events (--watch: poll)
@@ -597,11 +598,38 @@ static int ac_render_hook_check_interval(void)
     return (v > 0) ? v : 30;
 }
 
+/* Defined later alongside the periodic LD_PRELOAD checker; forward
+ * declared here so the CLI wrapper below (and cmd_scan) can use it
+ * without moving that whole section above this one. */
+static int ac_read_ld_preload(int pid, char *out, size_t outsz);
+
+/* CLI-facing wrapper for `scan --check-preload`. */
+static int check_ld_preload(int pid)
+{
+    char val[512];
+    int rc = ac_read_ld_preload(pid, val, sizeof(val));
+
+    if (rc < 0) {
+        printf("  LD_PRELOAD check: could not read /proc/%d/environ (%s)\n",
+               pid, strerror(errno));
+        return -1;
+    }
+    if (rc == 0) {
+        printf("  LD_PRELOAD check: not set\n");
+        return 0;
+    }
+    printf("  LD_PRELOAD check: %s\n"
+           "    (informational only -- also used by legitimate overlay/compat\n"
+           "     tools like MangoHud, gamemode, gamescope; not a verdict)\n",
+           val);
+    return 1;
+}
+
 static int cmd_scan(int argc, char **argv)
 {
     struct ac_scan_begin b;
     int pid = -1, i;
-    int do_hash = 0, do_save = 0, do_check = 0, do_hooks = 0;
+    int do_hash = 0, do_save = 0, do_check = 0, do_hooks = 0, do_preload = 0;
     char exe[PATH_MAX] = "";
     char *exe_link;
     unsigned int v;
@@ -617,9 +645,12 @@ static int cmd_scan(int argc, char **argv)
             do_check = 1;
         else if (strcmp(argv[i], "--check-hooks") == 0)
             do_hooks = 1;
+        else if (strcmp(argv[i], "--check-preload") == 0)
+            do_preload = 1;
     }
     if (pid < 0)
-        die("usage: anticheat scan --pid N [--hash [--save|--check]] [--check-hooks]");
+        die("usage: anticheat scan --pid N [--hash [--save|--check]] "
+            "[--check-hooks] [--check-preload]");
 
     ac_open();
     memset(&b, 0, sizeof(b));
@@ -661,6 +692,9 @@ static int cmd_scan(int argc, char **argv)
 
     if (do_hooks)
         check_vulkan_present_hook(pid);
+
+    if (do_preload)
+        check_ld_preload(pid);
 
     if (do_hash) {
         exe_link = proc_exe_path(pid);
@@ -983,6 +1017,158 @@ static void anon_baseline_check(int pid, const char *comm, unsigned int count)
         g_anon_baseline[free_slot].count = count;
         g_anon_baseline[free_slot].in_use = 1;
     }
+}
+
+/* ------------------------------------------------------------------ */
+/* LD_PRELOAD detection                                                */
+/*                                                                      */
+/* Catches library-interposition hooking -- the other documented blind */
+/* spot alongside malicious Vulkan layers (see the render-hook section  */
+/* in README): a cheat that intercepts vkQueuePresentKHR (or anything   */
+/* else) via LD_PRELOAD rather than inline-patching bytes never shows   */
+/* up in the render-hook check, since it never touches the target       */
+/* function's actual code.                                              */
+/*                                                                      */
+/* Deliberately a heuristic, not a verdict: MangoHud, gamemode,         */
+/* gamescope, and plenty of other completely legitimate tools also use  */
+/* LD_PRELOAD. This ships at LOG_WARNING, not LOG_ALERT/LOG_CRIT, so it  */
+/* does NOT flow through the ban-pipeline auto-report hook in logmsg()  */
+/* (scoped to pri <= LOG_CRIT) -- an operator sees it in the log, but   */
+/* it doesn't accumulate as a report against a client_id on its own.    */
+/* ------------------------------------------------------------------ */
+#define AC_ENVIRON_BUF (16 * 1024)
+
+/* /proc/<pid>/environ is populated once at exec() and never updated by
+ * the process's own later setenv() calls -- exactly what's wanted here:
+ * this shows what the process launched with, not whatever it might
+ * claim about itself at runtime. NUL-separated KEY=VALUE entries.
+ * Returns 1 (found, fills out), 0 (not set), -1 (unreadable -- process
+ * already gone by the time we look, most likely). */
+static int ac_read_ld_preload(int pid, char *out, size_t outsz)
+{
+    char path[64];
+    char *buf;
+    ssize_t n;
+    int fd;
+    size_t pos;
+
+    snprintf(path, sizeof(path), "/proc/%d/environ", pid);
+    fd = open(path, O_RDONLY);
+    if (fd < 0)
+        return -1;
+    buf = malloc(AC_ENVIRON_BUF);
+    if (!buf) {
+        close(fd);
+        return -1;
+    }
+    n = read(fd, buf, AC_ENVIRON_BUF - 1);
+    close(fd);
+    if (n <= 0) {
+        free(buf);
+        return n < 0 ? -1 : 0;
+    }
+    buf[n] = '\0';
+
+    for (pos = 0; pos < (size_t)n; ) {
+        const char *entry = buf + pos;
+        size_t entry_len = strlen(entry);
+
+        if (entry_len == 0)
+            break;   /* malformed/truncated read -- stop rather than misread */
+        if (strncmp(entry, "LD_PRELOAD=", 11) == 0) {
+            snprintf(out, outsz, "%s", entry + 11);
+            free(buf);
+            return 1;
+        }
+        pos += entry_len + 1;
+    }
+    free(buf);
+    return 0;
+}
+
+/* Warn at most once per pid -- environ is static for the process's
+ * lifetime, so re-checking every cycle would either always re-find
+ * nothing or always re-find the same value; neither is worth repeating
+ * in the log every cycle forever. Same in_use/pid slot-tracking pattern
+ * as g_anon_baseline above. */
+struct ac_preload_warned {
+    int pid;
+    int in_use;
+};
+static struct ac_preload_warned g_preload_warned[AC_MAX_PROTS];
+
+static void preload_warned_forget_stale(const struct ac_prot_list *pl)
+{
+    unsigned int i, j;
+
+    for (i = 0; i < AC_MAX_PROTS; i++) {
+        if (!g_preload_warned[i].in_use)
+            continue;
+        for (j = 0; j < pl->count; j++)
+            if (pl->items[j].pid == g_preload_warned[i].pid)
+                break;
+        if (j == pl->count)
+            g_preload_warned[i].in_use = 0;
+    }
+}
+
+static int preload_already_warned(int pid)
+{
+    unsigned int i;
+
+    for (i = 0; i < AC_MAX_PROTS; i++)
+        if (g_preload_warned[i].in_use && g_preload_warned[i].pid == pid)
+            return 1;
+    return 0;
+}
+
+static void preload_mark_warned(int pid)
+{
+    unsigned int i, free_slot = AC_MAX_PROTS;
+
+    for (i = 0; i < AC_MAX_PROTS; i++) {
+        if (g_preload_warned[i].in_use && g_preload_warned[i].pid == pid)
+            return;
+        if (free_slot == AC_MAX_PROTS && !g_preload_warned[i].in_use)
+            free_slot = i;
+    }
+    if (free_slot != AC_MAX_PROTS) {
+        g_preload_warned[free_slot].pid = pid;
+        g_preload_warned[free_slot].in_use = 1;
+    }
+}
+
+static void check_ld_preload_periodic(void)
+{
+    struct ac_prot_list pl;
+    unsigned int i;
+
+    memset(&pl, 0, sizeof(pl));
+    if (ioctl(dev_fd, AC_IOCTL_LIST_PROTECTED, &pl) < 0)
+        return;
+    preload_warned_forget_stale(&pl);
+    for (i = 0; i < pl.count; i++) {
+        char val[512];
+
+        if (preload_already_warned(pl.items[i].pid))
+            continue;
+        if (ac_read_ld_preload(pl.items[i].pid, val, sizeof(val)) != 1)
+            continue;
+        logmsg(LOG_WARNING, "pid %d (%s): LD_PRELOAD=%s set at exec -- "
+               "common for legitimate overlay/compat tools (MangoHud, "
+               "gamemode, gamescope) as well as library-injection hooking; "
+               "informational only, not a verdict on its own",
+               pl.items[i].pid, pl.items[i].comm, val);
+        preload_mark_warned(pl.items[i].pid);
+    }
+}
+
+static int ac_ld_preload_check_interval(void)
+{
+    const char *e = getenv("AC_LD_PRELOAD_CHECK_INTERVAL");
+    int v = e ? atoi(e) : 0;
+
+    return (v > 0) ? v : 10;
 }
 
 static int scan_protected_periodic(void)
@@ -1313,7 +1499,7 @@ static int cmd_start(int argc, char **argv)
     }
     {
         time_t next_sys = 0, next_mod = 0, next_scan = 0, next_baseline = 0;
-        time_t next_render = 0;
+        time_t next_render = 0, next_preload = 0;
 
         while (!g_stop) {
             struct ac_event_list el;
@@ -1354,6 +1540,10 @@ static int cmd_start(int argc, char **argv)
                 check_render_hooks_periodic();
                 next_render = now + ac_render_hook_check_interval();
             }
+            if (now >= next_preload) {
+                check_ld_preload_periodic();
+                next_preload = now + ac_ld_preload_check_interval();
+            }
             sleep(1);
         }
     }
@@ -1372,7 +1562,7 @@ static void usage(const char *prog)
            "  protect --pid N | --comm NAME\n"
            "  unprotect --pid N\n"
            "  list                       list protected processes\n"
-           "  scan --pid N [--hash [--save|--check]] [--check-hooks]\n"
+           "  scan --pid N [--hash [--save|--check]] [--check-hooks] [--check-preload]\n"
            "  syscalls                   verify syscall table integrity\n"
            "  modules                    kernel module list + hidden module check\n"
            "  events [--watch]           dump security events\n"

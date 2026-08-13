@@ -182,6 +182,54 @@ else
     say "no process with libvulkan loaded found on this machine, skipping both render-hook checks"
 fi
 
+say "LD_PRELOAD check: negative case (victim has none set)"
+PRELOAD_OUT=$(./anticheat scan --pid "$VICTIM_PID" --check-preload 2>&1)
+if printf '%s' "$PRELOAD_OUT" | grep -q "LD_PRELOAD check: not set"; then
+    ok "victim process correctly reports no LD_PRELOAD"
+else
+    bad "expected 'not set' for a process with no LD_PRELOAD (got: $PRELOAD_OUT)"
+fi
+
+say "LD_PRELOAD check: positive case (one-shot and periodic)"
+# Preload libc itself -- completely inert (the dynamic linker already
+# loads it regardless), just makes LD_PRELOAD non-empty in the target's
+# environment so there's a real, harmless positive case to detect.
+LIBC_PATH=$(ldd /bin/sh 2>/dev/null | awk '/libc\.so/{print $3; exit}')
+if [ -n "$LIBC_PATH" ] && [ -e "$LIBC_PATH" ]; then
+    LD_PRELOAD="$LIBC_PATH" bash -c 'sleep 300' &
+    PRELOAD_PID=$!
+    sleep 0.3
+
+    PRELOAD_OUT=$(./anticheat scan --pid "$PRELOAD_PID" --check-preload 2>&1)
+    if printf '%s' "$PRELOAD_OUT" | grep -qF "$LIBC_PATH"; then
+        ok "one-shot check reports the LD_PRELOAD value"
+    else
+        bad "one-shot check did not report LD_PRELOAD=$LIBC_PATH (got: $PRELOAD_OUT)"
+    fi
+
+    if ./anticheat protect --pid "$PRELOAD_PID" >/dev/null 2>&1; then
+        AC_LD_PRELOAD_CHECK_INTERVAL=2 ./anticheat start --foreground \
+            >/tmp/ac_preload_test.log 2>&1 &
+        PRELOAD_DAEMON_PID=$!
+        sleep 4
+        if grep -q "LD_PRELOAD=$LIBC_PATH" /tmp/ac_preload_test.log; then
+            ok "periodic monitoring loop detected LD_PRELOAD (LOG_WARNING, not a ban-pipeline report)"
+        else
+            bad "periodic monitoring loop did not detect LD_PRELOAD"
+        fi
+        kill "$PRELOAD_DAEMON_PID" 2>/dev/null
+        wait "$PRELOAD_DAEMON_PID" 2>/dev/null
+        rm -f /tmp/ac_preload_test.log
+    else
+        bad "could not protect the LD_PRELOAD victim pid for the periodic check"
+    fi
+
+    kill "$PRELOAD_PID" 2>/dev/null
+    wait "$PRELOAD_PID" 2>/dev/null
+else
+    say "could not resolve a real libc path, skipping LD_PRELOAD positive-case checks"
+fi
+
 say "memory integrity baseline"
 if ./anticheat scan --pid "$VICTIM_PID" --hash --save >/dev/null 2>&1; then
     ok "baseline saved"
