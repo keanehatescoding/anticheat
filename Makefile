@@ -72,6 +72,16 @@ render-hook-test: test/render_hook_test
 test/render_hook_test: test/render_hook_test.c src/anticheat.h
 	$(CC) $(CFLAGS) -o $@ $< -ldl
 
+# mount-namespace live test helper: dlopen()s an explicit path inside a
+# private mount namespace test.sh sets up, so the render-hook check's
+# /proc/<pid>/root/ resolution can be proven against a real target whose
+# view of a path differs from the host's. Needs root (mount namespaces,
+# the module) -- see test.sh.
+mount-ns-test: test/mount_ns_probe
+
+test/mount_ns_probe: test/mount_ns_probe.c
+	$(CC) $(CFLAGS) -o $@ $< -ldl
+
 # run the daemon CLI against the userspace mock (no kernel module, no root)
 test-mock: mock daemon
 	./test/mock_test.sh
@@ -86,7 +96,7 @@ ci:
 
 clean:
 	@if [ -d $(KDIR) ]; then $(MAKE) -C $(KDIR) M=$(PWD) clean; fi
-	rm -f anticheat test/libmock_anticheat.so test/priv_drop_test test/render_hook_test
+	rm -f anticheat test/libmock_anticheat.so test/priv_drop_test test/render_hook_test test/mount_ns_probe
 
 install: all
 	install -D -m 0755 anticheat /usr/local/sbin/anticheat
@@ -115,4 +125,4 @@ install-deck: all
 uninstall-deck:
 	rm -rf $(DECK_PREFIX)
 
-.PHONY: all module daemon mock test-mock priv-drop-test render-hook-test ci clean install uninstall install-deck uninstall-deck
+.PHONY: all module daemon mock test-mock priv-drop-test render-hook-test mount-ns-test ci clean install uninstall install-deck uninstall-deck

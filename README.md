@@ -166,12 +166,26 @@ exported function, not a cheat that intercepts the call via `LD_PRELOAD`
 symbol interposition or a malicious Vulkan layer (`VK_LAYER_*`) — those
 never touch `vkQueuePresentKHR`'s actual bytes. `--check-preload` below
 partially covers the `LD_PRELOAD` case (as a heuristic signal, not a
-verdict); `VK_LAYER_*` interception remains fully undetected. Also, like
-the rest of this
-tool (see Design notes below), it isn't mount-namespace-aware: if the
-target resolves `libvulkan.so` to a path only visible inside its own
-container/sandbox, the daemon may be unable to open the identical file to
-build a reference copy, and the check is skipped rather than guessing.
+verdict); `VK_LAYER_*` interception remains fully undetected.
+
+**Mount-namespace aware.** The kernel-side VMA scan reports a path
+string for the target's library; opening that string directly from the
+daemon's own (host) mount namespace would trust that whatever exists
+there is the same file the target actually has mapped, which isn't
+guaranteed for a process in a container/sandbox with a private
+bind-mount at that path (Flatpak, Steam Runtime). The daemon instead
+opens it through `/proc/<pid>/root/<path>`, which the kernel resolves
+exactly as the target process itself sees it — for a target sharing the
+daemon's own namespace (the common case), `/proc/<pid>/root` is just
+`/`, so this is a strict correctness fix with no downside there. Verified
+empirically, not assumed: without this, a private bind-mount shadowing
+an otherwise-identical host path silently produced the wrong reference
+bytes (or an unopenable file) and the check could only report
+"inconclusive"; through `/proc/<pid>/root/` it correctly loads the real,
+target-visible library and compares it properly. `test/mount_ns_probe.c`
++ a real `unshare --mount` namespace in `test.sh` exercise this directly
+against a real loaded module, not just in theory.
+
 `scan --check-hooks` is the on-demand, human-facing form; the same
 detection also runs automatically every 30 s against every protected
 process from the `start` monitoring loop (see above) — a hook installed
@@ -495,6 +509,9 @@ test/priv_drop_test.c    live test: proves ac_ioctl() rechecks CAP_SYS_ADMIN
 test/render_hook_test.c  live test: self-hooks vkQueuePresentKHR, proves
                          `scan --check-hooks` detects it (root, real module
                          -- run via test.sh)
+test/mount_ns_probe.c    live test: proves render-hook detection resolves a
+                         target's real mount-namespace view of a path, not
+                         the host's (root, real module -- run via test.sh)
 src/anticheat.h          shared ioctl ABI
 src/anticheat_module.c   the kernel module
 src/anticheat_daemon.c   userspace daemon + CLI

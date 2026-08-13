@@ -22,6 +22,9 @@ jobs:
       - name: Build the render-hook test helper (compile check only)
         run: make CFLAGS="-O2 -Wall -Wextra -Werror" render-hook-test
 
+      - name: Build the mount-namespace test helper (compile check only)
+        run: make CFLAGS="-O2 -Wall -Wextra -Werror" mount-ns-test
+
       - name: Ban-pipeline server test (no root, pure Python + HTTP)
         run: ./server/test_server.sh
 

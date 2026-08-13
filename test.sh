@@ -182,6 +182,52 @@ else
     say "no process with libvulkan loaded found on this machine, skipping both render-hook checks"
 fi
 
+say "render-hook check: resolves a target-namespaced path correctly (not the host's)"
+# Proves the /proc/<pid>/root/ fix in compare_render_symbol(): create a
+# private mount namespace where a *different* (empty) file sits at the
+# same path the daemon would naively try to open from its own (host)
+# namespace, bind-mount the real libvulkan.so.1 over that path -- but
+# only inside the new namespace. A daemon that opens the raw path string
+# gets the wrong (empty, unopenable) file and can only report
+# "inconclusive"; one that resolves through /proc/<pid>/root/ gets the
+# real library the target process actually has mapped, and reports
+# clean. This needs `unshare --mount`, so skip gracefully if that fails
+# rather than treating an unrelated environment gap as a real failure.
+NS_DIR="/tmp/ac_mount_ns_test_$$"
+make mount-ns-test >/dev/null 2>&1
+if [ -x ./test/mount_ns_probe ]; then
+    rm -rf "$NS_DIR"
+    mkdir -p "$NS_DIR"
+    touch "$NS_DIR/libvulkan.so.1"
+    NS_FIFO=$(mktemp -u)
+    mkfifo "$NS_FIFO"
+    setsid unshare --mount -- bash -c "
+        mount --make-rprivate / &&
+        mount --bind /usr/lib/libvulkan.so.1 '$NS_DIR/libvulkan.so.1' &&
+        exec $PWD/test/mount_ns_probe '$NS_DIR/libvulkan.so.1'
+    " >"$NS_FIFO" 2>&1 &
+    NS_LINE=$(head -n1 "$NS_FIFO")
+    rm -f "$NS_FIFO"
+    NS_PID=$(printf '%s' "$NS_LINE" | sed -n 's/^READY pid=\([0-9]*\)$/\1/p')
+    if [ -n "$NS_PID" ]; then
+        NS_OUT=$(./anticheat scan --pid "$NS_PID" --check-hooks 2>&1)
+        if printf '%s' "$NS_OUT" | grep -q "vkQueuePresentKHR clean"; then
+            ok "resolved the target's real library through its own mount namespace"
+        elif printf '%s' "$NS_OUT" | grep -q "could not verify"; then
+            bad "fell back to the host's (wrong) view of the path instead of the target's"
+        else
+            bad "unexpected result (output: $NS_OUT)"
+        fi
+        kill "$NS_PID" 2>/dev/null
+        wait "$NS_PID" 2>/dev/null
+    else
+        say "could not set up the test mount namespace (output: $NS_LINE), skipping"
+    fi
+    rm -rf "$NS_DIR"
+else
+    say "mount-ns-test helper did not build, skipping"
+fi
+
 say "LD_PRELOAD check: negative case (victim has none set)"
 PRELOAD_OUT=$(./anticheat scan --pid "$VICTIM_PID" --check-preload 2>&1)
 if printf '%s' "$PRELOAD_OUT" | grep -q "LD_PRELOAD check: not set"; then

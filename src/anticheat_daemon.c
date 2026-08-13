@@ -418,16 +418,17 @@ static void baseline_path_for(const char *path, char out[PATH_MAX])
 /* ------------------------------------------------------------------ */
 #define AC_HOOK_CHECK_BYTES 32
 
-/* dlopen()s libpath in *this* process to get a known-good reference
- * copy of `symbol`, then compares its first AC_HOOK_CHECK_BYTES against
- * the same offset in the target pid's mapping of the identical file
- * (lib_base = that mapping's lowest VMA start, i.e. its file-offset-0
- * load address). Returns 1 if hooked, 0 if clean, -1 if inconclusive
- * (never treated as a positive detection -- an unreadable/unloadable
- * library is a skip, not an alert). Silent by design -- callers decide
- * how (or whether) to surface the result, since the CLI's one-shot
- * `scan --check-hooks` and the daemon's silent-unless-hooked periodic
- * check want very different presentation of the same underlying check. */
+/* dlopen()s libpath (via the target's own /proc/<pid>/root/ -- see
+ * below) to get a known-good reference copy of `symbol`, then compares
+ * its first AC_HOOK_CHECK_BYTES against the same offset in the target
+ * pid's mapping of the identical file (lib_base = that mapping's lowest
+ * VMA start, i.e. its file-offset-0 load address). Returns 1 if hooked,
+ * 0 if clean, -1 if inconclusive (never treated as a positive detection
+ * -- an unreadable/unloadable library is a skip, not an alert). Silent
+ * by design -- callers decide how (or whether) to surface the result,
+ * since the CLI's one-shot `scan --check-hooks` and the daemon's
+ * silent-unless-hooked periodic check want very different presentation
+ * of the same underlying check. */
 static int compare_render_symbol(int pid, const char *libpath,
                                   unsigned long long lib_base,
                                   const char *symbol)
@@ -439,10 +440,29 @@ static int compare_render_symbol(int pid, const char *libpath,
     unsigned char expected[AC_HOOK_CHECK_BYTES];
     unsigned char actual[AC_HOOK_CHECK_BYTES];
     char memp[64];
+    char nspath[AC_VMA_PATH + 32];
     int fd;
     ssize_t r;
 
-    handle = dlopen(libpath, RTLD_NOW | RTLD_LOCAL);
+    /* libpath came from the kernel's d_path() on the target's VMA, which
+     * is just a string -- opening it directly from the daemon's own
+     * mount namespace trusts that whatever exists at that path here is
+     * the same file the target actually has mapped. For a process in a
+     * container/sandbox with a private bind-mount at that path, it can
+     * be a different file entirely (or nothing), and blindly dlopen()ing
+     * it would compare against the wrong reference bytes. Going through
+     * /proc/<pid>/root/ instead resolves the path exactly as the target
+     * process itself sees it -- for the common case of a target sharing
+     * the daemon's own namespace, /proc/<pid>/root is just "/", so this
+     * is a strict correctness fix with no downside there. Verified
+     * empirically (not assumed): a plain path collides with an unrelated
+     * host-side file across a private bind mount and silently returns
+     * the wrong content, while /proc/<pid>/root/<path> resolves to the
+     * real target-visible file, as root, via ordinary open()+read() --
+     * no setns() or any persistent namespace switch needed. */
+    snprintf(nspath, sizeof(nspath), "/proc/%d/root%s", pid, libpath);
+
+    handle = dlopen(nspath, RTLD_NOW | RTLD_LOCAL);
     if (!handle)
         return -1;
     sym = dlsym(handle, symbol);
