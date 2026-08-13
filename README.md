@@ -228,12 +228,20 @@ banned real player, which is a worse failure mode than a slower
 human-in-the-loop pipeline. This mirrors the same design instinct as
 `--hash --save` never auto-creating baselines above.
 
+**Rate limited.** Every endpoint (not just `/report`) is limited per
+source IP — `--rate-limit`/`--rate-window`, default 60 requests per 60s —
+so a compromised or misbehaving client can't flood the ingestion pipeline
+or the SQLite DB, and an attacker can't freely hammer `/banned/<id>` to
+enumerate client IDs or brute-force the admin key. It's a simple
+fixed-window counter (allows a brief double-rate burst right at a window
+boundary), not built for distributed scale — enough to bound abuse
+against a single small process, which is the deployment this targets.
+
 **No TLS.** This is plain HTTP, meant for localhost/LAN or behind a
 reverse proxy that terminates TLS for anything reachable over an
 untrusted network — not a hardened, internet-facing service as shipped.
-There's also no rate limiting. Both are real gaps for a production
-deployment, not oversights papered over: this is the minimal version of
-the pipeline, not the finished one.
+That's a real gap for a production deployment, not an oversight papered
+over: this is the minimal version of the pipeline, not the finished one.
 
 `server/test_server.sh` exercises the full server (report → review → ban
 → query → unban → query) with no root and no kernel module, and CI runs

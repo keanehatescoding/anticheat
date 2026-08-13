@@ -35,10 +35,38 @@ import json
 import re
 import sqlite3
 import sys
+import threading
 import time
 
 CLIENT_ID_RE = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
 MAX_BODY_BYTES = 4096
+
+
+class RateLimiter:
+    """Fixed-window limiter: at most `limit` requests per `window` seconds,
+    per key (source IP here). Not built for distributed scale or precise
+    edge behavior (a fixed window allows a brief double-rate burst right
+    at the boundary) -- enough to bound abuse against a single small
+    process, which is the actual deployment this is for. Applied to every
+    endpoint, not just /report: unauthenticated attempts against /banned
+    or /ban are exactly the kind of thing worth throttling too (ID
+    enumeration, admin-key brute-forcing), not just report flooding."""
+
+    def __init__(self, limit, window):
+        self.limit = limit
+        self.window = window
+        self._lock = threading.Lock()
+        self._buckets = {}  # key -> (window_start, count)
+
+    def allow(self, key):
+        now = time.time()
+        with self._lock:
+            window_start, count = self._buckets.get(key, (now, 0))
+            if now - window_start >= self.window:
+                window_start, count = now, 0
+            count += 1
+            self._buckets[key] = (window_start, count)
+            return count <= self.limit
 
 
 def now_ts():
@@ -152,20 +180,32 @@ class Store:
             conn.close()
 
 
-def make_handler(store, report_key, admin_key):
+def make_handler(store, report_key, admin_key, rate_limiter):
     class Handler(http.server.BaseHTTPRequestHandler):
         server_version = "ac_server/1"
 
         def log_message(self, fmt, *args):
             sys.stderr.write("%s - %s\n" % (self.address_string(), fmt % args))
 
-        def _send_json(self, code, obj):
+        def _send_json(self, code, obj, extra_headers=None):
             body = json.dumps(obj).encode("utf-8")
             self.send_response(code)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
+            for k, v in (extra_headers or {}).items():
+                self.send_header(k, v)
             self.end_headers()
             self.wfile.write(body)
+
+        def _rate_limited(self):
+            if rate_limiter.allow(self.client_address[0]):
+                return False
+            self._send_json(
+                429,
+                {"error": "rate limited"},
+                {"Retry-After": str(rate_limiter.window)},
+            )
+            return True
 
         def _bearer(self):
             auth = self.headers.get("Authorization", "")
@@ -195,6 +235,8 @@ def make_handler(store, report_key, admin_key):
             return isinstance(v, str) and CLIENT_ID_RE.match(v) is not None
 
         def do_POST(self):
+            if self._rate_limited():
+                return
             if self.path == "/report":
                 return self._handle_report()
             if self.path == "/ban":
@@ -204,6 +246,8 @@ def make_handler(store, report_key, admin_key):
             self._send_json(404, {"error": "not found"})
 
         def do_GET(self):
+            if self._rate_limited():
+                return
             if self.path.startswith("/banned/"):
                 return self._handle_banned(self.path[len("/banned/"):])
             if self.path.startswith("/reports/"):
@@ -294,6 +338,19 @@ def main():
         help="bearer token for ban/unban/query endpoints "
         "(default: $AC_SERVER_ADMIN_KEY)",
     )
+    ap.add_argument(
+        "--rate-limit",
+        type=int,
+        default=60,
+        help="max requests per --rate-window seconds, per source IP, "
+        "across every endpoint (default: 60)",
+    )
+    ap.add_argument(
+        "--rate-window",
+        type=int,
+        default=60,
+        help="rate-limit window in seconds (default: 60)",
+    )
     args = ap.parse_args()
 
     import os
@@ -311,13 +368,19 @@ def main():
         sys.stderr.write("ac_server: report-key and admin-key must differ\n")
         sys.exit(1)
 
+    if args.rate_limit <= 0 or args.rate_window <= 0:
+        sys.stderr.write("ac_server: --rate-limit/--rate-window must be positive\n")
+        sys.exit(1)
+
     store = Store(args.db)
-    handler = make_handler(store, report_key, admin_key)
+    rate_limiter = RateLimiter(args.rate_limit, args.rate_window)
+    handler = make_handler(store, report_key, admin_key, rate_limiter)
     httpd = http.server.ThreadingHTTPServer((args.host, args.port), handler)
     sys.stderr.write(
-        "ac_server: listening on %s:%d, db=%s (plain HTTP -- put a TLS "
-        "reverse proxy in front for anything beyond localhost/LAN)\n"
-        % (args.host, args.port, args.db)
+        "ac_server: listening on %s:%d, db=%s, rate limit %d req/%ds per IP "
+        "(plain HTTP -- put a TLS reverse proxy in front for anything "
+        "beyond localhost/LAN)\n"
+        % (args.host, args.port, args.db, args.rate_limit, args.rate_window)
     )
     try:
         httpd.serve_forever()

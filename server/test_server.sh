@@ -21,11 +21,14 @@ pass() { printf '  \033[1;32mPASS\033[0m  %s\n' "$*"; }
 fail() { printf '  \033[1;31mFAIL\033[0m  %s\n' "$*"; FAIL=1; }
 
 SERVER_PID=""
+RL_SERVER_PID=""
 # cleanup is invoked via trap below; shellcheck cannot always see that
 # shellcheck disable=SC2317,SC2329
 cleanup() {
     [ -n "$SERVER_PID" ] && kill "$SERVER_PID" 2>/dev/null
+    [ -n "$RL_SERVER_PID" ] && kill "$RL_SERVER_PID" 2>/dev/null
     wait "$SERVER_PID" 2>/dev/null
+    wait "$RL_SERVER_PID" 2>/dev/null
     rm -f "$DB" "$DB-wal" "$DB-shm"
 }
 trap cleanup EXIT
@@ -149,6 +152,85 @@ else
 fi
 
 rm -f "/tmp/ac_server_test_$$.log"
+
+# Rate limiting: a separate low-limit server instance, so this doesn't
+# interfere with (or get interfered with by) the ~11 requests the
+# functional tests above already made against the default 60/60 limit.
+RL_PORT=18800
+RL_LIMIT=3
+RL_WINDOW=2
+RL_DB="/tmp/ac_server_rl_test_$$.db"
+AC_SERVER_REPORT_KEY="$REPORT_KEY" AC_SERVER_ADMIN_KEY="$ADMIN_KEY" \
+    python3 ./ac_server.py --host 127.0.0.1 --port "$RL_PORT" --db "$RL_DB" \
+    --rate-limit "$RL_LIMIT" --rate-window "$RL_WINDOW" \
+    >/tmp/ac_server_rl_test_$$.log 2>&1 &
+RL_SERVER_PID=$!
+RL_BASE="http://127.0.0.1:$RL_PORT"
+
+RL_READY=0
+for _ in $(seq 1 50); do
+    if curl -s "$RL_BASE/banned/x" -H "Authorization: Bearer $ADMIN_KEY" 2>/dev/null \
+        | grep -q '"banned"'; then
+        RL_READY=1
+        break
+    fi
+    sleep 0.1
+done
+
+if [ "$RL_READY" -eq 1 ]; then
+    # The readiness poll above already consumed some of the budget it's
+    # about to test against -- let the window roll over to a clean state
+    # before asserting on exact counts.
+    sleep "$((RL_WINDOW + 1))"
+
+    # First $RL_LIMIT requests in the window should succeed (200/404, not
+    # 429); this endpoint doesn't need auth to hit the limiter, since the
+    # limiter runs before auth is even checked.
+    RL_TRIPPED=0
+    for _ in $(seq 1 "$RL_LIMIT"); do
+        CODE=$(curl -s -o /dev/null -w '%{http_code}' "$RL_BASE/banned/x" \
+            -H "Authorization: Bearer $ADMIN_KEY")
+        [ "$CODE" = "429" ] && RL_TRIPPED=1
+    done
+    if [ "$RL_TRIPPED" -eq 0 ]; then
+        pass "requests within the limit are not rate limited"
+    else
+        fail "a request within the limit ($RL_LIMIT per ${RL_WINDOW}s) got 429"
+    fi
+
+    # One more request, still inside the window, should now be limited.
+    CODE=$(curl -s -o /dev/null -w '%{http_code}' "$RL_BASE/banned/x" \
+        -H "Authorization: Bearer $ADMIN_KEY")
+    if [ "$CODE" = "429" ]; then
+        pass "request beyond the limit -> 429"
+    else
+        fail "request beyond the limit should be 429 (got $CODE)"
+    fi
+
+    # Confirm the 429 carries a Retry-After header.
+    HEADERS=$(curl -s -D - -o /dev/null "$RL_BASE/banned/x" \
+        -H "Authorization: Bearer $ADMIN_KEY")
+    if printf '%s' "$HEADERS" | grep -qi '^Retry-After:'; then
+        pass "429 response includes Retry-After"
+    else
+        fail "429 response missing Retry-After header"
+    fi
+
+    sleep "$RL_WINDOW"
+    CODE=$(curl -s -o /dev/null -w '%{http_code}' "$RL_BASE/banned/x" \
+        -H "Authorization: Bearer $ADMIN_KEY")
+    if [ "$CODE" != "429" ]; then
+        pass "limit resets after the window passes"
+    else
+        fail "still rate limited after the window passed"
+    fi
+else
+    fail "rate-limit test server never became ready on port $RL_PORT"
+fi
+
+kill "$RL_SERVER_PID" 2>/dev/null
+wait "$RL_SERVER_PID" 2>/dev/null
+rm -f "$RL_DB" "$RL_DB-wal" "$RL_DB-shm" "/tmp/ac_server_rl_test_$$.log"
 
 echo
 if [ "$FAIL" -eq 0 ]; then
