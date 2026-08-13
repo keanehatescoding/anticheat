@@ -6,6 +6,7 @@ set -u
 cd "$(dirname "$0")" || exit 1
 VICTIM_PID=""
 DAEMON_PID=""
+REPORT_SERVER_PID=""
 FAILED=0
 
 say()  { printf '\033[1;34m[TEST]\033[0m %s\n' "$*"; }
@@ -17,6 +18,7 @@ bad()  { printf '\033[1;31m  FAIL\033[0m  %s\n' "$*"; FAILED=1; }
 cleanup() {
     [ -n "$VICTIM_PID" ] && kill "$VICTIM_PID" 2>/dev/null
     [ -n "$DAEMON_PID" ] && kill "$DAEMON_PID" 2>/dev/null
+    [ -n "$REPORT_SERVER_PID" ] && kill "$REPORT_SERVER_PID" 2>/dev/null
     sleep 0.2
     rmmod anticheat 2>/dev/null
 }
@@ -177,7 +179,32 @@ if [ -d "$BLDIR" ]; then
         sed -i 's/[0-9a-f]\{64\}$/deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef/' "$f"
     done
 fi
-AC_BASELINE_CHECK_INTERVAL=2 ./anticheat start --foreground >/tmp/ac_baseline_test.log 2>&1 &
+
+# Start the report-pipeline server so this same tampering detection also
+# proves the daemon's ac_report() reaches a live server correctly -- HTTP
+# request framing and JSON body can't be verified by reading the code, only
+# by actually running it end to end.
+REPORT_PORT=18799
+REPORT_KEY="test-report-key-$$"
+ADMIN_KEY="test-admin-key-$$"
+REPORT_DB="/tmp/ac_report_test_$$.db"
+AC_SERVER_REPORT_KEY="$REPORT_KEY" AC_SERVER_ADMIN_KEY="$ADMIN_KEY" \
+    python3 server/ac_server.py --host 127.0.0.1 --port "$REPORT_PORT" --db "$REPORT_DB" \
+    >/tmp/ac_report_server_$$.log 2>&1 &
+REPORT_SERVER_PID=$!
+REPORT_SERVER_READY=0
+for _ in $(seq 1 50); do
+    if curl -s "http://127.0.0.1:$REPORT_PORT/banned/x" \
+        -H "Authorization: Bearer $ADMIN_KEY" 2>/dev/null | grep -q '"banned"'; then
+        REPORT_SERVER_READY=1
+        break
+    fi
+    sleep 0.1
+done
+[ "$REPORT_SERVER_READY" -eq 1 ] || bad "report server never became ready on port $REPORT_PORT"
+
+AC_BASELINE_CHECK_INTERVAL=2 AC_REPORT_URL="127.0.0.1:$REPORT_PORT" AC_REPORT_KEY="$REPORT_KEY" \
+    ./anticheat start --foreground >/tmp/ac_baseline_test.log 2>&1 &
 DAEMON_PID=$!
 sleep 4
 if grep -q "differs from saved baseline" /tmp/ac_baseline_test.log; then
@@ -187,6 +214,18 @@ else
 fi
 kill "$DAEMON_PID" 2>/dev/null
 wait "$DAEMON_PID" 2>/dev/null
+
+MACHINE_ID=$(cat /etc/machine-id 2>/dev/null || hostname)
+REPORT_OUT=$(curl -s "http://127.0.0.1:$REPORT_PORT/reports/$MACHINE_ID" \
+    -H "Authorization: Bearer $ADMIN_KEY")
+if printf '%s' "$REPORT_OUT" | grep -q "differs from saved baseline"; then
+    ok "ban-pipeline server received the report over real HTTP"
+else
+    bad "ban-pipeline server did not receive the report (got: $REPORT_OUT)"
+fi
+kill "$REPORT_SERVER_PID" 2>/dev/null
+wait "$REPORT_SERVER_PID" 2>/dev/null
+rm -f "$REPORT_DB" "$REPORT_DB-wal" "$REPORT_DB-shm" "/tmp/ac_report_server_$$.log"
 DAEMON_PID=""
 rm -f /tmp/ac_baseline_test.log
 

@@ -19,12 +19,16 @@ userspace daemon/CLI that talks to it over a small ioctl interface
 │  · status / protect / scan │        │  · syscall table discovery   │
 │  · baselines (SHA-256)     │        │  · syscall integrity checks  │
 │  · monitor loop (start)    │        │  · module enumeration        │
-└────────────────────────────┘        │  · protected process registry│
-                                      │  · ptrace denial (kprobe)    │
-                                      │  · fork/exec/exit tracing    │
-                                      │  · VMA scan (RWX + anon-exec)│
-                                      │  · event ring buffer         │
-                                      └──────────────────────────────┘
+└──────────────┬─────────────┘        │  · protected process registry│
+               │ HTTP (opt-in,        │  · ptrace denial (kprobe)    │
+               │  AC_REPORT_URL)      │  · fork/exec/exit tracing    │
+               ▼                      │  · VMA scan (RWX + anon-exec)│
+┌────────────────────────────┐        │  · event ring buffer         │
+│  server/ac_server.py       │        └──────────────────────────────┘
+│  (optional, separate host) │
+│  · report ingestion        │
+│  · ban list (SQLite)       │
+└────────────────────────────┘
 ```
 
 ### Kernel module features
@@ -158,6 +162,76 @@ into the periodic `start` monitoring loop — `test/render_hook_test.c`
 proves the detection itself works (self-hooks `vkQueuePresentKHR` in a
 throwaway process and confirms the scan flags it; run via `test.sh`
 against a real loaded module).
+
+### Ban-pipeline reporting (server-side)
+
+Everything above is client-side detection with nowhere for the result to
+go. `server/ac_server.py` is a minimal report-ingestion + ban-lookup
+service closing that gap — deliberately not an enforcement point, since
+this project has no game or matchmaking server to enforce anything against;
+it's the API a real one would call.
+
+**Daemon side.** Opt-in via two environment variables passed to
+`anticheat start`:
+
+```
+AC_REPORT_URL=host:port    # plain HTTP, no scheme -- see TLS note below
+AC_REPORT_KEY=<report-key>
+```
+
+Unset (the default), reporting is a complete no-op — no network activity
+at all. When set, every detection the monitoring loop already logs at
+`LOG_ALERT`/`LOG_CRIT` (syscall hook, hidden module, ptrace deny, baseline
+tamper, anon-exec growth — see `logmsg()`) is also POSTed to the server as
+`{client_id, event_type, detail, ts}`. `client_id` is `/etc/machine-id`
+(falls back to the hostname). A hung or unreachable server can't stall
+detection: the send/receive timeout is 3s, and a failed report only logs a
+local warning, never blocks or crashes the monitoring loop.
+
+**Server side.** Stdlib-only Python (`http.server` + `sqlite3`, zero
+third-party dependencies) with two separate bearer-token tiers:
+
+```
+POST /report            report-key   -- what the daemon uses
+POST /ban               admin-key    -- {client_id, reason}
+POST /unban              admin-key   -- {client_id}
+GET  /banned/<id>        admin-key   -- what a game server would call
+GET  /reports/<id>       admin-key   -- raw reports for a human to review
+```
+
+```
+AC_SERVER_REPORT_KEY=<report-key> AC_SERVER_ADMIN_KEY=<admin-key> \
+    ./server/ac_server.py --host 127.0.0.1 --port 8787 --db ac_server.db
+```
+
+Both keys are required at startup — it refuses to run with no auth
+configured rather than defaulting to open. Client IDs are validated
+against a bounded alnum/`.`/`_`/`-` pattern before touching the database;
+report bodies are capped at 4 KiB.
+
+**Reports never auto-ban.** A report is a client-side daemon's unverified
+claim about itself, running on the exact machine a cheat author controls —
+it can be wrong, or spoofed, or replayed by someone probing for false
+positives. Accumulated reports are for a human to review (`GET
+/reports/<id>`) before deciding to `POST /ban`; auto-banning on
+unverified client input would turn a bug or a spoofed report into a
+banned real player, which is a worse failure mode than a slower
+human-in-the-loop pipeline. This mirrors the same design instinct as
+`--hash --save` never auto-creating baselines above.
+
+**No TLS.** This is plain HTTP, meant for localhost/LAN or behind a
+reverse proxy that terminates TLS for anything reachable over an
+untrusted network — not a hardened, internet-facing service as shipped.
+There's also no rate limiting. Both are real gaps for a production
+deployment, not oversights papered over: this is the minimal version of
+the pipeline, not the finished one.
+
+`server/test_server.sh` exercises the full server (report → review → ban
+→ query → unban → query) with no root and no kernel module, and CI runs
+it on every push. `test.sh`'s baseline-tamper check additionally starts a
+real `ac_server.py` instance and confirms the daemon's report actually
+arrives over real HTTP — proof the two sides' wire format agrees, not
+just that each compiles.
 
 ## Build
 
@@ -362,6 +436,8 @@ src/anticheat.h          shared ioctl ABI
 src/anticheat_module.c   the kernel module
 src/anticheat_daemon.c   userspace daemon + CLI
 src/sha256.{c,h}         SHA-256 for integrity baselines
+server/ac_server.py      ban-pipeline server: report ingestion + ban lookup
+server/test_server.sh    server test suite (no root): `./server/test_server.sh`
 ```
 
 ## Security & ethics

@@ -22,11 +22,14 @@ jobs:
       - name: Build the render-hook test helper (compile check only)
         run: make CFLAGS="-O2 -Wall -Wextra -Werror" render-hook-test
 
+      - name: Ban-pipeline server test (no root, pure Python + HTTP)
+        run: ./server/test_server.sh
+
       - name: Shellcheck the shell scripts
         run: |
           command -v shellcheck >/dev/null 2>&1 || \
             { sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck; }
-          shellcheck test.sh diag.sh test/mock_test.sh scripts/dkms-install.sh
+          shellcheck test.sh server/test_server.sh diag.sh test/mock_test.sh scripts/dkms-install.sh
 
   # --- kernel module: compile smoke test against a pinned modern tree ---
   # The module targets kernels >= 6.12 (uses sized_strscpy, the _noprof

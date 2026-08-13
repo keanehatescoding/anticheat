@@ -35,7 +35,9 @@
 #include <dirent.h>
 #include <ctype.h>
 #include <dlfcn.h>
+#include <netdb.h>
 #include <sys/ioctl.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/syslog.h>
@@ -52,6 +54,12 @@
 static int dev_fd = -1;
 static int g_verbose = 0;
 static volatile sig_atomic_t g_stop = 0;
+
+/* Ban-pipeline reporting (see the "server-side reporting" section below
+ * for the actual implementation). Forward-declared so logmsg() -- defined
+ * early, used everywhere -- can call it without moving the networking code
+ * up here. */
+static void ac_report(const char *event_type, const char *detail);
 
 /* ------------------------------------------------------------------ */
 /* helpers                                                             */
@@ -78,6 +86,14 @@ static void logmsg(int pri, const char *fmt, ...)
     syslog(pri, "%s", buf);
     if (pri <= LOG_WARNING || g_verbose)
         fprintf(stderr, "%s\n", buf);
+    /* LOG_ALERT/LOG_CRIT are exactly the severities this file already uses
+     * for genuine detections (ptrace deny, syscall hook, hidden module,
+     * baseline tamper, anon-exec growth) -- LOG_WARNING/LOG_INFO are
+     * operational messages (self-protect failures, startup/shutdown), not
+     * violations. Reusing that existing severity split as the report
+     * trigger avoids touching every call site individually. */
+    if (pri <= LOG_CRIT)
+        ac_report(pri <= LOG_ALERT ? "ALERT" : "CRITICAL", buf);
 }
 
 static int ac_open(void)
@@ -996,6 +1012,176 @@ static int check_baselines_periodic(void)
         ioctl(dev_fd, AC_IOCTL_SCAN_END, NULL);
     }
     return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* server-side reporting (ban pipeline)                                */
+/*                                                                      */
+/* Opt-in only (AC_REPORT_URL + AC_REPORT_KEY unset by default -- no    */
+/* network activity unless explicitly configured, same pattern as       */
+/* AC_BASELINE_DIR). Every LOG_ALERT/LOG_CRIT logmsg() call -- i.e.     */
+/* every genuine detection this daemon already makes, see logmsg()      */
+/* above -- gets POSTed to a minimal report-ingestion server (see       */
+/* server/ac_server.py) as {client_id, event_type, detail, ts}. A human */
+/* reviews accumulated reports and decides whether to ban a client_id;  */
+/* this deliberately does not auto-ban on an unverified client-side     */
+/* report, since a false positive here bans a real player, and nothing  */
+/* client-side can attest it wasn't tampered with by the very attacker  */
+/* it's trying to catch. Enforcement (a game server checking            */
+/* GET /banned/<id> before allowing a connection) is out of scope --    */
+/* this project has no game server to integrate with, only the API a    */
+/* real one would call.                                                 */
+/*                                                                      */
+/* No TLS: this is plain HTTP, meant for a local/LAN deployment behind  */
+/* a reverse proxy that terminates TLS for anything reachable over an   */
+/* untrusted network. AC_REPORT_URL is host:port, no scheme.            */
+/* ------------------------------------------------------------------ */
+#define AC_REPORT_TIMEOUT_SEC 3
+
+/* Escapes a string for embedding in a JSON string literal. event_type and
+ * detail both ultimately derive from formatted log messages that can
+ * contain attacker-influenced bytes (a process's comm name, a file path
+ * from /proc), so this has to be correct, not just "usually fine" --
+ * unescaped control characters or quotes here would let a crafted comm
+ * name break the JSON body's structure. */
+static void ac_json_escape(const char *in, char *out, size_t outsz)
+{
+    size_t o = 0;
+
+    if (outsz == 0)
+        return;
+    for (; *in && o + 7 < outsz; in++) {
+        unsigned char c = (unsigned char)*in;
+
+        switch (c) {
+        case '"':  out[o++] = '\\'; out[o++] = '"';  break;
+        case '\\': out[o++] = '\\'; out[o++] = '\\'; break;
+        case '\n': out[o++] = '\\'; out[o++] = 'n';  break;
+        case '\r': out[o++] = '\\'; out[o++] = 'r';  break;
+        case '\t': out[o++] = '\\'; out[o++] = 't';  break;
+        default:
+            if (c < 0x20)
+                o += (size_t)snprintf(out + o, outsz - o, "\\u%04x", c);
+            else
+                out[o++] = (char)c;
+        }
+    }
+    out[o] = '\0';
+}
+
+/* /etc/machine-id is the standard systemd-provided stable-per-install
+ * identifier; falling back to the hostname keeps reporting useful (if
+ * less precise) on a system where it's absent rather than disabling
+ * reporting outright. */
+static void ac_report_client_id(char *out, size_t outsz)
+{
+    FILE *f = fopen("/etc/machine-id", "r");
+
+    if (f) {
+        if (fgets(out, (int)outsz, f)) {
+            size_t n = strlen(out);
+
+            while (n && (out[n - 1] == '\n' || out[n - 1] == '\r'))
+                out[--n] = '\0';
+            if (out[0]) {
+                fclose(f);
+                return;
+            }
+        }
+        fclose(f);
+    }
+    if (gethostname(out, outsz) == 0 && out[0])
+        return;
+    snprintf(out, outsz, "unknown");
+}
+
+static void ac_report(const char *event_type, const char *detail)
+{
+    const char *url = getenv("AC_REPORT_URL");
+    const char *key = getenv("AC_REPORT_KEY");
+    char host[256], client_id[128], et_esc[64], detail_esc[600];
+    char body[1024], req[2048], resp[64];
+    const char *port;
+    char *colon;
+    struct addrinfo hints, *res, *rp;
+    int fd = -1, rc;
+    struct timeval tv;
+    ssize_t n;
+
+    if (!url || !*url || !key || !*key)
+        return;   /* not configured -- silently a no-op, by design */
+
+    snprintf(host, sizeof(host), "%s", url);
+    colon = strrchr(host, ':');
+    if (!colon) {
+        fprintf(stderr, "ac_report: AC_REPORT_URL must be host:port\n");
+        return;
+    }
+    *colon = '\0';
+    port = colon + 1;
+
+    ac_report_client_id(client_id, sizeof(client_id));
+    ac_json_escape(event_type, et_esc, sizeof(et_esc));
+    ac_json_escape(detail, detail_esc, sizeof(detail_esc));
+    snprintf(body, sizeof(body),
+             "{\"client_id\":\"%s\",\"event_type\":\"%s\",\"detail\":\"%s\","
+             "\"ts\":%lld}",
+             client_id, et_esc, detail_esc, (long long)time(NULL));
+
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    rc = getaddrinfo(host, port, &hints, &res);
+    if (rc != 0) {
+        fprintf(stderr, "ac_report: getaddrinfo(%s:%s): %s\n",
+                host, port, gai_strerror(rc));
+        return;
+    }
+    /* A hung/unreachable report server must never stall the security
+     * monitoring loop -- short send/recv timeouts on every candidate
+     * address bound the total worst case. */
+    for (rp = res; rp; rp = rp->ai_next) {
+        fd = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
+        if (fd < 0)
+            continue;
+        tv.tv_sec = AC_REPORT_TIMEOUT_SEC;
+        tv.tv_usec = 0;
+        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+        if (connect(fd, rp->ai_addr, rp->ai_addrlen) == 0)
+            break;
+        close(fd);
+        fd = -1;
+    }
+    freeaddrinfo(res);
+    if (fd < 0) {
+        fprintf(stderr, "ac_report: could not connect to %s:%s\n", host, port);
+        return;
+    }
+
+    snprintf(req, sizeof(req),
+             "POST /report HTTP/1.1\r\n"
+             "Host: %s\r\n"
+             "Authorization: Bearer %s\r\n"
+             "Content-Type: application/json\r\n"
+             "Content-Length: %zu\r\n"
+             "Connection: close\r\n"
+             "\r\n"
+             "%s",
+             host, key, strlen(body), body);
+
+    if (write(fd, req, strlen(req)) < 0) {
+        fprintf(stderr, "ac_report: send failed: %s\n", strerror(errno));
+        close(fd);
+        return;
+    }
+    n = read(fd, resp, sizeof(resp) - 1);
+    if (n > 0) {
+        resp[n] = '\0';
+        if (!strstr(resp, " 200") && !strstr(resp, " 201"))
+            fprintf(stderr, "ac_report: server response: %.60s\n", resp);
+    }
+    close(fd);
 }
 
 static int cmd_start(int argc, char **argv)

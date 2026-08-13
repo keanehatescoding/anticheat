@@ -18,3 +18,6 @@ test/render_hook_test
 
 # runtime state
 *.log
+server/*.db
+server/*.db-wal
+server/*.db-shm
