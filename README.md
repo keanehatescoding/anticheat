@@ -99,6 +99,7 @@ anticheat scan --pid N --hash --check   verify runtime memory vs baseline
 anticheat scan --pid N --check-hooks    Vulkan present-call hook check
 anticheat scan --pid N --check-preload  LD_PRELOAD check (heuristic, not a verdict)
 anticheat scan --pid N --check-vklayers Vulkan-layer env var check (heuristic, not a verdict)
+anticheat scan --pid N --check-implicit-layers  implicit Vulkan-layer manifest check (heuristic)
 anticheat syscalls                   verify syscall table integrity
 anticheat modules                    detect modules hidden from /proc/modules
 anticheat events [--watch]           dump security events
@@ -132,8 +133,15 @@ it also checks each newly-protected process's `LD_PRELOAD`
 variables (`check_vk_layers_periodic()`) — see below; unlike the other
 periodic checks these warn **at most once per pid**, since
 `/proc/<pid>/environ` is fixed at `exec()` time and re-warning about the
-same unchanging values every cycle forever would be pure noise. Alerts go
-to syslog (`LOG_AUTH`) and `/var/log/anticheat.log`.
+same unchanging values every cycle forever would be pure noise. Every
+30 s (override via `AC_IMPLICIT_LAYER_CHECK_INTERVAL`) it also re-scans
+each protected process's *implicit* Vulkan layer manifests
+(`check_implicit_layers_periodic()`) — see below; this one re-checks every
+cycle rather than once per pid (manifest files can change while a session
+is running, unlike environ), but only warns on a *growth* in the
+unrecognized-layer count for a pid, same baseline-delta design as
+anon-exec detection above. Alerts go to syslog (`LOG_AUTH`) and
+`/var/log/anticheat.log`.
 
 Baselines are stored in `/var/lib/anticheat/baselines/` (one SHA-256 per
 file-backed executable mapping; override the directory with the
@@ -218,8 +226,9 @@ spots above: a cheat that intercepts `vkQueuePresentKHR` via library
 interposition or a Vulkan layer, rather than inline-patching bytes, never
 shows up in the render-hook check, since neither ever touches the target
 function's actual code — but both require setting something in the
-process's environment to get loaded in the first place (with one caveat
-for layers — see below).
+process's environment to get loaded in the first place, with one
+exception, closed separately below: an *implicit* Vulkan layer needs no
+environment variable at all.
 
 `--check-preload` looks for `LD_PRELOAD`. `--check-vklayers` looks for
 `VK_INSTANCE_LAYERS`/`VK_LOADER_LAYERS_ENABLE` (force-enabling a layer by
@@ -250,15 +259,6 @@ a report against a `client_id`. It's a fact for a human reviewing other
 evidence to correlate against, the same design instinct as anon-exec
 detection flagging presence rather than passing judgment.
 
-**`--check-vklayers`'s own honest gap:** it only covers the
-environment-variable activation path. An *implicit* Vulkan layer manifest
-dropped directly into one of the loader's default search directories
-(e.g. `~/.local/share/vulkan/implicit_layer.d/`) is auto-enabled with no
-environment variable involved at all, and is not detected by this check.
-Catching that would mean parsing and cross-referencing layer manifest
-files against some notion of "expected", a meaningfully bigger feature
-than an environ heuristic — a real gap, not papered over.
-
 `test.sh` exercises both checks the same way: a negative case (a plain
 victim process reports nothing set) and a positive case (a victim
 launched with the relevant variable set to something harmless — for
@@ -267,6 +267,75 @@ it regardless; for `VK_LAYER_PATH`, `/tmp`, since the check only reads the
 variable's value and never invokes the Vulkan loader) through both the
 one-shot `scan` path and the periodic monitoring-loop path, against a real
 loaded module.
+
+### Implicit Vulkan-layer manifest detection
+
+`--check-vklayers` only covers the environment-variable activation path.
+An *implicit* Vulkan layer manifest dropped directly into one of the
+loader's default search directories is auto-enabled with no environment
+variable involved at all — exactly what `scan --pid N --check-implicit-layers`
+closes, by directly replicating what the Vulkan loader itself does:
+enumerate the same directories it searches — both the target user's own
+per-user paths (`~/.config/vulkan/implicit_layer.d/`,
+`~/.local/share/vulkan/implicit_layer.d/` — the more realistic injection
+vector, since writing there needs no elevated privilege at all) and the
+system-wide ones (`/etc/vulkan/implicit_layer.d/`,
+`/usr/share/vulkan/implicit_layer.d/`, and their `/usr/local/...`
+counterparts) — parse each `*.json` manifest found, and cross-reference
+against the target's own `environ` (reusing `ac_read_environ_vars()`) to
+determine whether each discovered layer is actually active for that
+specific process right now: present, and not disabled via its own
+`disable_environment` variable (if the manifest defines one).
+
+Since the daemon runs as root but the target runs as its own user, the
+per-user paths are resolved against *that user's* home directory — read
+from `/proc/<pid>/status`'s `Uid:` line, then `getpwuid_r()` — not root's
+own `$HOME`, which would silently miss the entire per-user vector.
+
+**Manifests are parsed, never executed, and never trusted as well-formed.**
+This is exactly the kind of file the check exists to be suspicious of, so
+`json_extract_string()`/`json_extract_disable_env()` are a small, targeted
+extractor for the specific fields this schema needs (`name`,
+`library_path`, and the single key inside `disable_environment`'s nested
+object) — not a general JSON parser, bounded and defensive throughout, the
+same posture as `elf_find_symbol_offset()` in the render-hook check.
+Nothing from a discovered layer's `library_path` is ever opened or loaded,
+only reported. Verified directly, not just reasoned about: a truncated,
+syntactically-broken manifest and 500 bytes of raw random data dropped in
+the same directory don't crash or hang the check, they're just skipped.
+
+**A small, explicitly non-exhaustive allowlist** of common legitimate
+overlay/vendor layer name prefixes (MangoHud, `vkBasalt`, RenderDoc,
+LatencyFleX, Steam's overlay and Fossilize layers, and the GPU-vendor/Khronos
+layers Mesa/NVIDIA/AMD/Intel ship) keeps the periodic check from warning on
+every machine that happens to have a normal Linux gaming setup — verified
+against a real one: this machine's actual installed Steam and Mesa layer
+manifests were used to catch (and fix) a case-sensitivity bug in the
+allowlist before it shipped, not just a synthetic test. This is a
+name-based heuristic, not a security boundary — a cheat could name its own
+layer `VK_LAYER_MANGOHUD_overlay` to blend in — so the one-shot CLI check
+reports every active layer regardless of the allowlist, precisely so a
+human reviewing it isn't relying on the name check alone.
+
+**Periodic check re-scans every cycle, not once per pid.** Unlike the
+environ-based checks above, manifest files live on disk and can change
+while a session is already running, so treating environ's "fixed at
+exec()" logic as an excuse to check once wouldn't be correct here. Instead
+it reuses `anon_baseline_check()`'s exact design: whatever unrecognized
+layers are already active the first time a pid is observed become that
+pid's baseline, silently, and only a *later increase* — a new
+unrecognized layer appearing mid-session — is the signal worth a
+`LOG_WARNING`. `test.sh` proves this baseline-then-growth behavior
+directly: protects a victim with no manifest present yet, confirms the
+periodic check logs nothing on its first pass, drops the manifest in
+while the daemon is still running, and confirms the very next cycle logs
+it.
+
+`test.sh` also proves the full mechanism against a real user's real
+`$HOME` (via `$SUDO_USER`, since this all needs to run as root but
+resolve a *different* user's paths to mean anything): the negative case,
+the positive case, `disable_environment` suppression, and the periodic
+baseline/growth behavior, all against a real loaded module.
 
 ### Ban-pipeline reporting (server-side)
 

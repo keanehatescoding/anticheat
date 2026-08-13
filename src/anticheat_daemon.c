@@ -14,6 +14,7 @@
  *   scan --pid N --check-hooks             Vulkan present-call hook check
  *   scan --pid N --check-preload           LD_PRELOAD check (heuristic)
  *   scan --pid N --check-vklayers          Vulkan-layer env var check (heuristic)
+ *   scan --pid N --check-implicit-layers   implicit Vulkan-layer manifest check (heuristic)
  *   syscalls               verify syscall table integrity
  *   modules                list modules + detect hidden modules
  *   events [--watch]       dump pending security events (--watch: poll)
@@ -39,6 +40,7 @@
 #include <elf.h>
 #include <netdb.h>
 #include <poll.h>
+#include <pwd.h>
 #include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -805,16 +807,21 @@ static int check_vk_layer_env(int pid)
     printf("    (informational only -- also used by legitimate overlay tools\n"
            "     like MangoHud; not a verdict. An implicit layer manifest\n"
            "     dropped into the loader's default search directories needs\n"
-           "     no environment variable and is not detected by this check)\n");
+           "     no environment variable and is not detected by this check --\n"
+           "     see --check-implicit-layers for that)\n");
     return 1;
 }
+
+/* Defined later, alongside its own data structures; forward declared so
+ * cmd_scan doesn't need that whole section moved above this one. */
+static int check_implicit_layers(int pid);
 
 static int cmd_scan(int argc, char **argv)
 {
     struct ac_scan_begin b;
     int pid = -1, i;
     int do_hash = 0, do_save = 0, do_check = 0, do_hooks = 0, do_preload = 0;
-    int do_vklayers = 0;
+    int do_vklayers = 0, do_implicit = 0;
     char exe[PATH_MAX] = "";
     char *exe_link;
     unsigned int v;
@@ -834,10 +841,13 @@ static int cmd_scan(int argc, char **argv)
             do_preload = 1;
         else if (strcmp(argv[i], "--check-vklayers") == 0)
             do_vklayers = 1;
+        else if (strcmp(argv[i], "--check-implicit-layers") == 0)
+            do_implicit = 1;
     }
     if (pid < 0)
         die("usage: anticheat scan --pid N [--hash [--save|--check]] "
-            "[--check-hooks] [--check-preload] [--check-vklayers]");
+            "[--check-hooks] [--check-preload] [--check-vklayers] "
+            "[--check-implicit-layers]");
 
     ac_open();
     memset(&b, 0, sizeof(b));
@@ -885,6 +895,9 @@ static int cmd_scan(int argc, char **argv)
 
     if (do_vklayers)
         check_vk_layer_env(pid);
+
+    if (do_implicit)
+        check_implicit_layers(pid);
 
     if (do_hash) {
         exe_link = proc_exe_path(pid);
@@ -1529,6 +1542,447 @@ static int ac_vk_layer_check_interval(void)
     return (v > 0) ? v : 10;
 }
 
+/* ------------------------------------------------------------------ */
+/* implicit Vulkan-layer manifest detection                            */
+/*                                                                      */
+/* --check-vklayers only sees layers activated via environment          */
+/* variables. An *implicit* layer manifest dropped into one of the      */
+/* Vulkan loader's default search directories is auto-enabled by the    */
+/* loader for every Vulkan process -- unless the manifest itself        */
+/* defines a "disable_environment" variable and the target has it set   */
+/* -- with no environment variable involved at all: exactly the gap     */
+/* documented when --check-vklayers shipped. This closes it by directly */
+/* replicating what the loader itself does: enumerate the same          */
+/* directories it searches (both the target user's own per-user paths,  */
+/* the more realistic vector since writing there needs no elevated      */
+/* privilege at all, and the system-wide ones), parse each manifest's    */
+/* "library_path"/"disable_environment", and cross-reference against    */
+/* the target's own environ (reusing ac_read_environ_vars()) to         */
+/* determine whether each discovered layer is actually active for that  */
+/* specific process right now.                                          */
+/*                                                                      */
+/* Deliberately never trusts the manifest content beyond parsing it as  */
+/* data -- these files can be attacker-controlled (that's the whole     */
+/* point of this check), so parsing is bounded and defensive throughout, */
+/* same posture as elf_find_symbol_offset() above; nothing from a       */
+/* layer's library_path is ever opened or loaded, only reported.        */
+/*                                                                      */
+/* A small, explicitly non-exhaustive allowlist of common legitimate    */
+/* overlay layer names keeps the periodic check from warning on every   */
+/* machine that happens to have MangoHud installed (extremely common).  */
+/* This is a name-based heuristic, not a security boundary: a cheat     */
+/* could name its own layer "VK_LAYER_MANGOHUD_overlay" to blend in --  */
+/* the one-shot CLI check reports every active layer regardless of the  */
+/* allowlist, precisely so a human reviewing it isn't relying on the    */
+/* name check alone.                                                    */
+/* ------------------------------------------------------------------ */
+#define AC_MANIFEST_MAX_BYTES (64 * 1024)
+#define AC_MANIFEST_STR_LEN 256
+#define AC_MAX_IMPLICIT_LAYERS 64
+
+struct ac_implicit_layer {
+    char name[AC_MANIFEST_STR_LEN];
+    char library_path[AC_MANIFEST_STR_LEN];
+    char disable_env[AC_MANIFEST_STR_LEN];   /* empty if manifest has none */
+};
+
+/* Known-legitimate implicit overlay/compat/vendor layer name prefixes.
+ * Not exhaustive, not a security boundary -- see block comment above. */
+static const char *const AC_KNOWN_LAYER_PREFIXES[] = {
+    "VK_LAYER_MANGOHUD",
+    "VK_LAYER_OBS_HOOK",
+    "VK_LAYER_OBS_hotkeys",
+    "VK_LAYER_VKBASALT",
+    "VK_LAYER_RENDERDOC",
+    "VK_LAYER_LATENCYFLEX",
+    "VK_LAYER_VALVE_steam_overlay",
+    "VK_LAYER_VALVE_steam_fossilize",
+    "VK_LAYER_GOOGLE_",
+    "VK_LAYER_KHRONOS_",
+    "VK_LAYER_MESA_",
+    "VK_LAYER_INTEL_",
+    "VK_LAYER_NV_",
+    "VK_LAYER_AMD_",
+};
+#define AC_KNOWN_LAYER_PREFIXES_COUNT \
+    (sizeof(AC_KNOWN_LAYER_PREFIXES) / sizeof(AC_KNOWN_LAYER_PREFIXES[0]))
+
+static int ac_layer_name_known(const char *name)
+{
+    unsigned int i;
+
+    for (i = 0; i < AC_KNOWN_LAYER_PREFIXES_COUNT; i++)
+        if (strncmp(name, AC_KNOWN_LAYER_PREFIXES[i],
+                    strlen(AC_KNOWN_LAYER_PREFIXES[i])) == 0)
+            return 1;
+    return 0;
+}
+
+/* Finds "key" as a JSON object key (a targeted extractor for the small,
+ * well-defined Vulkan layer manifest schema, not a general JSON parser)
+ * followed by ':' and a quoted string, and copies the string's content
+ * into out. Returns 1 if found, 0 if not. Bounded and defensive
+ * throughout: the manifest is attacker-influenceable content, never
+ * trusted structure. Minimal escape handling -- a backslash-escaped
+ * character is copied verbatim, which is close enough for the plain
+ * ASCII paths/names these manifests contain in practice; a value using
+ * more exotic JSON escapes just won't match cleanly, a safe failure
+ * mode (skip, not misread). */
+static int json_extract_string(const char *json, size_t json_len,
+                                const char *key, char *out, size_t outsz)
+{
+    char needle[64];
+    int needle_len;
+    const char *p = json, *end = json + json_len;
+
+    needle_len = snprintf(needle, sizeof(needle), "\"%s\"", key);
+    if (needle_len <= 0 || (size_t)needle_len >= sizeof(needle))
+        return 0;
+
+    while (p < end) {
+        const char *hit = memmem(p, (size_t)(end - p), needle, (size_t)needle_len);
+        const char *q;
+        size_t oi;
+
+        if (!hit)
+            return 0;
+        q = hit + needle_len;
+        while (q < end && isspace((unsigned char)*q))
+            q++;
+        if (q >= end || *q != ':') {
+            p = hit + 1;
+            continue;
+        }
+        q++;
+        while (q < end && isspace((unsigned char)*q))
+            q++;
+        if (q >= end || *q != '"') {
+            p = hit + 1;
+            continue;
+        }
+        q++;
+        oi = 0;
+        while (q < end && *q != '"') {
+            if (*q == '\\' && q + 1 < end)
+                q++;
+            if (oi + 1 < outsz)
+                out[oi++] = *q;
+            q++;
+        }
+        out[oi < outsz ? oi : outsz - 1] = '\0';
+        return 1;
+    }
+    return 0;
+}
+
+/* Same idea as json_extract_string(), but "disable_environment"'s JSON
+ * value is an object whose single key is the variable name -- e.g.
+ * "disable_environment": { "DISABLE_MANGOHUD": "1" } -- so this needs
+ * the first key inside that object, not a plain string value. */
+static int json_extract_disable_env(const char *json, size_t json_len,
+                                     char *out, size_t outsz)
+{
+    static const char needle[] = "\"disable_environment\"";
+    const char *hit, *end = json + json_len;
+    const char *q;
+    size_t oi;
+
+    hit = memmem(json, json_len, needle, sizeof(needle) - 1);
+    if (!hit)
+        return 0;
+    q = hit + sizeof(needle) - 1;
+    while (q < end && isspace((unsigned char)*q))
+        q++;
+    if (q >= end || *q != ':')
+        return 0;
+    q++;
+    while (q < end && isspace((unsigned char)*q))
+        q++;
+    if (q >= end || *q != '{')
+        return 0;
+    q++;
+    while (q < end && isspace((unsigned char)*q))
+        q++;
+    if (q >= end || *q != '"')
+        return 0;
+    q++;
+    oi = 0;
+    while (q < end && *q != '"') {
+        if (*q == '\\' && q + 1 < end)
+            q++;
+        if (oi + 1 < outsz)
+            out[oi++] = *q;
+        q++;
+    }
+    out[oi < outsz ? oi : outsz - 1] = '\0';
+    return 1;
+}
+
+/* Resolves the target process's real uid (from /proc/<pid>/status,
+ * "Uid:" line, first field) and that user's home directory, so the
+ * per-user implicit-layer manifest paths can be checked correctly --
+ * the daemon runs as root, so its own $HOME is irrelevant to what a
+ * game running as a different, unprivileged user would actually have
+ * loaded. Returns 0 on success (fills home), -1 if the pid is gone or
+ * the uid can't be resolved to a passwd entry (not fatal to the overall
+ * check -- the system-wide directories are still checked either way). */
+static int ac_resolve_pid_home(int pid, char *home, size_t homesz)
+{
+    char path[64];
+    FILE *f;
+    char line[256];
+    uid_t uid = (uid_t)-1;
+    struct passwd pwbuf, *pw = NULL;
+    char pwdata[4096];
+
+    snprintf(path, sizeof(path), "/proc/%d/status", pid);
+    f = fopen(path, "r");
+    if (!f)
+        return -1;
+    while (fgets(line, sizeof(line), f)) {
+        unsigned long v;
+
+        if (sscanf(line, "Uid: %lu", &v) == 1) {
+            uid = (uid_t)v;
+            break;
+        }
+    }
+    fclose(f);
+    if (uid == (uid_t)-1)
+        return -1;
+
+    if (getpwuid_r(uid, &pwbuf, pwdata, sizeof(pwdata), &pw) != 0 ||
+        !pw || !pw->pw_dir)
+        return -1;
+    snprintf(home, homesz, "%s", pw->pw_dir);
+    return 0;
+}
+
+/* Scans one implicit_layer.d directory for *.json manifests, appending
+ * successfully-parsed layers into layers[*count] (capped at
+ * AC_MAX_IMPLICIT_LAYERS total across all directories -- more than that
+ * many implicit layers on one machine would be extraordinary). A
+ * manifest missing "name" or "library_path" is skipped, not guessed at.
+ * A missing directory is the overwhelmingly common case (most machines
+ * have none of these paths at all) and is silently skipped, not an
+ * error. */
+static void ac_scan_implicit_layer_dir(const char *dir,
+                                        struct ac_implicit_layer *layers,
+                                        unsigned int *count)
+{
+    DIR *d;
+    struct dirent *de;
+
+    d = opendir(dir);
+    if (!d)
+        return;
+    while (*count < AC_MAX_IMPLICIT_LAYERS && (de = readdir(d)) != NULL) {
+        char path[PATH_MAX];
+        size_t namelen = strlen(de->d_name);
+        int fd;
+        char *buf;
+        ssize_t n;
+        struct ac_implicit_layer *layer;
+
+        if (namelen < 5 || strcmp(de->d_name + namelen - 5, ".json") != 0)
+            continue;
+        snprintf(path, sizeof(path), "%s/%s", dir, de->d_name);
+        fd = open(path, O_RDONLY);
+        if (fd < 0)
+            continue;
+        buf = malloc(AC_MANIFEST_MAX_BYTES);
+        if (!buf) {
+            close(fd);
+            continue;
+        }
+        n = read(fd, buf, AC_MANIFEST_MAX_BYTES - 1);
+        close(fd);
+        if (n <= 0) {
+            free(buf);
+            continue;
+        }
+        buf[n] = '\0';
+
+        layer = &layers[*count];
+        memset(layer, 0, sizeof(*layer));
+        if (json_extract_string(buf, (size_t)n, "name", layer->name, sizeof(layer->name)) &&
+            json_extract_string(buf, (size_t)n, "library_path", layer->library_path,
+                                 sizeof(layer->library_path))) {
+            json_extract_disable_env(buf, (size_t)n, layer->disable_env,
+                                      sizeof(layer->disable_env));
+            (*count)++;
+        }
+        free(buf);
+    }
+    closedir(d);
+}
+
+/* Enumerates every standard implicit_layer.d directory and returns the
+ * layers that are actually active for this specific target: present,
+ * and not disabled via its own "disable_environment" variable (if the
+ * manifest defines one) in the target's own environ. Returns the count
+ * found (0 is normal and common). */
+static int ac_scan_active_implicit_layers(int pid,
+                                           struct ac_implicit_layer *out,
+                                           unsigned int outcap)
+{
+    struct ac_implicit_layer found[AC_MAX_IMPLICIT_LAYERS];
+    unsigned int nfound = 0, nactive = 0, i;
+    char home[PATH_MAX];
+
+    if (ac_resolve_pid_home(pid, home, sizeof(home)) == 0) {
+        char dir[PATH_MAX + 64];   /* home[] + the longest suffix below, with headroom */
+
+        snprintf(dir, sizeof(dir), "%s/.config/vulkan/implicit_layer.d", home);
+        ac_scan_implicit_layer_dir(dir, found, &nfound);
+        snprintf(dir, sizeof(dir), "%s/.local/share/vulkan/implicit_layer.d", home);
+        ac_scan_implicit_layer_dir(dir, found, &nfound);
+    }
+    ac_scan_implicit_layer_dir("/etc/vulkan/implicit_layer.d", found, &nfound);
+    ac_scan_implicit_layer_dir("/usr/local/etc/vulkan/implicit_layer.d", found, &nfound);
+    ac_scan_implicit_layer_dir("/usr/share/vulkan/implicit_layer.d", found, &nfound);
+    ac_scan_implicit_layer_dir("/usr/local/share/vulkan/implicit_layer.d", found, &nfound);
+
+    for (i = 0; i < nfound && nactive < outcap; i++) {
+        if (found[i].disable_env[0]) {
+            struct ac_environ_query q;
+
+            memset(&q, 0, sizeof(q));
+            q.name = found[i].disable_env;
+            if (ac_read_environ_vars(pid, &q, 1) == 0 && q.found)
+                continue;   /* explicitly disabled for this process */
+        }
+        out[nactive++] = found[i];
+    }
+    return (int)nactive;
+}
+
+/* CLI-facing wrapper for `scan --check-implicit-layers`. Reports every
+ * active layer regardless of the allowlist -- unlike the periodic check
+ * below, a human explicitly asked to see this. */
+static int check_implicit_layers(int pid)
+{
+    struct ac_implicit_layer layers[AC_MAX_IMPLICIT_LAYERS];
+    int n = ac_scan_active_implicit_layers(pid, layers, AC_MAX_IMPLICIT_LAYERS);
+    int i, unknown = 0;
+
+    if (n <= 0) {
+        printf("  Implicit Vulkan-layer check: none active for this process\n");
+        return 0;
+    }
+    for (i = 0; i < n; i++) {
+        int known = ac_layer_name_known(layers[i].name);
+
+        printf("  Implicit Vulkan-layer: %s -> %s%s\n",
+               layers[i].name[0] ? layers[i].name : "(unnamed)",
+               layers[i].library_path[0] ? layers[i].library_path : "(no library_path)",
+               known ? "" : "  [not in the known-overlay allowlist]");
+        if (!known)
+            unknown++;
+    }
+    printf("    (informational only -- also used by legitimate overlay tools\n"
+           "     like MangoHud; not a verdict. Name-based allowlist matching\n"
+           "     can be spoofed by a layer that names itself similarly)\n");
+    return unknown > 0 ? 1 : 0;
+}
+
+/* Periodic counterpart. Unlike the environ-based checks (LD_PRELOAD,
+ * VK layer env vars), which read something fixed at exec() time,
+ * manifest files live on disk and can change while a session is
+ * running -- so this re-scans every cycle rather than checking once per
+ * pid, but only ever warns on *growth* of the unrecognized-layer count
+ * for a given pid, the same baseline-delta design as
+ * anon_baseline_check(): a pid's already-active layers at first
+ * observation are its baseline, not something to alert on, and only a
+ * later increase (a new unrecognized layer appearing mid-session) is
+ * the signal. */
+struct ac_implicit_layer_baseline {
+    int pid;
+    unsigned int count;
+    int in_use;
+};
+static struct ac_implicit_layer_baseline g_implicit_layer_baseline[AC_MAX_PROTS];
+
+static void implicit_layer_baseline_forget_stale(const struct ac_prot_list *pl)
+{
+    unsigned int i, j;
+
+    for (i = 0; i < AC_MAX_PROTS; i++) {
+        if (!g_implicit_layer_baseline[i].in_use)
+            continue;
+        for (j = 0; j < pl->count; j++)
+            if (pl->items[j].pid == g_implicit_layer_baseline[i].pid)
+                break;
+        if (j == pl->count)
+            g_implicit_layer_baseline[i].in_use = 0;
+    }
+}
+
+static void check_implicit_layers_periodic(void)
+{
+    struct ac_prot_list pl;
+    unsigned int i;
+
+    memset(&pl, 0, sizeof(pl));
+    if (ioctl(dev_fd, AC_IOCTL_LIST_PROTECTED, &pl) < 0)
+        return;
+    implicit_layer_baseline_forget_stale(&pl);
+    for (i = 0; i < pl.count; i++) {
+        struct ac_implicit_layer layers[AC_MAX_IMPLICIT_LAYERS];
+        int n = ac_scan_active_implicit_layers(pl.items[i].pid, layers,
+                                                AC_MAX_IMPLICIT_LAYERS);
+        char names[512];
+        size_t noff = 0;
+        unsigned int unknown = 0, j, slot = AC_MAX_PROTS, free_slot = AC_MAX_PROTS;
+
+        if (n < 0)
+            continue;
+        for (j = 0; j < (unsigned int)n; j++) {
+            const char *nm;
+
+            if (ac_layer_name_known(layers[j].name))
+                continue;
+            nm = layers[j].name[0] ? layers[j].name : "(unnamed)";
+            noff += (size_t)snprintf(names + noff,
+                                      noff < sizeof(names) ? sizeof(names) - noff : 0,
+                                      "%s%s", unknown ? ", " : "", nm);
+            unknown++;
+        }
+
+        for (j = 0; j < AC_MAX_PROTS; j++) {
+            if (g_implicit_layer_baseline[j].in_use &&
+                g_implicit_layer_baseline[j].pid == pl.items[i].pid) {
+                slot = j;
+                break;
+            }
+            if (free_slot == AC_MAX_PROTS && !g_implicit_layer_baseline[j].in_use)
+                free_slot = j;
+        }
+        if (slot == AC_MAX_PROTS) {
+            if (free_slot != AC_MAX_PROTS) {
+                g_implicit_layer_baseline[free_slot].pid = pl.items[i].pid;
+                g_implicit_layer_baseline[free_slot].count = unknown;
+                g_implicit_layer_baseline[free_slot].in_use = 1;
+            }
+            continue;
+        }
+        if (unknown > g_implicit_layer_baseline[slot].count)
+            logmsg(LOG_WARNING, "pid %d (%s): %u unrecognized implicit Vulkan "
+                   "layer(s) active (%s) -- not in the known-overlay "
+                   "allowlist; informational only, not a verdict on its own",
+                   pl.items[i].pid, pl.items[i].comm, unknown, names);
+        g_implicit_layer_baseline[slot].count = unknown;
+    }
+}
+
+static int ac_implicit_layer_check_interval(void)
+{
+    const char *e = getenv("AC_IMPLICIT_LAYER_CHECK_INTERVAL");
+    int v = e ? atoi(e) : 0;
+
+    return (v > 0) ? v : 30;
+}
+
 static int scan_protected_periodic(void)
 {
     struct ac_prot_list pl;
@@ -1935,6 +2389,7 @@ static int cmd_start(int argc, char **argv)
     {
         time_t next_sys = 0, next_mod = 0, next_scan = 0, next_baseline = 0;
         time_t next_render = 0, next_preload = 0, next_vklayer = 0;
+        time_t next_implicit = 0;
 
         while (!g_stop) {
             struct ac_event_list el;
@@ -1983,6 +2438,10 @@ static int cmd_start(int argc, char **argv)
                 check_vk_layers_periodic();
                 next_vklayer = now + ac_vk_layer_check_interval();
             }
+            if (now >= next_implicit) {
+                check_implicit_layers_periodic();
+                next_implicit = now + ac_implicit_layer_check_interval();
+            }
             sleep(1);
         }
     }
@@ -2002,7 +2461,8 @@ static void usage(const char *prog)
            "  unprotect --pid N\n"
            "  list                       list protected processes\n"
            "  scan --pid N [--hash [--save|--check]] [--check-hooks] "
-           "[--check-preload] [--check-vklayers]\n"
+           "[--check-preload]\n"
+           "           [--check-vklayers] [--check-implicit-layers]\n"
            "  syscalls                   verify syscall table integrity\n"
            "  modules                    kernel module list + hidden module check\n"
            "  events [--watch]           dump security events\n"

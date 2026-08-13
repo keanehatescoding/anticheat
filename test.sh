@@ -320,6 +320,131 @@ fi
 kill "$VKLAYER_PID" 2>/dev/null
 wait "$VKLAYER_PID" 2>/dev/null
 
+say "implicit Vulkan-layer manifest check: negative, positive, disable_environment, periodic growth"
+# Needs a real non-root user to place a manifest under and run a victim
+# as (getpwuid() resolution is the whole point of this check -- root's
+# own $HOME wouldn't exercise it). $SUDO_USER is how test.sh, itself run
+# via sudo, knows who that is without hardcoding a username.
+if [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != "root" ]; then
+    IMPLICIT_HOME=$(getent passwd "$SUDO_USER" | cut -d: -f6)
+else
+    IMPLICIT_HOME=""
+fi
+if [ -n "$IMPLICIT_HOME" ] && [ -d "$IMPLICIT_HOME" ]; then
+    IMPLICIT_DIR="$IMPLICIT_HOME/.local/share/vulkan/implicit_layer.d"
+    IMPLICIT_DIR_PRE_EXISTED=0
+    [ -d "$IMPLICIT_DIR" ] && IMPLICIT_DIR_PRE_EXISTED=1
+    mkdir -p "$IMPLICIT_DIR"
+    MANIFEST="$IMPLICIT_DIR/ac_test_layer_$$.json"
+
+    sudo -u "$SUDO_USER" bash -c 'sleep 300' &
+    IMPLICIT_SUDO_PID=$!
+    sleep 0.3
+    # sudo forks a monitor process and runs the command in a child with
+    # the target uid; $! is the monitor (still root), not the real
+    # unprivileged victim -- pgrep -P finds that actual child.
+    IMPLICIT_VPID=$(pgrep -P "$IMPLICIT_SUDO_PID" -f "sleep 300")
+
+    if [ -n "$IMPLICIT_VPID" ]; then
+        NEG_OUT=$(./anticheat scan --pid "$IMPLICIT_VPID" --check-implicit-layers 2>&1)
+        if printf '%s' "$NEG_OUT" | grep -q "ac_test_layer_$$\|VK_LAYER_AC_TEST_$$"; then
+            bad "test layer unexpectedly reported before the manifest was written"
+        else
+            ok "victim process does not report the not-yet-written test layer"
+        fi
+
+        cat > "$MANIFEST" <<MANIFESTEOF
+{
+    "file_format_version": "1.0.0",
+    "layer": {
+        "name": "VK_LAYER_AC_TEST_$$",
+        "type": "GLOBAL",
+        "library_path": "/tmp/ac-test-does-not-exist-$$.so",
+        "api_version": "1.2.135",
+        "implementation_version": "1",
+        "description": "hypranticheat test.sh coverage for implicit-layer detection",
+        "disable_environment": {
+            "AC_TEST_DISABLE_LAYER_$$": "1"
+        }
+    }
+}
+MANIFESTEOF
+        POS_OUT=$(./anticheat scan --pid "$IMPLICIT_VPID" --check-implicit-layers 2>&1)
+        if printf '%s' "$POS_OUT" | grep -q "VK_LAYER_AC_TEST_$$" && \
+            printf '%s' "$POS_OUT" | grep -q "not in the known-overlay allowlist"; then
+            ok "one-shot check detects the new manifest and flags it as unrecognized"
+        else
+            bad "one-shot check did not detect/flag the test manifest (got: $POS_OUT)"
+        fi
+        kill "$IMPLICIT_SUDO_PID" "$IMPLICIT_VPID" 2>/dev/null
+
+        sudo -u "$SUDO_USER" env "AC_TEST_DISABLE_LAYER_$$=1" bash -c 'sleep 300' &
+        IMPLICIT_SUDO_PID2=$!
+        sleep 0.3
+        IMPLICIT_VPID2=$(pgrep -P "$IMPLICIT_SUDO_PID2" -f "sleep 300")
+        if [ -n "$IMPLICIT_VPID2" ]; then
+            DIS_OUT=$(./anticheat scan --pid "$IMPLICIT_VPID2" --check-implicit-layers 2>&1)
+            if printf '%s' "$DIS_OUT" | grep -q "VK_LAYER_AC_TEST_$$"; then
+                bad "layer still reported active with its disable_environment var set"
+            else
+                ok "disable_environment correctly suppresses the layer for this process"
+            fi
+            kill "$IMPLICIT_SUDO_PID2" "$IMPLICIT_VPID2" 2>/dev/null
+        else
+            bad "could not resolve the disable_environment victim's real pid"
+        fi
+
+        rm -f "$MANIFEST"
+        sudo -u "$SUDO_USER" bash -c 'sleep 300' &
+        IMPLICIT_SUDO_PID3=$!
+        sleep 0.3
+        IMPLICIT_VPID3=$(pgrep -P "$IMPLICIT_SUDO_PID3" -f "sleep 300")
+        if [ -n "$IMPLICIT_VPID3" ] && ./anticheat protect --pid "$IMPLICIT_VPID3" >/dev/null 2>&1; then
+            AC_IMPLICIT_LAYER_CHECK_INTERVAL=2 ./anticheat start --foreground \
+                >"/tmp/ac_implicit_test_$$.log" 2>&1 &
+            IMPLICIT_DAEMON_PID=$!
+            sleep 3
+            if grep -q "unrecognized implicit Vulkan" "/tmp/ac_implicit_test_$$.log"; then
+                bad "periodic check warned before the layer was even present (bad baseline)"
+            else
+                ok "periodic check established a silent baseline with no layer present"
+            fi
+            cat > "$MANIFEST" <<MANIFESTEOF2
+{
+    "file_format_version": "1.0.0",
+    "layer": {
+        "name": "VK_LAYER_AC_TEST_$$",
+        "type": "GLOBAL",
+        "library_path": "/tmp/ac-test-does-not-exist-$$.so"
+    }
+}
+MANIFESTEOF2
+            sleep 5
+            if grep -q "unrecognized implicit Vulkan.*VK_LAYER_AC_TEST_$$" "/tmp/ac_implicit_test_$$.log"; then
+                ok "periodic check detected the layer appearing mid-session"
+            else
+                bad "periodic check did not detect the layer appearing mid-session"
+            fi
+            kill "$IMPLICIT_DAEMON_PID" 2>/dev/null
+            wait "$IMPLICIT_DAEMON_PID" 2>/dev/null
+            rm -f "/tmp/ac_implicit_test_$$.log"
+        else
+            bad "could not protect the periodic-growth victim pid"
+        fi
+        kill "$IMPLICIT_SUDO_PID3" "$IMPLICIT_VPID3" 2>/dev/null
+    else
+        bad "could not resolve the real (non-sudo-monitor) victim pid"
+        kill "$IMPLICIT_SUDO_PID" 2>/dev/null
+    fi
+
+    rm -f "$MANIFEST"
+    if [ "$IMPLICIT_DIR_PRE_EXISTED" -eq 0 ]; then
+        rmdir "$IMPLICIT_DIR" 2>/dev/null
+    fi
+else
+    say "no real non-root \$SUDO_USER with a resolvable home directory, skipping implicit-layer checks"
+fi
+
 say "memory integrity baseline"
 if ./anticheat scan --pid "$VICTIM_PID" --hash --save >/dev/null 2>&1; then
     ok "baseline saved"
