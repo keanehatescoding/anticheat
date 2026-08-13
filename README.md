@@ -149,17 +149,27 @@ DXVK/VKD3D-Proton translate D3D calls down to Vulkan — one check point, wide
 practical coverage, no separate GLX/OpenGL path needed for the common case.
 
 This needs no signature database and can't go stale across distros or
-Vulkan loader versions: the daemon `dlopen()`s the *exact same on-disk
-file* the target process has mapped, reads `vkQueuePresentKHR`'s first 32
-bytes out of that fresh local load (via `dladdr()` to resolve the symbol's
-file-relative offset), and compares them against the same offset read from
-the target's memory (`/proc/<pid>/mem`, the same mechanism `--hash` already
-uses — see `compare_render_symbol()` in the daemon). A classic
-inline/trampoline hook — patching the function's leading bytes to jump into
-injected code — changes those bytes; an unmodified process matches
-byte-for-byte. The reference copy is whatever the target itself is
+Vulkan loader versions: the daemon reads the *exact same on-disk file*
+the target process has mapped, parses its ELF section headers directly to
+find `vkQueuePresentKHR`'s file-relative offset and first 32 bytes there,
+and compares them against the same offset read from the target's memory
+(`/proc/<pid>/mem`, the same mechanism `--hash` already uses — see
+`compare_render_symbol()`/`elf_find_symbol_offset()` in the daemon). A
+classic inline/trampoline hook — patching the function's leading bytes to
+jump into injected code — changes those bytes; an unmodified process
+matches byte-for-byte. The reference copy is whatever the target itself is
 currently using, read fresh at check time, so there's nothing to maintain
 as Mesa/NVIDIA driver or Vulkan loader versions change.
+
+Deliberately never `dlopen()`s that file, and this isn't a style
+preference: the path is resolved through the *target's own* mount
+namespace (see below), which isn't a trusted input — a process can be set
+up so an attacker controls what's mounted at the path the kernel reports
+for it. `dlopen()` would run that file's constructors as root. The ELF
+symbol table is parsed with plain `pread()` instead, so no code from an
+untrusted file is ever executed — verified directly, not just reasoned
+about: a constructor planted in a file at an attacker-controlled
+mount-namespace path does not run when the check reads it.
 
 Known blind spot, not a bug: this catches in-place byte patching of the
 exported function, not a cheat that intercepts the call via `LD_PRELOAD`
@@ -254,8 +264,14 @@ at all. When set, every detection the monitoring loop already logs at
 tamper, anon-exec growth, render hook — see `logmsg()`) is also POSTed to the server as
 `{client_id, event_type, detail, ts}`. `client_id` is `/etc/machine-id`
 (falls back to the hostname). A hung or unreachable server can't stall
-detection: the send/receive timeout is 3s, and a failed report only logs a
-local warning, never blocks or crashes the monitoring loop.
+detection: connect/send/receive are all bounded to 3s (`ac_connect_timeout()`
+does a non-blocking connect + `poll()`, since `SO_SNDTIMEO`/`SO_RCVTIMEO`
+alone don't bound `connect()` itself on Linux — a host that blackholes SYN
+packets rather than refusing them would otherwise hang for the kernel's TCP
+retry timeout, not 3s), and a failed or partially-sent report only logs a
+local warning, never blocks or crashes the monitoring loop. DNS resolution
+via `getaddrinfo()` is not itself timeout-bounded — configure
+`AC_REPORT_URL` as a literal IP if that matters for your deployment.
 
 **Server side.** Stdlib-only Python (`http.server` + `sqlite3`, zero
 third-party dependencies) with two separate bearer-token tiers:

@@ -35,8 +35,9 @@
 #include <time.h>
 #include <dirent.h>
 #include <ctype.h>
-#include <dlfcn.h>
+#include <elf.h>
 #include <netdb.h>
+#include <poll.h>
 #include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -401,15 +402,24 @@ static void baseline_path_for(const char *path, char out[PATH_MAX])
 /* through libvulkan.so's vkQueuePresentKHR, since DXVK/VKD3D-Proton   */
 /* translate D3D down to Vulkan -- one check point, broad coverage.    */
 /*                                                                      */
-/* Detection needs no signature database: we dlopen() the exact same   */
-/* on-disk file the target has mapped, read vkQueuePresentKHR's first  */
-/* bytes out of *our own* fresh load of it, and compare against the    */
-/* same bytes read from the target's memory at the equivalent runtime  */
-/* address. A classic inline/trampoline hook (redirecting the function */
-/* to a jmp into injected code) changes those leading bytes; a clean   */
-/* process matches byte-for-byte. The "known good" copy can't go stale */
-/* across distros or loader versions since it's whatever the target    */
-/* itself is using, read fresh at check time.                          */
+/* Detection needs no signature database: we read the exact same       */
+/* on-disk file the target has mapped, parse out vkQueuePresentKHR's   */
+/* file-relative offset and its first bytes there, and compare against */
+/* the same bytes read from the target's memory at the equivalent      */
+/* runtime address. A classic inline/trampoline hook (redirecting the  */
+/* function to a jmp into injected code) changes those leading bytes;  */
+/* a clean process matches byte-for-byte. The "known good" copy can't  */
+/* go stale across distros or loader versions since it's whatever the  */
+/* target itself is using, read fresh at check time.                   */
+/*                                                                      */
+/* Deliberately never dlopen()s that file: it's resolved through the   */
+/* *target's own* mount namespace (see compare_render_symbol() below), */
+/* which is not a trusted input -- a process can be set up so an       */
+/* attacker controls what's mounted at the path the kernel reports for */
+/* it. dlopen()ing an attacker-chosen file means running its           */
+/* constructors (DT_INIT/.init_array) as root. The ELF section headers */
+/* and symbol table are parsed directly with plain pread() instead --  */
+/* pure data reads, no code from that file is ever executed.           */
 /*                                                                      */
 /* Known blind spot, documented rather than silently missed: a cheat   */
 /* that hooks via LD_PRELOAD interposition or a malicious Vulkan layer */
@@ -417,30 +427,128 @@ static void baseline_path_for(const char *path, char out[PATH_MAX])
 /* place is not caught by this check -- see README.                    */
 /* ------------------------------------------------------------------ */
 #define AC_HOOK_CHECK_BYTES 32
+#define AC_ELF_MAX_SHNUM    2048           /* generous; real .so files have <100 */
+#define AC_ELF_MAX_STRTAB   (4 * 1024 * 1024)
+#define AC_ELF_MAX_SYMS     500000
 
-/* dlopen()s libpath (via the target's own /proc/<pid>/root/ -- see
- * below) to get a known-good reference copy of `symbol`, then compares
- * its first AC_HOOK_CHECK_BYTES against the same offset in the target
- * pid's mapping of the identical file (lib_base = that mapping's lowest
- * VMA start, i.e. its file-offset-0 load address). Returns 1 if hooked,
- * 0 if clean, -1 if inconclusive (never treated as a positive detection
- * -- an unreadable/unloadable library is a skip, not an alert). Silent
- * by design -- callers decide how (or whether) to surface the result,
- * since the CLI's one-shot `scan --check-hooks` and the daemon's
- * silent-unless-hooked periodic check want very different presentation
- * of the same underlying check. */
+/* Parses fd's ELF64 section headers to find `symbol` in .dynsym, using
+ * only plain pread() -- never dlopen(), see the block comment above.
+ * Returns 0 on success (fills *offset_out with the symbol's
+ * file-relative offset, which for the ET_DYN shared libraries this
+ * checks is the same value as its runtime offset from the load base),
+ * -1 on any parse/read/bounds failure. Every failure is inconclusive,
+ * never a positive detection -- a malformed or unexpected-shape ELF
+ * file is a skip, same as an unreadable one. x86-64 only (ELFCLASS64 /
+ * little-endian), matching the rest of this project's scope. */
+static int elf_find_symbol_offset(int fd, const char *symbol, uint64_t *offset_out)
+{
+    Elf64_Ehdr eh;
+    Elf64_Shdr *shdrs = NULL;
+    char *shstrtab = NULL;
+    Elf64_Sym *syms = NULL;
+    char *dynstrtab = NULL;
+    Elf64_Shdr *dynsym = NULL, *dynstr = NULL;
+    unsigned int i, nsyms;
+    int ret = -1;
+
+    if (pread(fd, &eh, sizeof(eh), 0) != (ssize_t)sizeof(eh))
+        return -1;
+    if (memcmp(eh.e_ident, ELFMAG, SELFMAG) != 0)
+        return -1;
+    if (eh.e_ident[EI_CLASS] != ELFCLASS64 || eh.e_ident[EI_DATA] != ELFDATA2LSB)
+        return -1;
+    if (eh.e_shentsize != sizeof(Elf64_Shdr) || eh.e_shnum == 0 ||
+        eh.e_shnum > AC_ELF_MAX_SHNUM || eh.e_shstrndx >= eh.e_shnum)
+        return -1;
+
+    shdrs = malloc((size_t)eh.e_shnum * sizeof(Elf64_Shdr));
+    if (!shdrs)
+        return -1;
+    if (pread(fd, shdrs, (size_t)eh.e_shnum * sizeof(Elf64_Shdr),
+              (off_t)eh.e_shoff) != (ssize_t)((size_t)eh.e_shnum * sizeof(Elf64_Shdr)))
+        goto out;
+
+    {
+        Elf64_Shdr *shstr = &shdrs[eh.e_shstrndx];
+
+        if (shstr->sh_size == 0 || shstr->sh_size > AC_ELF_MAX_STRTAB)
+            goto out;
+        shstrtab = malloc(shstr->sh_size);
+        if (!shstrtab)
+            goto out;
+        if (pread(fd, shstrtab, shstr->sh_size, (off_t)shstr->sh_offset) !=
+            (ssize_t)shstr->sh_size)
+            goto out;
+
+        for (i = 0; i < eh.e_shnum; i++) {
+            const char *name;
+
+            if (shdrs[i].sh_name >= shstr->sh_size)
+                continue;
+            name = shstrtab + shdrs[i].sh_name;
+            if (shdrs[i].sh_type == SHT_DYNSYM && strcmp(name, ".dynsym") == 0)
+                dynsym = &shdrs[i];
+            else if (shdrs[i].sh_type == SHT_STRTAB && strcmp(name, ".dynstr") == 0)
+                dynstr = &shdrs[i];
+        }
+    }
+    if (!dynsym || !dynstr || dynsym->sh_entsize != sizeof(Elf64_Sym) ||
+        dynstr->sh_size == 0 || dynstr->sh_size > AC_ELF_MAX_STRTAB)
+        goto out;
+
+    nsyms = (unsigned int)(dynsym->sh_size / sizeof(Elf64_Sym));
+    if (nsyms == 0 || nsyms > AC_ELF_MAX_SYMS)
+        goto out;
+
+    syms = malloc(dynsym->sh_size);
+    dynstrtab = malloc(dynstr->sh_size);
+    if (!syms || !dynstrtab)
+        goto out;
+    if (pread(fd, syms, dynsym->sh_size, (off_t)dynsym->sh_offset) !=
+        (ssize_t)dynsym->sh_size)
+        goto out;
+    if (pread(fd, dynstrtab, dynstr->sh_size, (off_t)dynstr->sh_offset) !=
+        (ssize_t)dynstr->sh_size)
+        goto out;
+
+    for (i = 0; i < nsyms; i++) {
+        if (syms[i].st_name == 0 || syms[i].st_name >= dynstr->sh_size ||
+            syms[i].st_value == 0)
+            continue;
+        if (strcmp(dynstrtab + syms[i].st_name, symbol) == 0) {
+            *offset_out = syms[i].st_value;
+            ret = 0;
+            break;
+        }
+    }
+
+out:
+    free(shdrs);
+    free(shstrtab);
+    free(syms);
+    free(dynstrtab);
+    return ret;
+}
+
+/* Reads `symbol`'s first AC_HOOK_CHECK_BYTES from libpath (resolved via
+ * the target's own /proc/<pid>/root/ -- see below) and compares against
+ * the same offset in the target pid's live memory (lib_base = that
+ * mapping's lowest VMA start, i.e. its file-offset-0 load address).
+ * Returns 1 if hooked, 0 if clean, -1 if inconclusive (never treated as
+ * a positive detection -- an unreadable/unparseable library is a skip,
+ * not an alert). Silent by design -- callers decide how (or whether) to
+ * surface the result, since the CLI's one-shot `scan --check-hooks` and
+ * the daemon's silent-unless-hooked periodic check want very different
+ * presentation of the same underlying check. */
 static int compare_render_symbol(int pid, const char *libpath,
                                   unsigned long long lib_base,
                                   const char *symbol)
 {
-    void *handle;
-    void *sym;
-    Dl_info info;
-    uintptr_t offset;
     unsigned char expected[AC_HOOK_CHECK_BYTES];
     unsigned char actual[AC_HOOK_CHECK_BYTES];
     char memp[64];
     char nspath[AC_VMA_PATH + 32];
+    uint64_t offset;
     int fd;
     ssize_t r;
 
@@ -449,8 +557,8 @@ static int compare_render_symbol(int pid, const char *libpath,
      * mount namespace trusts that whatever exists at that path here is
      * the same file the target actually has mapped. For a process in a
      * container/sandbox with a private bind-mount at that path, it can
-     * be a different file entirely (or nothing), and blindly dlopen()ing
-     * it would compare against the wrong reference bytes. Going through
+     * be a different file entirely (or nothing), and reading it as the
+     * reference would compare against the wrong bytes. Going through
      * /proc/<pid>/root/ instead resolves the path exactly as the target
      * process itself sees it -- for the common case of a target sharing
      * the daemon's own namespace, /proc/<pid>/root is just "/", so this
@@ -462,17 +570,17 @@ static int compare_render_symbol(int pid, const char *libpath,
      * no setns() or any persistent namespace switch needed. */
     snprintf(nspath, sizeof(nspath), "/proc/%d/root%s", pid, libpath);
 
-    handle = dlopen(nspath, RTLD_NOW | RTLD_LOCAL);
-    if (!handle)
+    fd = open(nspath, O_RDONLY);
+    if (fd < 0)
         return -1;
-    sym = dlsym(handle, symbol);
-    if (!sym || !dladdr(sym, &info) || !info.dli_fbase) {
-        dlclose(handle);
+    if (elf_find_symbol_offset(fd, symbol, &offset) != 0) {
+        close(fd);
         return -1;
     }
-    offset = (uintptr_t)sym - (uintptr_t)info.dli_fbase;
-    memcpy(expected, sym, AC_HOOK_CHECK_BYTES);
-    dlclose(handle);
+    r = pread(fd, expected, AC_HOOK_CHECK_BYTES, (off_t)offset);
+    close(fd);
+    if (r != AC_HOOK_CHECK_BYTES)
+        return -1;
 
     snprintf(memp, sizeof(memp), "/proc/%d/mem", pid);
     fd = open(memp, O_RDONLY);
@@ -608,8 +716,8 @@ static void check_render_hooks_periodic(void)
 /* Overridable the same way AC_BASELINE_CHECK_INTERVAL is, so test.sh can
  * exercise this on a live kernel without a long real wait. Longer default
  * than the other periodic checks: each protected process with Vulkan
- * loaded costs a real dlopen()/dlsym()/dlclose() cycle, not just a cheap
- * ioctl. */
+ * loaded costs an ELF section-header/symbol-table parse of its library,
+ * not just a cheap ioctl. */
 static int ac_render_hook_check_interval(void)
 {
     const char *e = getenv("AC_RENDER_HOOK_CHECK_INTERVAL");
@@ -1056,21 +1164,24 @@ static void anon_baseline_check(int pid, const char *comm, unsigned int count)
 /* (scoped to pri <= LOG_CRIT) -- an operator sees it in the log, but   */
 /* it doesn't accumulate as a report against a client_id on its own.    */
 /* ------------------------------------------------------------------ */
-#define AC_ENVIRON_BUF (16 * 1024)
+#define AC_ENVIRON_BUF (256 * 1024)
 
 /* /proc/<pid>/environ is populated once at exec() and never updated by
  * the process's own later setenv() calls -- exactly what's wanted here:
  * this shows what the process launched with, not whatever it might
  * claim about itself at runtime. NUL-separated KEY=VALUE entries.
- * Returns 1 (found, fills out), 0 (not set), -1 (unreadable -- process
- * already gone by the time we look, most likely). */
+ * Returns 1 (found, fills out), 0 (not set), -1 (unreadable, or too
+ * large to read in full -- see below; errno is set in both cases so
+ * callers can report why). */
 static int ac_read_ld_preload(int pid, char *out, size_t outsz)
 {
     char path[64];
     char *buf;
+    size_t total = 0;
     ssize_t n;
     int fd;
     size_t pos;
+    int truncated = 0;
 
     snprintf(path, sizeof(path), "/proc/%d/environ", pid);
     fd = open(path, O_RDONLY);
@@ -1081,15 +1192,36 @@ static int ac_read_ld_preload(int pid, char *out, size_t outsz)
         close(fd);
         return -1;
     }
-    n = read(fd, buf, AC_ENVIRON_BUF - 1);
-    close(fd);
-    if (n <= 0) {
-        free(buf);
-        return n < 0 ? -1 : 0;
-    }
-    buf[n] = '\0';
 
-    for (pos = 0; pos < (size_t)n; ) {
+    /* Loop to true EOF rather than trusting a single read() to capture
+     * the whole file -- a real Steam/Proton/Flatpak launch environment
+     * can comfortably exceed one read's worth. If the buffer fills
+     * before EOF, this is inconclusive, not "not set": silently missing
+     * a real LD_PRELOAD that happens to sit past the cutoff would be
+     * exactly the false negative this check exists to avoid. */
+    while (total < AC_ENVIRON_BUF - 1) {
+        n = read(fd, buf + total, AC_ENVIRON_BUF - 1 - total);
+        if (n < 0) {
+            close(fd);
+            free(buf);
+            return -1;
+        }
+        if (n == 0)
+            break;
+        total += (size_t)n;
+    }
+    close(fd);
+    if (total == 0) {
+        free(buf);
+        return 0;
+    }
+    if (total >= AC_ENVIRON_BUF - 1) {
+        truncated = 1;
+        errno = EMSGSIZE;
+    }
+    buf[total] = '\0';
+
+    for (pos = 0; pos < total; ) {
         const char *entry = buf + pos;
         size_t entry_len = strlen(entry);
 
@@ -1103,7 +1235,7 @@ static int ac_read_ld_preload(int pid, char *out, size_t outsz)
         pos += entry_len + 1;
     }
     free(buf);
-    return 0;
+    return truncated ? -1 : 0;
 }
 
 /* Warn at most once per pid -- environ is static for the process's
@@ -1309,6 +1441,57 @@ static int check_baselines_periodic(void)
 /* ------------------------------------------------------------------ */
 #define AC_REPORT_TIMEOUT_SEC 3
 
+/* connect() with an actual bound on how long it can block. On Linux,
+ * SO_SNDTIMEO/SO_RCVTIMEO -- despite being set on this socket -- do NOT
+ * apply to connect() itself, only to subsequent send/recv-family calls;
+ * against a host that blackholes SYN packets rather than actively
+ * refusing, a plain blocking connect() can hang for the kernel's TCP
+ * SYN-retry timeout (~127s), not the few seconds this is supposed to be
+ * bounded by. Doing the connect non-blocking and waiting on poll()
+ * enforces the real bound. Returns 0 on success (fd left in its
+ * original blocking mode), -1 on failure/timeout (errno set). */
+static int ac_connect_timeout(int fd, const struct sockaddr *addr,
+                               socklen_t addrlen, int timeout_sec)
+{
+    int flags, err;
+    socklen_t errlen = sizeof(err);
+    struct pollfd pfd;
+    int rc;
+
+    flags = fcntl(fd, F_GETFL, 0);
+    if (flags < 0)
+        return -1;
+    if (fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0)
+        return -1;
+
+    rc = connect(fd, addr, addrlen);
+    if (rc == 0) {
+        fcntl(fd, F_SETFL, flags);   /* restore blocking mode for send/recv */
+        return 0;
+    }
+    if (errno != EINPROGRESS) {
+        fcntl(fd, F_SETFL, flags);
+        return -1;
+    }
+
+    pfd.fd = fd;
+    pfd.events = POLLOUT;
+    rc = poll(&pfd, 1, timeout_sec * 1000);
+    if (rc <= 0) {
+        fcntl(fd, F_SETFL, flags);
+        errno = (rc == 0) ? ETIMEDOUT : errno;
+        return -1;
+    }
+    if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &errlen) < 0 || err != 0) {
+        fcntl(fd, F_SETFL, flags);
+        errno = (err != 0) ? err : errno;
+        return -1;
+    }
+
+    fcntl(fd, F_SETFL, flags);
+    return 0;
+}
+
 /* Escapes a string for embedding in a JSON string literal. event_type and
  * detail both ultimately derive from formatted log messages that can
  * contain attacker-influenced bytes (a process's comm name, a file path
@@ -1409,8 +1592,9 @@ static void ac_report(const char *event_type, const char *detail)
         return;
     }
     /* A hung/unreachable report server must never stall the security
-     * monitoring loop -- short send/recv timeouts on every candidate
-     * address bound the total worst case. */
+     * monitoring loop -- ac_connect_timeout() bounds connect() itself
+     * (which SO_SNDTIMEO/SO_RCVTIMEO do not, on Linux), and those two
+     * still bound the subsequent send/recv on whichever address works. */
     for (rp = res; rp; rp = rp->ai_next) {
         fd = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
         if (fd < 0)
@@ -1419,7 +1603,8 @@ static void ac_report(const char *event_type, const char *detail)
         tv.tv_usec = 0;
         setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
         setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-        if (connect(fd, rp->ai_addr, rp->ai_addrlen) == 0)
+        if (ac_connect_timeout(fd, rp->ai_addr, rp->ai_addrlen,
+                                AC_REPORT_TIMEOUT_SEC) == 0)
             break;
         close(fd);
         fd = -1;
@@ -1441,10 +1626,34 @@ static void ac_report(const char *event_type, const char *detail)
              "%s",
              host, key, strlen(body), body);
 
-    if (write(fd, req, strlen(req)) < 0) {
-        fprintf(stderr, "ac_report: send failed: %s\n", strerror(errno));
-        close(fd);
-        return;
+    {
+        size_t reqlen = strlen(req);
+        size_t sent = 0;
+
+        /* A short write is normal TCP socket behavior (send-buffer
+         * pressure, or interrupted by the SO_SNDTIMEO deadline this
+         * socket has set) -- checking only for a negative return and
+         * assuming anything else means the whole request went out would
+         * let a partial, malformed HTTP request reach the server
+         * silently. */
+        while (sent < reqlen) {
+            ssize_t w = write(fd, req + sent, reqlen - sent);
+
+            if (w < 0) {
+                fprintf(stderr, "ac_report: send failed: %s\n", strerror(errno));
+                close(fd);
+                return;
+            }
+            if (w == 0)
+                break;
+            sent += (size_t)w;
+        }
+        if (sent != reqlen) {
+            fprintf(stderr, "ac_report: short write (%zu of %zu bytes)\n",
+                    sent, reqlen);
+            close(fd);
+            return;
+        }
     }
     n = read(fd, resp, sizeof(resp) - 1);
     if (n > 0) {

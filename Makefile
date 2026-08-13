@@ -47,7 +47,7 @@ module:
 	$(MAKE) -C $(KDIR) M=$(PWD) LLVM=$(LLVM) modules
 
 daemon: src/anticheat_daemon.c src/sha256.c src/sha256.h src/anticheat.h
-	$(CC) $(CFLAGS) -o anticheat src/anticheat_daemon.c src/sha256.c -ldl
+	$(CC) $(CFLAGS) -o anticheat src/anticheat_daemon.c src/sha256.c
 
 mock: test/libmock_anticheat.so
 

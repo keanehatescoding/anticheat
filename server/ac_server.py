@@ -57,6 +57,7 @@ class RateLimiter:
         self.window = window
         self._lock = threading.Lock()
         self._buckets = {}  # key -> (window_start, count)
+        self._last_prune = time.time()
 
     def allow(self, key):
         now = time.time()
@@ -66,7 +67,20 @@ class RateLimiter:
                 window_start, count = now, 0
             count += 1
             self._buckets[key] = (window_start, count)
+            if now - self._last_prune >= self.window:
+                self._prune(now)
             return count <= self.limit
+
+    def _prune(self, now):
+        """Drop buckets whose window has already elapsed. _buckets grows
+        one entry per distinct source IP ever seen with nothing to evict
+        them otherwise -- an unbounded leak in a long-running process.
+        Called opportunistically from allow() roughly once per window
+        rather than on every request, so this stays cheap."""
+        stale = [k for k, (ws, _) in self._buckets.items() if now - ws >= self.window]
+        for k in stale:
+            del self._buckets[k]
+        self._last_prune = now
 
 
 def now_ts():
@@ -221,13 +235,27 @@ def make_handler(store, report_key, admin_key, rate_limiter):
             return got is not None and hmac.compare_digest(got, expected)
 
         def _read_json_body(self):
-            length = int(self.headers.get("Content-Length", "0") or "0")
+            try:
+                length = int(self.headers.get("Content-Length", "0") or "0")
+            except ValueError:
+                # A client sending a garbage Content-Length (not
+                # necessarily malicious -- could just be buggy) shouldn't
+                # take the request handler down with an uncaught
+                # exception; treat it the same as any other bad request.
+                return None
             if length <= 0 or length > MAX_BODY_BYTES:
                 return None
             raw = self.rfile.read(length)
+            # event_type/detail ultimately derive from process comm names
+            # and kernel file paths -- raw bytes with no UTF-8 guarantee
+            # (see ac_json_escape() on the daemon side). Rejecting the
+            # whole report over a decode error would let a process simply
+            # name itself with invalid UTF-8 to suppress its own reports
+            # from ever reaching the ban pipeline; replacing the bad
+            # bytes keeps the report (and everything else in it) intact.
             try:
-                return json.loads(raw.decode("utf-8"))
-            except (ValueError, UnicodeDecodeError):
+                return json.loads(raw.decode("utf-8", errors="replace"))
+            except ValueError:
                 return None
 
         @staticmethod

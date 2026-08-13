@@ -332,7 +332,13 @@ fi
 kill "$DAEMON_PID" 2>/dev/null
 wait "$DAEMON_PID" 2>/dev/null
 
-MACHINE_ID=$(cat /etc/machine-id 2>/dev/null || hostname)
+# Mirrors ac_report_client_id()'s own fallback logic exactly: a
+# present-but-empty /etc/machine-id (common on freshly-provisioned
+# containers/CI images before systemd-firstboot runs) must also fall
+# back to the hostname, not just a missing file -- `cat ... || hostname`
+# alone doesn't trigger on empty-but-successful output.
+MACHINE_ID=$(cat /etc/machine-id 2>/dev/null)
+[ -n "$MACHINE_ID" ] || MACHINE_ID=$(hostname)
 REPORT_OUT=$(curl -s "http://127.0.0.1:$REPORT_PORT/reports/$MACHINE_ID" \
     -H "Authorization: Bearer $ADMIN_KEY")
 if printf '%s' "$REPORT_OUT" | grep -q "differs from saved baseline"; then
