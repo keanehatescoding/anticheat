@@ -227,6 +227,10 @@ if [ -n "$VK_PID" ]; then
         wait "$HOOK_PID" 2>/dev/null
     else
         bad "render_hook_test did not report READY (output: $HOOK_LINE)"
+        # HOOK_PID was never captured (empty/timed-out READY line), so it
+        # can't be killed by pid -- if the harness is just slow rather than
+        # dead, it would otherwise leak as an orphan for the rest of the run.
+        pkill -f "test/render_hook_test" 2>/dev/null
     fi
 
     say "render-hook check: catches a hook past the old fixed 32-byte window"
@@ -254,6 +258,7 @@ if [ -n "$VK_PID" ]; then
         wait "$OFFHOOK_PID" 2>/dev/null
     else
         bad "offset-40 render_hook_test did not report READY (output: $OFFHOOK_LINE)"
+        pkill -f "test/render_hook_test" 2>/dev/null
     fi
 else
     say "no process with libvulkan loaded found on this machine, skipping both render-hook checks"
@@ -315,6 +320,7 @@ if [ -n "$GL_PID" ]; then
         wait "$GLHOOK_PID" 2>/dev/null
     else
         bad "GL render_hook_test did not report READY (output: $GLHOOK_LINE)"
+        pkill -f "test/render_hook_test" 2>/dev/null
     fi
 else
     say "no process with libGL loaded found on this machine, skipping both GLX render-hook checks"
@@ -376,6 +382,7 @@ if [ -n "$EGL_PID" ]; then
         wait "$EGLHOOK_PID" 2>/dev/null
     else
         bad "EGL render_hook_test did not report READY (output: $EGLHOOK_LINE)"
+        pkill -f "test/render_hook_test" 2>/dev/null
     fi
 else
     say "no process with libEGL loaded found on this machine, skipping both EGL render-hook checks"
@@ -421,6 +428,7 @@ if [ -x ./test/mount_ns_probe ]; then
         wait "$NS_PID" 2>/dev/null
     else
         say "could not set up the test mount namespace (output: $NS_LINE), skipping"
+        pkill -f "test/mount_ns_probe" 2>/dev/null
     fi
     rm -rf "$NS_DIR"
 else
@@ -820,6 +828,10 @@ if [ -n "$AE1_PID" ] && [ -n "$AE2_PID" ]; then
         "/tmp/ac_jit_report_server_$$.log" /tmp/ac_jit_test_$$.log
 else
     bad "anon_exec_test harness(es) did not report READY (got: '$AE1_LINE' / '$AE2_LINE')"
+    # A pid that never got captured (empty/timed-out READY line) can't be
+    # killed by pid below -- catch it by binary path instead, or a slow
+    # (not dead) harness leaks as an orphan for the rest of the run.
+    pkill -f "test/anon_exec_test" 2>/dev/null
 fi
 kill "$AE1_PID" "$AE2_PID" 2>/dev/null
 wait "$AE1_PID" "$AE2_PID" 2>/dev/null
