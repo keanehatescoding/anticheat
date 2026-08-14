@@ -24,6 +24,7 @@ SERVER_PID=""
 RL_SERVER_PID=""
 TERM_SERVER_PID=""
 TP_SERVER_PID=""
+NOTP_SERVER_PID=""
 # cleanup is invoked via trap below; shellcheck cannot always see that
 # shellcheck disable=SC2317,SC2329
 cleanup() {
@@ -34,16 +35,24 @@ cleanup() {
     [ -n "$RL_SERVER_PID" ] && kill "$RL_SERVER_PID" 2>/dev/null
     [ -n "$TERM_SERVER_PID" ] && kill "$TERM_SERVER_PID" 2>/dev/null
     [ -n "$TP_SERVER_PID" ] && kill "$TP_SERVER_PID" 2>/dev/null
+    [ -n "$NOTP_SERVER_PID" ] && kill "$NOTP_SERVER_PID" 2>/dev/null
     wait "$SERVER_PID" 2>/dev/null
     wait "$RL_SERVER_PID" 2>/dev/null
     wait "$TERM_SERVER_PID" 2>/dev/null
     wait "$TP_SERVER_PID" 2>/dev/null
+    wait "$NOTP_SERVER_PID" 2>/dev/null
     rm -f "$DB" "$DB-wal" "$DB-shm"
 }
 trap cleanup EXIT
 
+# Explicit --rate-limit here (well above the CLI's own default of 60) so
+# the sequential functional tests plus the concurrent-write test below
+# (~40+ requests total against this one instance/IP) never risk tripping
+# the limiter themselves -- rate-limiting behavior itself is exercised
+# separately, against dedicated low-limit instances further down.
 AC_SERVER_REPORT_KEY="$REPORT_KEY" AC_SERVER_ADMIN_KEY="$ADMIN_KEY" \
     python3 ./ac_server.py --host 127.0.0.1 --port "$PORT" --db "$DB" \
+    --rate-limit 500 --rate-window 60 \
     >/tmp/ac_server_test_$$.log 2>&1 &
 SERVER_PID=$!
 
@@ -271,30 +280,38 @@ fi
 # testing philosophy. Store._connect() opens a fresh connection per call
 # rather than pooling one, so chmod-ing the db files read-only after
 # startup reliably forces the next write to hit a real permission error
-# (no already-open writable fd survives from before the chmod).
-chmod 444 "$DB" "$DB-wal" "$DB-shm" 2>/dev/null
-CODE=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$BASE/report" \
-    -H "Authorization: Bearer $REPORT_KEY" -H 'Content-Type: application/json' \
-    -d "{\"client_id\":\"$CID\",\"event_type\":\"X\",\"detail\":\"forced-failure\",\"ts\":1}")
-chmod 644 "$DB" "$DB-wal" "$DB-shm" 2>/dev/null
-if [ "$CODE" = "500" ]; then
-    pass "induced DB write failure -> clean 500, not a hang/broken connection"
+# (no already-open writable fd survives from before the chmod). Skipped
+# under root: chmod'ing a file read-only has no effect on root's own
+# ability to write to it (a fundamental Unix property, not a bug in this
+# test), so this specific check can't force a real failure that way when
+# the whole script happens to be run as root.
+if [ "$(id -u)" -eq 0 ]; then
+    echo "  (skipping induced-DB-failure test: chmod is a no-op for root)"
 else
-    fail "induced DB write failure should be 500 (got $CODE)"
-fi
-# Confirm the server is still healthy after surviving that failure --
-# not just that one request got a 500, but that nothing else broke.
-CODE=$(curl -s -o /dev/null -w '%{http_code}' "$BASE/banned/$CID" \
-    -H "Authorization: Bearer $ADMIN_KEY")
-if [ "$CODE" = "200" ]; then
-    pass "server still healthy after the induced DB failure"
-else
-    fail "server should still answer normally after a recovered DB failure (got $CODE)"
-fi
-if grep -q "Traceback" "/tmp/ac_server_test_$$.log"; then
-    pass "internal error was logged with a traceback for debugging"
-else
-    fail "expected a traceback logged for the induced DB failure"
+    chmod 444 "$DB" "$DB-wal" "$DB-shm" 2>/dev/null
+    CODE=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$BASE/report" \
+        -H "Authorization: Bearer $REPORT_KEY" -H 'Content-Type: application/json' \
+        -d "{\"client_id\":\"$CID\",\"event_type\":\"X\",\"detail\":\"forced-failure\",\"ts\":1}")
+    chmod 644 "$DB" "$DB-wal" "$DB-shm" 2>/dev/null
+    if [ "$CODE" = "500" ]; then
+        pass "induced DB write failure -> clean 500, not a hang/broken connection"
+    else
+        fail "induced DB write failure should be 500 (got $CODE)"
+    fi
+    # Confirm the server is still healthy after surviving that failure --
+    # not just that one request got a 500, but that nothing else broke.
+    CODE=$(curl -s -o /dev/null -w '%{http_code}' "$BASE/banned/$CID" \
+        -H "Authorization: Bearer $ADMIN_KEY")
+    if [ "$CODE" = "200" ]; then
+        pass "server still healthy after the induced DB failure"
+    else
+        fail "server should still answer normally after a recovered DB failure (got $CODE)"
+    fi
+    if grep -q "Traceback" "/tmp/ac_server_test_$$.log"; then
+        pass "internal error was logged with a traceback for debugging"
+    else
+        fail "expected a traceback logged for the induced DB failure"
+    fi
 fi
 
 rm -f "/tmp/ac_server_test_$$.log"
@@ -400,19 +417,26 @@ done
 
 if [ "$TERM_READY" -eq 1 ]; then
     kill -TERM "$TERM_SERVER_PID"
-    TERM_EXITED=0
-    for _ in $(seq 1 20); do
-        if ! kill -0 "$TERM_SERVER_PID" 2>/dev/null; then
-            TERM_EXITED=1
-            break
-        fi
-        sleep 0.1
-    done
+    # `wait` is deterministic (blocks until the process is actually
+    # reaped) and yields its real exit status -- unlike polling
+    # `kill -0`, which only tests PID existence and would report success
+    # even for a zombie the shell hasn't reaped yet. A backgrounded
+    # killer provides the timeout: if serve_forever()'s ~0.5s poll
+    # interval somehow didn't notice the signal, this bounds the wait
+    # instead of hanging the whole test suite.
+    ( sleep 2; kill -9 "$TERM_SERVER_PID" 2>/dev/null ) &
+    TERM_KILLER_PID=$!
+    if wait "$TERM_SERVER_PID" 2>/dev/null; then
+        TERM_EXITED=1
+    else
+        TERM_EXITED=0
+    fi
+    kill "$TERM_KILLER_PID" 2>/dev/null
+    wait "$TERM_KILLER_PID" 2>/dev/null
     if [ "$TERM_EXITED" -eq 1 ]; then
         pass "SIGTERM shuts the server down cleanly, no -9 needed"
     else
-        fail "server did not exit within 2s of SIGTERM"
-        kill -9 "$TERM_SERVER_PID" 2>/dev/null
+        fail "server did not exit cleanly within 2s of SIGTERM"
     fi
     if grep -q "Traceback" "/tmp/ac_server_term_test_$$.log"; then
         fail "SIGTERM shutdown logged an unexpected traceback"
@@ -510,8 +534,13 @@ rm -f "$TP_DB" "$TP_DB-wal" "$TP_DB-shm" "/tmp/ac_server_tp_test_$$.log"
 # which would let a client evade rate limiting entirely.
 TPRL_PORT=18807
 TPRL_DB="/tmp/ac_server_tprl_test_$$.db"
-TPRL_LIMIT=3
-TPRL_WINDOW=2
+# Wider than the main rate-limit block's 3/2s: this test issues 4 real
+# HTTP round-trips (3 to consume the budget, 1 to assert it's exhausted)
+# sequentially, not just checked against a mock clock -- a slower/loaded
+# CI runner could plausibly let the window roll over mid-test with a
+# tighter margin, silently turning a real trip into a false pass.
+TPRL_LIMIT=5
+TPRL_WINDOW=5
 AC_SERVER_REPORT_KEY="$REPORT_KEY" AC_SERVER_ADMIN_KEY="$ADMIN_KEY" \
     python3 ./ac_server.py --host 127.0.0.1 --port "$TPRL_PORT" --db "$TPRL_DB" \
     --trust-proxy --rate-limit "$TPRL_LIMIT" --rate-window "$TPRL_WINDOW" \

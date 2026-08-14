@@ -245,13 +245,25 @@ def make_handler(store, report_key, admin_key, rate_limiter, trust_proxy=False):
         def _client_ip(self):
             if not trust_proxy:
                 return self.client_address[0]
-            xff = self.headers.get("X-Forwarded-For")
-            if not xff:
+            # self.headers.get() returns only the FIRST occurrence of a
+            # repeated header -- a client could send its own
+            # X-Forwarded-For line ahead of the one the proxy adds and
+            # win outright, since .get() would return the attacker's
+            # value and never even see the proxy's. get_all() returns
+            # every occurrence; RFC 9110 SS5.3 treats repeated instances
+            # of the same field as equivalent to one field joined by
+            # commas in order, so joining them before re-splitting
+            # handles both a proxy that appends to an existing header
+            # (the common case, e.g. nginx's proxy_add_x_forwarded_for)
+            # and one that adds a second, separate header line.
+            xff_all = self.headers.get_all("X-Forwarded-For")
+            if not xff_all:
                 # Flag on but header absent: fall back to the raw peer --
                 # if a direct connection somehow bypasses the proxy, the
                 # raw peer IS the real source, so this is the safe/more
                 # correct direction, not less.
                 return self.client_address[0]
+            xff = ",".join(xff_all)
             # The LAST entry is the one the trusted proxy itself appended
             # (its own view of its immediate peer); everything before
             # that is attacker-controlled request-header content. Taking
