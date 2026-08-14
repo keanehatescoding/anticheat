@@ -20,6 +20,10 @@
  * Usage: ./render_hook_test [library symbol [offset]] &
  *   -- prints "READY pid=<pid>", then sleeps.
  */
+#define _GNU_SOURCE  /* MAP_ANONYMOUS under a strict -std= build; this
+                      * project's own Makefile doesn't set one (the GNU
+                      * dialect is already the default), but don't rely
+                      * on that staying true forever. */
 #include <dlfcn.h>
 #include <stdint.h>
 #include <stdio.h>

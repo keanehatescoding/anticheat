@@ -15,6 +15,10 @@
  * Usage: ./anon_exec_test &
  *   -- prints "READY pid=<pid>", then waits for SIGUSR1.
  */
+#define _GNU_SOURCE  /* struct sigaction / MAP_ANONYMOUS under a strict
+                      * -std= build; this project's own Makefile doesn't
+                      * set one (the GNU dialect is already the default),
+                      * but don't rely on that staying true forever. */
 #include <signal.h>
 #include <stdio.h>
 #include <string.h>
