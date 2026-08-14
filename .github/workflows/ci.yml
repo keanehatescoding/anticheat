@@ -55,6 +55,15 @@ jobs:
         run: |
           curl -fsSL https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.12.tar.xz | tar -xJ
           make -C linux-6.12 ARCH=x86_64 defconfig
+          # defconfig alone leaves module signing off, so modules_prepare
+          # below never builds scripts/sign-file -- the DKMS build +
+          # signing smoke test step further down needs that tool; without
+          # it DKMS silently skips signing and that step's own
+          # `grep -q sig_id` assertion fails.
+          ./linux-6.12/scripts/config --file linux-6.12/.config \
+            --enable MODULE_SIG \
+            --set-val MODULE_SIG_HASH sha256
+          make -C linux-6.12 ARCH=x86_64 olddefconfig
           make -C linux-6.12 ARCH=x86_64 scripts
           make -C linux-6.12 ARCH=x86_64 modules_prepare
 
