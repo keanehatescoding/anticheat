@@ -397,16 +397,19 @@ static void baseline_path_for(const char *path, char out[PATH_MAX])
 }
 
 /* ------------------------------------------------------------------ */
-/* render-hook detection (Vulkan present-call inline-hook check)       */
+/* render-hook detection (frame-present-call inline-hook check)        */
 /*                                                                      */
 /* ESP/wallhack/aimbot overlays typically work by hooking the graphics */
-/* API's frame-present call. On Linux this is a good, narrow target:   */
-/* native Vulkan games AND Proton D3D9/10/11/12 titles all route       */
-/* through libvulkan.so's vkQueuePresentKHR, since DXVK/VKD3D-Proton   */
-/* translate D3D down to Vulkan -- one check point, broad coverage.    */
+/* API's frame-present call. On Linux this check targets two:          */
+/* vkQueuePresentKHR in libvulkan.so covers native Vulkan games AND    */
+/* Proton D3D9/10/11/12 titles, since DXVK/VKD3D-Proton translate D3D  */
+/* down to Vulkan; glXSwapBuffers in libGL.so covers native OpenGL     */
+/* games and older Proton titles still on wined3d's GL backend instead */
+/* of DXVK. A process only using one API cleanly reports the other as  */
+/* "not loaded", not an error -- see check_render_hooks() below.       */
 /*                                                                      */
 /* Detection needs no signature database: we read the exact same       */
-/* on-disk file the target has mapped, parse out vkQueuePresentKHR's   */
+/* on-disk file the target has mapped, parse out the target symbol's   */
 /* file-relative offset and its first bytes there, and compare against */
 /* the same bytes read from the target's memory at the equivalent      */
 /* runtime address. A classic inline/trampoline hook (redirecting the  */
@@ -597,17 +600,19 @@ static int compare_render_symbol(int pid, const char *libpath,
     return memcmp(expected, actual, AC_HOOK_CHECK_BYTES) != 0 ? 1 : 0;
 }
 
-/* Single streaming pass over the target's VMAs to find libvulkan.so*'s
- * load base, without collecting the (potentially thousands-of-entries)
- * VMA list into memory -- same "don't build a big buffer you don't
- * need" discipline as the rest of this file. Returns 1 if found (and
- * fills libpath/lib_base), 0 if not loaded in this process, -1 on ioctl
- * failure. */
-static int find_vulkan_lib(int pid, char *libpath, size_t libpath_sz,
-                            unsigned long long *lib_base)
+/* Single streaming pass over the target's VMAs to find the load base of
+ * whichever mapped library's basename starts with `prefix` (e.g.
+ * "libvulkan.so", "libGL.so"), without collecting the (potentially
+ * thousands-of-entries) VMA list into memory -- same "don't build a big
+ * buffer you don't need" discipline as the rest of this file. Returns 1
+ * if found (and fills libpath/lib_base), 0 if not loaded in this
+ * process, -1 on ioctl failure. */
+static int find_lib_by_basename(int pid, const char *prefix, char *libpath,
+                                 size_t libpath_sz, unsigned long long *lib_base)
 {
     struct ac_scan_begin b;
     unsigned int v;
+    size_t prefix_len = strlen(prefix);
     int found = 0;
 
     libpath[0] = '\0';
@@ -633,7 +638,7 @@ static int find_vulkan_lib(int pid, char *libpath, size_t libpath_sz,
             continue;
         base = strrchr(vi->path, '/');
         base = base ? base + 1 : vi->path;
-        if (strncmp(base, "libvulkan.so", 12) != 0)
+        if (strncmp(base, prefix, prefix_len) != 0)
             continue;
         if (!found || vi->start < *lib_base) {
             *lib_base = vi->start;
@@ -645,48 +650,81 @@ static int find_vulkan_lib(int pid, char *libpath, size_t libpath_sz,
     return found;
 }
 
-/* render_hook_status(): the single source of truth both the one-shot CLI
- * check and the periodic daemon check build on. Returns -2 (Vulkan not
- * loaded in this process -- not an error, most processes), -1
- * (inconclusive), 0 (clean), or 1 (hooked); fills libpath on any
+/* render_hook_status_for(): the single source of truth both the one-shot
+ * CLI check and the periodic daemon check build on, for a given
+ * (library basename prefix, exported symbol) pair -- e.g.
+ * ("libvulkan.so", "vkQueuePresentKHR") or ("libGL.so",
+ * "glXSwapBuffers"). Returns -2 (that library not loaded in this
+ * process -- not an error, most processes only use one rendering API),
+ * -1 (inconclusive), 0 (clean), or 1 (hooked); fills libpath on any
  * non-(-2) result. */
-static int render_hook_status(int pid, char *libpath, size_t libpath_sz)
+static int render_hook_status_for(int pid, const char *lib_prefix,
+                                   const char *symbol, char *libpath,
+                                   size_t libpath_sz)
 {
     unsigned long long lib_base;
-    int found = find_vulkan_lib(pid, libpath, libpath_sz, &lib_base);
+    int found = find_lib_by_basename(pid, lib_prefix, libpath, libpath_sz, &lib_base);
 
     if (found < 0)
         return -1;
     if (found == 0)
         return -2;
-    return compare_render_symbol(pid, libpath, lib_base, "vkQueuePresentKHR");
+    return compare_render_symbol(pid, libpath, lib_base, symbol);
 }
 
-/* CLI-facing wrapper for `scan --check-hooks`: same detection as the
- * periodic check below, but always prints a human-readable result. */
-static int check_vulkan_present_hook(int pid)
+/* Shared presentation for one (api, symbol) check's result -- used by
+ * both check_render_hooks() below (each call prints its own line) so
+ * the Vulkan and GLX/OpenGL checks don't duplicate this switch twice.
+ * Returns 1 if hooked (so the caller can track "any hook found"), 0
+ * otherwise (clean, skipped, or inconclusive -- none of those are a
+ * positive detection). */
+static int print_render_hook_result(int pid, const char *api_label,
+                                     const char *symbol, const char *libpath,
+                                     int status)
 {
-    char libpath[AC_VMA_PATH];
-    int status = render_hook_status(pid, libpath, sizeof(libpath));
-
     switch (status) {
     case -2:
-        printf("  render-hook check: libvulkan not loaded in this process, skipping\n");
+        printf("  render-hook check (%s): not loaded in this process, skipping\n",
+               api_label);
         return 0;
     case -1:
-        printf("  render-hook check: could not verify vkQueuePresentKHR in %s, skipping\n",
-               libpath);
-        return -1;
+        printf("  render-hook check (%s): could not verify %s in %s, skipping\n",
+               api_label, symbol, libpath);
+        return 0;
     case 1:
-        printf("  [!] render hook: vkQueuePresentKHR in %s (target pid %d) differs\n"
+        printf("  [!] render hook (%s): %s in %s (target pid %d) differs\n"
                "      from a freshly-loaded reference copy of the same file --\n"
                "      possible ESP/overlay/render hijack\n",
-               libpath, pid);
+               api_label, symbol, libpath, pid);
         return 1;
     default:
-        printf("  render-hook check: vkQueuePresentKHR clean (%s)\n", libpath);
+        printf("  render-hook check (%s): %s clean (%s)\n", api_label, symbol, libpath);
         return 0;
     }
+}
+
+/* CLI-facing wrapper for `scan --check-hooks`: checks both rendering
+ * APIs a Linux game is realistically using -- native Vulkan (and Proton
+ * D3D9/10/11/12 via DXVK/VKD3D, which translate down to Vulkan too) via
+ * vkQueuePresentKHR, and native OpenGL or older Proton titles still on
+ * wined3d's GL backend via glXSwapBuffers. A process only using one API
+ * cleanly reports "not loaded" for the other, not an error. */
+static int check_render_hooks(int pid)
+{
+    char libpath[AC_VMA_PATH];
+    int status, hooked = 0;
+
+    status = render_hook_status_for(pid, "libvulkan.so", "vkQueuePresentKHR",
+                                     libpath, sizeof(libpath));
+    if (print_render_hook_result(pid, "Vulkan", "vkQueuePresentKHR", libpath, status))
+        hooked = 1;
+
+    status = render_hook_status_for(pid, "libGL.so", "glXSwapBuffers",
+                                     libpath, sizeof(libpath));
+    if (print_render_hook_result(pid, "GLX/OpenGL", "glXSwapBuffers", libpath, status))
+        hooked = 1;
+
+    return hooked;
 }
 
 /* Periodic daemon-loop counterpart: silent unless a hook is actually
@@ -706,11 +744,21 @@ static void check_render_hooks_periodic(void)
         return;
     for (i = 0; i < pl.count; i++) {
         char libpath[AC_VMA_PATH];
-        int status = render_hook_status(pl.items[i].pid, libpath, sizeof(libpath));
+        int status;
 
+        status = render_hook_status_for(pl.items[i].pid, "libvulkan.so",
+                                         "vkQueuePresentKHR", libpath, sizeof(libpath));
         if (status == 1)
             logmsg(LOG_CRIT, "pid %d (%s): render hook detected in %s "
                    "(vkQueuePresentKHR differs from a freshly-loaded reference "
+                   "copy -- possible ESP/overlay/render hijack)",
+                   pl.items[i].pid, pl.items[i].comm, libpath);
+
+        status = render_hook_status_for(pl.items[i].pid, "libGL.so",
+                                         "glXSwapBuffers", libpath, sizeof(libpath));
+        if (status == 1)
+            logmsg(LOG_CRIT, "pid %d (%s): render hook detected in %s "
+                   "(glXSwapBuffers differs from a freshly-loaded reference "
                    "copy -- possible ESP/overlay/render hijack)",
                    pl.items[i].pid, pl.items[i].comm, libpath);
     }
@@ -719,8 +767,8 @@ static void check_render_hooks_periodic(void)
 /* Overridable the same way AC_BASELINE_CHECK_INTERVAL is, so test.sh can
  * exercise this on a live kernel without a long real wait. Longer default
  * than the other periodic checks: each protected process with Vulkan
- * loaded costs an ELF section-header/symbol-table parse of its library,
- * not just a cheap ioctl. */
+ * and/or GL loaded costs an ELF section-header/symbol-table parse of
+ * each library it has, not just a cheap ioctl. */
 static int ac_render_hook_check_interval(void)
 {
     const char *e = getenv("AC_RENDER_HOOK_CHECK_INTERVAL");
@@ -888,7 +936,7 @@ static int cmd_scan(int argc, char **argv)
     ioctl(dev_fd, AC_IOCTL_SCAN_END, NULL);
 
     if (do_hooks)
-        check_vulkan_present_hook(pid);
+        check_render_hooks(pid);
 
     if (do_preload)
         check_ld_preload(pid);

@@ -1,18 +1,22 @@
 /*
- * render_hook_test.c -- self-hooks vkQueuePresentKHR in its own address
- * space to prove `anticheat scan --check-hooks` actually fires on a real
- * tampering, not just on the "library not loaded" skip path or the
- * trivial case of matching an already-clean process (test.sh separately
- * verifies that true-negative case against a real running process).
+ * render_hook_test.c -- self-hooks an exported symbol (default:
+ * vkQueuePresentKHR in libvulkan.so.1; pass a different library/symbol
+ * pair as argv[1]/argv[2] to exercise the GLX/OpenGL path instead) in
+ * its own address space, to prove `anticheat scan --check-hooks`
+ * actually fires on a real tampering, not just on the "library not
+ * loaded" skip path or the trivial case of matching an already-clean
+ * process (test.sh separately verifies that true-negative case against
+ * a real running process).
  *
- * Loads libvulkan.so.1, makes vkQueuePresentKHR's page writable, and
+ * Loads the library, makes the target symbol's page writable, and
  * overwrites its first bytes -- the same inline-hook pattern an
- * ESP/overlay cheat would install to intercept the present call. The
- * function is never actually invoked (the patched bytes are inert NOPs),
- * so this is safe to run; it exists purely to be scanned from another
- * process while it sleeps.
+ * ESP/overlay cheat would install to intercept the call. The function
+ * is never actually invoked (the patched bytes are inert NOPs), so this
+ * is safe to run; it exists purely to be scanned from another process
+ * while it sleeps.
  *
- * Usage: ./render_hook_test &   -- prints "READY pid=<pid>", then sleeps.
+ * Usage: ./render_hook_test [library symbol] &
+ *   -- prints "READY pid=<pid>", then sleeps.
  */
 #include <dlfcn.h>
 #include <stdint.h>
@@ -21,20 +25,22 @@
 #include <unistd.h>
 #include <sys/mman.h>
 
-int main(void)
+int main(int argc, char **argv)
 {
     void *h, *sym, *page;
     long pagesize;
     unsigned char patch[8] = { 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90 };
+    const char *lib = argc > 1 ? argv[1] : "libvulkan.so.1";
+    const char *symbol = argc > 2 ? argv[2] : "vkQueuePresentKHR";
 
-    h = dlopen("libvulkan.so.1", RTLD_NOW);
+    h = dlopen(lib, RTLD_NOW);
     if (!h) {
-        fprintf(stderr, "render_hook_test: dlopen libvulkan.so.1: %s\n", dlerror());
+        fprintf(stderr, "render_hook_test: dlopen %s: %s\n", lib, dlerror());
         return 2;
     }
-    sym = dlsym(h, "vkQueuePresentKHR");
+    sym = dlsym(h, symbol);
     if (!sym) {
-        fprintf(stderr, "render_hook_test: dlsym vkQueuePresentKHR: %s\n", dlerror());
+        fprintf(stderr, "render_hook_test: dlsym %s: %s\n", symbol, dlerror());
         return 2;
     }
 

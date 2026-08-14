@@ -96,7 +96,7 @@ anticheat list                       list protected processes
 anticheat scan --pid N               VMA scan, RWX + anon-exec detection
 anticheat scan --pid N --hash --save    create memory-integrity baselines
 anticheat scan --pid N --hash --check   verify runtime memory vs baseline
-anticheat scan --pid N --check-hooks    Vulkan present-call hook check
+anticheat scan --pid N --check-hooks    Vulkan + GLX/OpenGL present-call hook check
 anticheat scan --pid N --check-preload  LD_PRELOAD check (heuristic, not a verdict)
 anticheat scan --pid N --check-vklayers Vulkan-layer env var check (heuristic, not a verdict)
 anticheat scan --pid N --check-implicit-layers  implicit Vulkan-layer manifest check (heuristic)
@@ -149,26 +149,30 @@ file-backed executable mapping; override the directory with the
 runtime content differs from the baseline — a strong signal of runtime code
 patching.
 
-### Render-hook detection (Vulkan present-call)
+### Render-hook detection (Vulkan + GLX/OpenGL present-call)
 
 `scan --pid N --check-hooks` checks for the classic ESP/overlay/aimbot
 technique of inline-hooking the graphics API's frame-present call. It
-targets **Vulkan only** (`vkQueuePresentKHR` in `libvulkan.so`), which on
-Linux is a deliberately narrow but broadly effective choice: native Vulkan
-games hit it directly, and Proton D3D9/10/11/12 titles hit it too, since
-DXVK/VKD3D-Proton translate D3D calls down to Vulkan — one check point, wide
-practical coverage, no separate GLX/OpenGL path needed for the common case.
+checks **both** rendering APIs a Linux game is realistically using:
+`vkQueuePresentKHR` in `libvulkan.so` (native Vulkan games, and Proton
+D3D9/10/11/12 titles too, since DXVK/VKD3D-Proton translate D3D calls down
+to Vulkan), and `glXSwapBuffers` in `libGL.so` (native OpenGL games, and
+older Proton titles still on wined3d's GL backend instead of DXVK). A
+process only using one API cleanly reports the other as "not loaded", not
+an error — most processes only ever have one of the two mapped.
 
 This needs no signature database and can't go stale across distros or
-Vulkan loader versions: the daemon reads the *exact same on-disk file*
+driver/loader versions: the daemon reads the *exact same on-disk file*
 the target process has mapped, parses its ELF section headers directly to
-find `vkQueuePresentKHR`'s file-relative offset and first 32 bytes there,
+find the target symbol's file-relative offset and first 32 bytes there,
 and compares them against the same offset read from the target's memory
 (`/proc/<pid>/mem`, the same mechanism `--hash` already uses — see
-`compare_render_symbol()`/`elf_find_symbol_offset()` in the daemon). A
-classic inline/trampoline hook — patching the function's leading bytes to
-jump into injected code — changes those bytes; an unmodified process
-matches byte-for-byte. The reference copy is whatever the target itself is
+`compare_render_symbol()`/`elf_find_symbol_offset()` in the daemon, and
+`render_hook_status_for()`/`find_lib_by_basename()` for the
+library/symbol-parameterized lookup both APIs share). A classic
+inline/trampoline hook — patching the function's leading bytes to jump
+into injected code — changes those bytes; an unmodified process matches
+byte-for-byte. The reference copy is whatever the target itself is
 currently using, read fresh at check time, so there's nothing to maintain
 as Mesa/NVIDIA driver or Vulkan loader versions change.
 
@@ -184,10 +188,12 @@ mount-namespace path does not run when the check reads it.
 
 Known blind spot, not a bug: this catches in-place byte patching of the
 exported function, not a cheat that intercepts the call via `LD_PRELOAD`
-symbol interposition or a malicious Vulkan layer — those never touch
-`vkQueuePresentKHR`'s actual bytes. `--check-preload` and
-`--check-vklayers` below partially cover both cases, as heuristic signals,
-not verdicts — see the environment-variable-only caveat on the Vulkan-layer
+symbol interposition or a malicious Vulkan layer — those never touch the
+target symbol's actual bytes (GLX has no layer system, so this is a
+Vulkan-specific gap; LD_PRELOAD interposition applies to both APIs
+equally). `--check-preload` and `--check-vklayers` below partially cover
+both cases, as heuristic signals, not verdicts — see the
+environment-variable-only caveat on the Vulkan-layer
 one specifically.
 
 **Mount-namespace aware.** The kernel-side VMA scan reports a path
@@ -212,10 +218,12 @@ against a real loaded module, not just in theory.
 detection also runs automatically every 30 s against every protected
 process from the `start` monitoring loop (see above) — a hook installed
 mid-session gets caught without anyone running a manual scan.
-`test/render_hook_test.c` proves the detection itself works (self-hooks
-`vkQueuePresentKHR` in a throwaway process), and `test.sh` exercises both
-the one-shot `scan --check-hooks` path and the periodic monitoring-loop
-path against it, against a real loaded module.
+`test/render_hook_test.c` proves the detection itself works (self-hooks a
+given library/symbol pair — `vkQueuePresentKHR`/`libvulkan.so.1` by
+default, or `glXSwapBuffers`/`libGL.so.1` via `argv[1]`/`argv[2]` — in a
+throwaway process), and `test.sh` exercises both APIs separately: the
+one-shot `scan --check-hooks` path and the periodic monitoring-loop path,
+against a real loaded module, for each of Vulkan and GLX/OpenGL.
 
 ### LD_PRELOAD and Vulkan-layer detection
 
@@ -617,9 +625,9 @@ test/mock_anticheat.c    LD_PRELOAD mock of /dev/anticheat (no-root tests)
 test/mock_test.sh        mock test suite: `make test-mock`
 test/priv_drop_test.c    live test: proves ac_ioctl() rechecks CAP_SYS_ADMIN
                          (root, real module -- run via test.sh)
-test/render_hook_test.c  live test: self-hooks vkQueuePresentKHR, proves
-                         `scan --check-hooks` detects it (root, real module
-                         -- run via test.sh)
+test/render_hook_test.c  live test: self-hooks vkQueuePresentKHR or (given
+                         args) glXSwapBuffers, proves `scan --check-hooks`
+                         detects it (root, real module -- run via test.sh)
 test/mount_ns_probe.c    live test: proves render-hook detection resolves a
                          target's real mount-namespace view of a path, not
                          the host's (root, real module -- run via test.sh)

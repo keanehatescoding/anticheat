@@ -119,7 +119,7 @@ for m in /proc/[0-9]*/maps; do
 done
 if [ -n "$VK_PID" ]; then
     HOOK_OUT=$(./anticheat scan --pid "$VK_PID" --check-hooks 2>&1)
-    if printf '%s' "$HOOK_OUT" | grep -q "render-hook check:.*clean"; then
+    if printf '%s' "$HOOK_OUT" | grep -q "vkQueuePresentKHR clean"; then
         ok "vkQueuePresentKHR matched reference copy (pid $VK_PID)"
     elif printf '%s' "$HOOK_OUT" | grep -q "render hook"; then
         bad "unexpected hook flagged on an untampered process (pid $VK_PID)"
@@ -180,6 +180,67 @@ if [ -n "$VK_PID" ]; then
     fi
 else
     say "no process with libvulkan loaded found on this machine, skipping both render-hook checks"
+fi
+
+say "render-hook check (GLX/OpenGL) against a real, untampered process"
+GL_PID=""
+for m in /proc/[0-9]*/maps; do
+    if grep -q "libGL\.so" "$m" 2>/dev/null; then
+        GL_PID=$(basename "$(dirname "$m")")
+        break
+    fi
+done
+if [ -n "$GL_PID" ]; then
+    GLHOOK_OUT=$(./anticheat scan --pid "$GL_PID" --check-hooks 2>&1)
+    if printf '%s' "$GLHOOK_OUT" | grep -q "glXSwapBuffers clean"; then
+        ok "glXSwapBuffers matched reference copy (pid $GL_PID)"
+    elif printf '%s' "$GLHOOK_OUT" | grep -q "render hook"; then
+        bad "unexpected hook flagged on an untampered process (pid $GL_PID)"
+    else
+        bad "render-hook check produced neither clean nor hook result for GLX"
+    fi
+
+    say "render-hook check (GLX/OpenGL): does it actually catch a real hook?"
+    make render-hook-test >/dev/null 2>&1
+    GLFIFO=$(mktemp -u)
+    mkfifo "$GLFIFO"
+    setsid ./test/render_hook_test libGL.so.1 glXSwapBuffers >"$GLFIFO" 2>&1 &
+    GLHOOK_LINE=$(head -n1 "$GLFIFO")
+    rm -f "$GLFIFO"
+    GLHOOK_PID=$(printf '%s' "$GLHOOK_LINE" | sed -n 's/^READY pid=\([0-9]*\)$/\1/p')
+    if [ -n "$GLHOOK_PID" ]; then
+        GLDETECT_OUT=$(./anticheat scan --pid "$GLHOOK_PID" --check-hooks 2>&1)
+        if printf '%s' "$GLDETECT_OUT" | grep -q "render hook"; then
+            ok "self-hooked glXSwapBuffers correctly flagged (pid $GLHOOK_PID)"
+        else
+            bad "self-hooked glXSwapBuffers was NOT flagged (pid $GLHOOK_PID)"
+        fi
+
+        say "render-hook check (GLX/OpenGL): periodic monitoring loop, not just one-shot scan"
+        if ./anticheat protect --pid "$GLHOOK_PID" >/dev/null 2>&1; then
+            AC_RENDER_HOOK_CHECK_INTERVAL=2 ./anticheat start --foreground \
+                >/tmp/ac_gl_render_hook_test.log 2>&1 &
+            GLRENDER_DAEMON_PID=$!
+            sleep 4
+            if grep -q "render hook detected" /tmp/ac_gl_render_hook_test.log; then
+                ok "periodic monitoring loop detected the self-hooked GLX process"
+            else
+                bad "periodic monitoring loop did not detect the self-hooked GLX process"
+            fi
+            kill "$GLRENDER_DAEMON_PID" 2>/dev/null
+            wait "$GLRENDER_DAEMON_PID" 2>/dev/null
+            rm -f /tmp/ac_gl_render_hook_test.log
+        else
+            bad "could not protect GL render_hook_test pid for the periodic check"
+        fi
+
+        kill "$GLHOOK_PID" 2>/dev/null
+        wait "$GLHOOK_PID" 2>/dev/null
+    else
+        bad "GL render_hook_test did not report READY (output: $GLHOOK_LINE)"
+    fi
+else
+    say "no process with libGL loaded found on this machine, skipping both GLX render-hook checks"
 fi
 
 say "render-hook check: resolves a target-namespaced path correctly (not the host's)"
