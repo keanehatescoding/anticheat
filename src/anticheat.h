@@ -94,6 +94,11 @@ struct ac_status {
 
 struct ac_proc_id {
     int  pid;
+    int  ref_pid;             /* <=0: resolve `pid` in the caller's own
+                                * (host) pid namespace -- default,
+                                * current behavior. >0: resolve `pid`
+                                * within the pid namespace that host-pid
+                                * ref_pid lives in (see --ns-of). */
     char comm[AC_MAX_COMM];   /* informational, may be empty on input */
 };
 

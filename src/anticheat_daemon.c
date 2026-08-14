@@ -6,6 +6,12 @@
  * Commands:
  *   status                 module status
  *   protect --pid N        protect a running process
+ *   protect --pid N --ns-of REFPID   protect a pid as seen inside the
+ *                           pid namespace that host-pid REFPID lives in
+ *                           (e.g. a sandboxed/containerized game whose
+ *                           in-namespace pid is known but its host pid
+ *                           isn't -- --comm below is usually simpler
+ *                           when a comm name is available)
  *   protect --comm NAME    protect all processes whose comm == NAME
  *   unprotect --pid N      remove protection
  *   list                   list protected processes
@@ -217,7 +223,7 @@ static int pid_of_comm(const char *comm, int *pids, int max)
 static int cmd_protect(int argc, char **argv)
 {
     struct ac_proc_id id;
-    int pid = -1, i, n;
+    int pid = -1, ref_pid = -1, i, n;
     const char *comm = NULL;
 
     for (i = 0; i < argc; i++) {
@@ -225,9 +231,15 @@ static int cmd_protect(int argc, char **argv)
             pid = atoi(argv[++i]);
         else if (strcmp(argv[i], "--comm") == 0 && i + 1 < argc)
             comm = argv[++i];
+        else if (strcmp(argv[i], "--ns-of") == 0 && i + 1 < argc)
+            ref_pid = atoi(argv[++i]);
     }
     if (pid < 0 && !comm)
-        die("usage: anticheat protect --pid N | --comm NAME");
+        die("usage: anticheat protect --pid N [--ns-of REFPID] | --comm NAME");
+    if (ref_pid >= 0 && comm)
+        die("usage: --ns-of cannot be combined with --comm");
+    if (ref_pid >= 0 && pid < 0)
+        die("usage: --ns-of requires --pid");
 
     ac_open();
     if (comm) {
@@ -247,6 +259,7 @@ static int cmd_protect(int argc, char **argv)
     } else {
         memset(&id, 0, sizeof(id));
         id.pid = pid;
+        id.ref_pid = ref_pid;
         if (ioctl_ok(AC_IOCTL_ADD_PROC, &id) < 0)
             return 1;
         printf("protected pid %d (%s)\n", pid, id.comm);
@@ -2556,7 +2569,7 @@ static void usage(const char *prog)
     printf("usage: %s <command> [options]\n"
            "\n"
            "  status                     kernel module status\n"
-           "  protect --pid N | --comm NAME\n"
+           "  protect --pid N [--ns-of REFPID] | --comm NAME\n"
            "  unprotect --pid N\n"
            "  list                       list protected processes\n"
            "  scan --pid N [--hash [--save|--check]] [--check-hooks] "

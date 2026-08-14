@@ -57,7 +57,13 @@ else
 fi
 
 say "protecting a victim process (a bash that will fork a child)"
-bash -c 'sleep 300 & echo $! > /tmp/ac_child.pid; wait' &
+# 1800s, not 300s: this process must stay alive across the entire rest of
+# the suite (its last use is the "unprotect + cleanup" section near the
+# end). A fixed 300s cap already came within one added test block of
+# expiring mid-run as the suite grew -- give real headroom instead of
+# re-tuning this number every time a new section is added. The exit trap
+# (line 19) kills it regardless of how far the script gets.
+bash -c 'sleep 1800 & echo $! > /tmp/ac_child.pid; wait' &
 VICTIM_PID=$!
 if ./anticheat protect --pid "$VICTIM_PID" >/dev/null; then
     ok "protected pid $VICTIM_PID"
@@ -91,6 +97,50 @@ sleep 0.5
 EVENTS=$(./anticheat events)
 if printf '%s' "$EVENTS" | grep -q "PTRACE-DENIED"; then ok "PTRACE-DENIED event logged"; else bad "no ptrace event"; fi
 if printf '%s' "$EVENTS" | grep -q "FORK"; then ok "FORK event logged"; else bad "no fork event"; fi
+
+say "pid-namespace resolution: protect --pid inside another namespace via --ns-of"
+# --comm already works across pid namespaces for free (it walks /proc from
+# the daemon's own, ancestor-namespace view, which already shows
+# host-visible pids for descendant-namespace tasks). --ns-of is for the
+# narrower case where a caller only has a raw in-namespace pid number
+# (e.g. 1, the new namespace's own "init") and a separate host-resolvable
+# reference pid known to live in that same namespace.
+if unshare --pid --mount-proc --fork -- true >/dev/null 2>&1; then
+    unshare --pid --mount-proc --fork -- sleep 300 &
+    NSPID_UNSHARE=$!
+    sleep 0.3
+    # unshare --fork's direct child becomes pid 1 *inside* the new
+    # namespace while still being an ordinary host process with a normal
+    # host-visible pid; $! above is the outer unshare(1) wrapper itself
+    # (still in the host namespace), so pgrep -P is needed to find the
+    # real namespaced victim -- same wrapper-vs-real-child problem as the
+    # sudo -u case solved earlier in this file.
+    NSPID_HOST=$(pgrep -P "$NSPID_UNSHARE" -f "sleep 300")
+    if [ -n "$NSPID_HOST" ]; then
+        if ./anticheat protect --pid 1 --ns-of "$NSPID_HOST" >/dev/null 2>&1; then
+            LIST_OUT=$(./anticheat list 2>&1)
+            # t->pid is always the root/init-namespace number, so a
+            # correct resolution shows the HOST pid here, not the literal
+            # "1" that was given on the command line -- that's the proof
+            # --ns-of actually resolved relative to the sandboxed
+            # namespace instead of the daemon's own.
+            if printf '%s' "$LIST_OUT" | grep -q "pid $NSPID_HOST "; then
+                ok "pid 1 inside the new namespace resolved to host pid $NSPID_HOST"
+            else
+                bad "protect --ns-of did not register the expected host pid (got: $LIST_OUT)"
+            fi
+            ./anticheat unprotect --pid "$NSPID_HOST" >/dev/null 2>&1
+        else
+            bad "protect --pid 1 --ns-of $NSPID_HOST failed"
+        fi
+    else
+        bad "could not capture the host pid of the namespaced victim"
+    fi
+    kill "$NSPID_UNSHARE" "$NSPID_HOST" 2>/dev/null
+    wait "$NSPID_UNSHARE" 2>/dev/null
+else
+    say "unshare --pid/--mount-proc not available/permitted here, skipping"
+fi
 
 say "memory scan (RWX + anon-exec detection)"
 SCAN_OUT=$(./anticheat scan --pid "$VICTIM_PID")

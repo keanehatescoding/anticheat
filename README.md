@@ -90,6 +90,8 @@ userspace daemon/CLI that talks to it over a small ioctl interface
 ```
 anticheat status                     module status
 anticheat protect --pid N            protect a process (children inherit)
+anticheat protect --pid N --ns-of REFPID   protect a pid namespace-relative
+                                      to host-pid REFPID (see below)
 anticheat protect --comm NAME        protect by comm name
 anticheat unprotect --pid N
 anticheat list                       list protected processes
@@ -619,9 +621,19 @@ To run the same userspace checks locally: `make ci`.
   entries. A cheat that invokes the `ptrace` functionality through other
   kernel paths (e.g., `process_vm_readv` on an attached victim) is out of
   scope for v1.
-- Protected pids are matched via the caller's pid namespace. Games running in
-  the init namespace work as expected; containerized targets need matching
-  namespace awareness (future work).
+- Protected pids are matched via the caller's pid namespace by default:
+  `protect --pid N` resolves `N` as seen by the daemon itself (normally the
+  host/init namespace). This is already correct, with no extra flags, for
+  the common case of a sandboxed/containerized game (e.g. Steam's
+  pressure-vessel/bwrap) — `/proc` viewed from the daemon's ancestor
+  namespace already shows host-visible pids for descendant-namespace
+  tasks, and `protect --comm NAME` matches on that view directly. The
+  remaining gap is narrower: when a caller only has a *raw in-namespace*
+  pid number (no usable comm), `protect --pid N --ns-of REFPID` resolves
+  `N` within the pid namespace that host-pid `REFPID` lives in, given any
+  other host-resolvable pid known to be in that same namespace as a
+  reference point. Prefer `--comm` when a comm name is available; reach
+  for `--ns-of` only when it isn't.
 - kprobes require `CONFIG_KPROBES` / `CONFIG_KALLSYMS_ALL` (both enabled on
   this kernel). If a probe cannot be registered the module still loads and
   logs the limitation.

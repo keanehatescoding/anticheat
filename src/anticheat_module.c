@@ -36,6 +36,7 @@
 #include <linux/sched/signal.h>
 #include <linux/sched/task.h>
 #include <linux/pid.h>
+#include <linux/pid_namespace.h>
 #include <linux/mm.h>
 #include <linux/mmap_lock.h>
 #include <linux/kprobes.h>
@@ -429,6 +430,46 @@ static struct task_struct *ac_find_task(pid_t pid)
     return task;
 }
 
+/* Resolve `nr` as a pid number within the pid namespace that host-pid
+ * ref_pid lives in, rather than the caller's own namespace. Lets a
+ * privileged caller target a process by its in-namespace pid (e.g. a
+ * sandboxed/containerized game) when it can supply some other
+ * host-resolvable pid known to be in that same namespace (ref_pid).
+ *
+ * find_pid_ns() has no internal locking (unlike find_get_pid(), which
+ * wraps rcu_read_lock() itself), and task_active_pid_ns(ref_task) is
+ * only safe to read while ref_task's reference is held -- ref_task could
+ * otherwise exit concurrently on another CPU. So the namespace lookup and
+ * find_pid_ns() call must both happen strictly before put_task_struct().
+ * The resulting struct pid is pinned with get_pid() before the RCU
+ * read-side critical section ends, mirroring how find_get_pid() itself
+ * pins under rcu_read_lock(). */
+static struct task_struct *ac_find_task_in_ns_of(pid_t nr, pid_t ref_pid)
+{
+    struct task_struct *ref_task, *target;
+    struct pid_namespace *ns;
+    struct pid *pidp;
+
+    ref_task = ac_find_task(ref_pid);
+    if (!ref_task)
+        return NULL;
+
+    rcu_read_lock();
+    ns = task_active_pid_ns(ref_task);
+    pidp = ns ? find_pid_ns(nr, ns) : NULL;
+    if (pidp)
+        get_pid(pidp);
+    rcu_read_unlock();
+
+    put_task_struct(ref_task);
+    if (!pidp)
+        return NULL;
+
+    target = get_pid_task(pidp, PIDTYPE_PID);
+    put_pid(pidp);
+    return target;
+}
+
 static int ac_add_prot_task(struct task_struct *t)
 {
     unsigned long flags;
@@ -458,9 +499,10 @@ out:
     return ret;
 }
 
-static int ac_add_prot_pid(pid_t pid, char *comm_out)
+static int ac_add_prot_pid(pid_t pid, pid_t ref_pid, char *comm_out)
 {
-    struct task_struct *t = ac_find_task(pid);
+    struct task_struct *t = ref_pid > 0 ? ac_find_task_in_ns_of(pid, ref_pid)
+                                         : ac_find_task(pid);
     int ret;
 
     if (!t)
@@ -1008,7 +1050,7 @@ static long ac_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 
         if (copy_from_user(&a, uarg, sizeof(a)))
             return -EFAULT;
-        ret = ac_add_prot_pid(a.pid, a.comm);
+        ret = ac_add_prot_pid(a.pid, a.ref_pid, a.comm);
         if (ret == 0 && ac_verbose)
             pr_info("protected pid %d (%s)\n", a.pid, a.comm);
         return ret;
