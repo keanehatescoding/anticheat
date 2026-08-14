@@ -96,7 +96,7 @@ anticheat list                       list protected processes
 anticheat scan --pid N               VMA scan, RWX + anon-exec detection
 anticheat scan --pid N --hash --save    create memory-integrity baselines
 anticheat scan --pid N --hash --check   verify runtime memory vs baseline
-anticheat scan --pid N --check-hooks    Vulkan + GLX/OpenGL present-call hook check
+anticheat scan --pid N --check-hooks    Vulkan + GLX/OpenGL + EGL present-call hook check
 anticheat scan --pid N --check-preload  LD_PRELOAD check (heuristic, not a verdict)
 anticheat scan --pid N --check-vklayers Vulkan-layer env var check (heuristic, not a verdict)
 anticheat scan --pid N --check-implicit-layers  implicit Vulkan-layer manifest check (heuristic)
@@ -149,17 +149,20 @@ file-backed executable mapping; override the directory with the
 runtime content differs from the baseline — a strong signal of runtime code
 patching.
 
-### Render-hook detection (Vulkan + GLX/OpenGL present-call)
+### Render-hook detection (Vulkan + GLX/OpenGL + EGL present-call)
 
 `scan --pid N --check-hooks` checks for the classic ESP/overlay/aimbot
 technique of inline-hooking the graphics API's frame-present call. It
-checks **both** rendering APIs a Linux game is realistically using:
+checks **every** rendering API a Linux game is realistically using:
 `vkQueuePresentKHR` in `libvulkan.so` (native Vulkan games, and Proton
 D3D9/10/11/12 titles too, since DXVK/VKD3D-Proton translate D3D calls down
-to Vulkan), and `glXSwapBuffers` in `libGL.so` (native OpenGL games, and
-older Proton titles still on wined3d's GL backend instead of DXVK). A
-process only using one API cleanly reports the other as "not loaded", not
-an error — most processes only ever have one of the two mapped.
+to Vulkan), `glXSwapBuffers` in `libGL.so` (native OpenGL games, and older
+Proton titles still on wined3d's GL backend instead of DXVK), and
+`eglSwapBuffers` in `libEGL.so` (anything using EGL instead of GLX to
+create its GL/GLES context — increasingly common under Wayland, and for
+GLES-based engines). A process only using one or two of the three cleanly
+reports the rest as "not loaded", not an error — most processes only ever
+have one mapped.
 
 This needs no signature database and can't go stale across distros or
 driver/loader versions: the daemon reads the *exact same on-disk file*
@@ -169,7 +172,7 @@ and compares them against the same offset read from the target's memory
 (`/proc/<pid>/mem`, the same mechanism `--hash` already uses — see
 `compare_render_symbol()`/`elf_find_symbol_offset()` in the daemon, and
 `render_hook_status_for()`/`find_lib_by_basename()` for the
-library/symbol-parameterized lookup both APIs share). A classic
+library/symbol-parameterized lookup all three APIs share). A classic
 inline/trampoline hook — patching the function's leading bytes to jump
 into injected code — changes those bytes; an unmodified process matches
 byte-for-byte. The reference copy is whatever the target itself is
@@ -189,12 +192,18 @@ mount-namespace path does not run when the check reads it.
 Known blind spot, not a bug: this catches in-place byte patching of the
 exported function, not a cheat that intercepts the call via `LD_PRELOAD`
 symbol interposition or a malicious Vulkan layer — those never touch the
-target symbol's actual bytes (GLX has no layer system, so this is a
-Vulkan-specific gap; LD_PRELOAD interposition applies to both APIs
-equally). `--check-preload` and `--check-vklayers` below partially cover
-both cases, as heuristic signals, not verdicts — see the
-environment-variable-only caveat on the Vulkan-layer
-one specifically.
+target symbol's actual bytes (neither GLX nor EGL has a layer system, so
+that specific gap is Vulkan-only; LD_PRELOAD interposition applies to all
+three APIs equally). `--check-preload` and `--check-vklayers` below
+partially cover both cases, as heuristic signals, not verdicts — see the
+environment-variable-only caveat on the Vulkan-layer one specifically.
+Also known and not yet covered: this only compares each symbol's first 32
+bytes, so a "detour"-style hook patching further into the function body
+rather than at its entry point wouldn't be caught, and hooks placed inside
+DXVK/VKD3D's own translation-layer code (rather than in `libvulkan.so`
+itself) or in the Vulkan loader's internal dispatch table (rather than the
+exported symbol) are both invisible to a check that only verifies the
+exported symbol's own bytes.
 
 **Mount-namespace aware.** The kernel-side VMA scan reports a path
 string for the target's library; opening that string directly from the
@@ -220,10 +229,11 @@ process from the `start` monitoring loop (see above) — a hook installed
 mid-session gets caught without anyone running a manual scan.
 `test/render_hook_test.c` proves the detection itself works (self-hooks a
 given library/symbol pair — `vkQueuePresentKHR`/`libvulkan.so.1` by
-default, or `glXSwapBuffers`/`libGL.so.1` via `argv[1]`/`argv[2]` — in a
-throwaway process), and `test.sh` exercises both APIs separately: the
+default, or any other pair via `argv[1]`/`argv[2]`, e.g.
+`glXSwapBuffers`/`libGL.so.1` or `eglSwapBuffers`/`libEGL.so.1` — in a
+throwaway process), and `test.sh` exercises all three APIs separately: the
 one-shot `scan --check-hooks` path and the periodic monitoring-loop path,
-against a real loaded module, for each of Vulkan and GLX/OpenGL.
+against a real loaded module, for each of Vulkan, GLX/OpenGL, and EGL.
 
 ### LD_PRELOAD and Vulkan-layer detection
 

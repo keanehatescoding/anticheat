@@ -243,6 +243,67 @@ else
     say "no process with libGL loaded found on this machine, skipping both GLX render-hook checks"
 fi
 
+say "render-hook check (EGL) against a real, untampered process"
+EGL_PID=""
+for m in /proc/[0-9]*/maps; do
+    if grep -q "libEGL\.so" "$m" 2>/dev/null; then
+        EGL_PID=$(basename "$(dirname "$m")")
+        break
+    fi
+done
+if [ -n "$EGL_PID" ]; then
+    EGLHOOK_OUT=$(./anticheat scan --pid "$EGL_PID" --check-hooks 2>&1)
+    if printf '%s' "$EGLHOOK_OUT" | grep -q "eglSwapBuffers clean"; then
+        ok "eglSwapBuffers matched reference copy (pid $EGL_PID)"
+    elif printf '%s' "$EGLHOOK_OUT" | grep -q "render hook"; then
+        bad "unexpected hook flagged on an untampered process (pid $EGL_PID)"
+    else
+        bad "render-hook check produced neither clean nor hook result for EGL"
+    fi
+
+    say "render-hook check (EGL): does it actually catch a real hook?"
+    make render-hook-test >/dev/null 2>&1
+    EGLFIFO=$(mktemp -u)
+    mkfifo "$EGLFIFO"
+    setsid ./test/render_hook_test libEGL.so.1 eglSwapBuffers >"$EGLFIFO" 2>&1 &
+    EGLHOOK_LINE=$(head -n1 "$EGLFIFO")
+    rm -f "$EGLFIFO"
+    EGLHOOK_PID=$(printf '%s' "$EGLHOOK_LINE" | sed -n 's/^READY pid=\([0-9]*\)$/\1/p')
+    if [ -n "$EGLHOOK_PID" ]; then
+        EGLDETECT_OUT=$(./anticheat scan --pid "$EGLHOOK_PID" --check-hooks 2>&1)
+        if printf '%s' "$EGLDETECT_OUT" | grep -q "render hook"; then
+            ok "self-hooked eglSwapBuffers correctly flagged (pid $EGLHOOK_PID)"
+        else
+            bad "self-hooked eglSwapBuffers was NOT flagged (pid $EGLHOOK_PID)"
+        fi
+
+        say "render-hook check (EGL): periodic monitoring loop, not just one-shot scan"
+        if ./anticheat protect --pid "$EGLHOOK_PID" >/dev/null 2>&1; then
+            AC_RENDER_HOOK_CHECK_INTERVAL=2 ./anticheat start --foreground \
+                >/tmp/ac_egl_render_hook_test.log 2>&1 &
+            EGLRENDER_DAEMON_PID=$!
+            sleep 4
+            if grep -q "render hook detected" /tmp/ac_egl_render_hook_test.log; then
+                ok "periodic monitoring loop detected the self-hooked EGL process"
+            else
+                bad "periodic monitoring loop did not detect the self-hooked EGL process"
+            fi
+            kill "$EGLRENDER_DAEMON_PID" 2>/dev/null
+            wait "$EGLRENDER_DAEMON_PID" 2>/dev/null
+            rm -f /tmp/ac_egl_render_hook_test.log
+        else
+            bad "could not protect EGL render_hook_test pid for the periodic check"
+        fi
+
+        kill "$EGLHOOK_PID" 2>/dev/null
+        wait "$EGLHOOK_PID" 2>/dev/null
+    else
+        bad "EGL render_hook_test did not report READY (output: $EGLHOOK_LINE)"
+    fi
+else
+    say "no process with libEGL loaded found on this machine, skipping both EGL render-hook checks"
+fi
+
 say "render-hook check: resolves a target-namespaced path correctly (not the host's)"
 # Proves the /proc/<pid>/root/ fix in compare_render_symbol(): create a
 # private mount namespace where a *different* (empty) file sits at the

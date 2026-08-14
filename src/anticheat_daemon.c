@@ -400,13 +400,16 @@ static void baseline_path_for(const char *path, char out[PATH_MAX])
 /* render-hook detection (frame-present-call inline-hook check)        */
 /*                                                                      */
 /* ESP/wallhack/aimbot overlays typically work by hooking the graphics */
-/* API's frame-present call. On Linux this check targets two:          */
+/* API's frame-present call. On Linux this check targets three:        */
 /* vkQueuePresentKHR in libvulkan.so covers native Vulkan games AND    */
 /* Proton D3D9/10/11/12 titles, since DXVK/VKD3D-Proton translate D3D  */
 /* down to Vulkan; glXSwapBuffers in libGL.so covers native OpenGL     */
 /* games and older Proton titles still on wined3d's GL backend instead */
-/* of DXVK. A process only using one API cleanly reports the other as  */
-/* "not loaded", not an error -- see check_render_hooks() below.       */
+/* of DXVK; eglSwapBuffers in libEGL.so covers anything using EGL      */
+/* instead of GLX to create its GL/GLES context, increasingly common   */
+/* under Wayland and for GLES-based engines. A process only using one  */
+/* or two of the three cleanly reports the rest as "not loaded", not   */
+/* an error -- see check_render_hooks() below.                         */
 /*                                                                      */
 /* Detection needs no signature database: we read the exact same       */
 /* on-disk file the target has mapped, parse out the target symbol's   */
@@ -703,12 +706,15 @@ static int print_render_hook_result(int pid, const char *api_label,
     }
 }
 
-/* CLI-facing wrapper for `scan --check-hooks`: checks both rendering
- * APIs a Linux game is realistically using -- native Vulkan (and Proton
+/* CLI-facing wrapper for `scan --check-hooks`: checks every rendering
+ * API a Linux game is realistically using -- native Vulkan (and Proton
  * D3D9/10/11/12 via DXVK/VKD3D, which translate down to Vulkan too) via
- * vkQueuePresentKHR, and native OpenGL or older Proton titles still on
- * wined3d's GL backend via glXSwapBuffers. A process only using one API
- * cleanly reports "not loaded" for the other, not an error. */
+ * vkQueuePresentKHR; native OpenGL or older Proton titles still on
+ * wined3d's GL backend via glXSwapBuffers; and anything using EGL
+ * instead of GLX to create its GL/GLES context (increasingly common
+ * under Wayland, and for GLES-based engines) via eglSwapBuffers. A
+ * process only using one or two of the three cleanly reports the rest
+ * as "not loaded", not an error. */
 static int check_render_hooks(int pid)
 {
     char libpath[AC_VMA_PATH];
@@ -722,6 +728,11 @@ static int check_render_hooks(int pid)
     status = render_hook_status_for(pid, "libGL.so", "glXSwapBuffers",
                                      libpath, sizeof(libpath));
     if (print_render_hook_result(pid, "GLX/OpenGL", "glXSwapBuffers", libpath, status))
+        hooked = 1;
+
+    status = render_hook_status_for(pid, "libEGL.so", "eglSwapBuffers",
+                                     libpath, sizeof(libpath));
+    if (print_render_hook_result(pid, "EGL", "eglSwapBuffers", libpath, status))
         hooked = 1;
 
     return hooked;
@@ -759,6 +770,14 @@ static void check_render_hooks_periodic(void)
         if (status == 1)
             logmsg(LOG_CRIT, "pid %d (%s): render hook detected in %s "
                    "(glXSwapBuffers differs from a freshly-loaded reference "
+                   "copy -- possible ESP/overlay/render hijack)",
+                   pl.items[i].pid, pl.items[i].comm, libpath);
+
+        status = render_hook_status_for(pl.items[i].pid, "libEGL.so",
+                                         "eglSwapBuffers", libpath, sizeof(libpath));
+        if (status == 1)
+            logmsg(LOG_CRIT, "pid %d (%s): render hook detected in %s "
+                   "(eglSwapBuffers differs from a freshly-loaded reference "
                    "copy -- possible ESP/overlay/render hijack)",
                    pl.items[i].pid, pl.items[i].comm, libpath);
     }
