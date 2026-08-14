@@ -178,6 +178,33 @@ if [ -n "$VK_PID" ]; then
     else
         bad "render_hook_test did not report READY (output: $HOOK_LINE)"
     fi
+
+    say "render-hook check: catches a hook past the old fixed 32-byte window"
+    # The check used to compare a fixed first-32-bytes window; it now
+    # compares the symbol's whole ELF-declared size instead (see
+    # compare_render_symbol()). vkQueuePresentKHR is 81 bytes on real
+    # systems -- patch offset 40 is comfortably past the old window and
+    # comfortably inside the real function, so this specifically proves
+    # the new capability, not just that hooks at byte 0 are still caught
+    # (the test above already covers that).
+    OFFFIFO=$(mktemp -u)
+    mkfifo "$OFFFIFO"
+    setsid ./test/render_hook_test libvulkan.so.1 vkQueuePresentKHR 40 >"$OFFFIFO" 2>&1 &
+    OFFHOOK_LINE=$(head -n1 "$OFFFIFO")
+    rm -f "$OFFFIFO"
+    OFFHOOK_PID=$(printf '%s' "$OFFHOOK_LINE" | sed -n 's/^READY pid=\([0-9]*\)$/\1/p')
+    if [ -n "$OFFHOOK_PID" ]; then
+        OFFDETECT_OUT=$(./anticheat scan --pid "$OFFHOOK_PID" --check-hooks 2>&1)
+        if printf '%s' "$OFFDETECT_OUT" | grep -q "render hook"; then
+            ok "hook at offset 40 (past the old 32-byte window) correctly flagged (pid $OFFHOOK_PID)"
+        else
+            bad "hook at offset 40 was NOT flagged -- past-window detection regressed (pid $OFFHOOK_PID)"
+        fi
+        kill "$OFFHOOK_PID" 2>/dev/null
+        wait "$OFFHOOK_PID" 2>/dev/null
+    else
+        bad "offset-40 render_hook_test did not report READY (output: $OFFHOOK_LINE)"
+    fi
 else
     say "no process with libvulkan loaded found on this machine, skipping both render-hook checks"
 fi

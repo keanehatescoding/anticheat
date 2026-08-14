@@ -167,17 +167,34 @@ have one mapped.
 This needs no signature database and can't go stale across distros or
 driver/loader versions: the daemon reads the *exact same on-disk file*
 the target process has mapped, parses its ELF section headers directly to
-find the target symbol's file-relative offset and first 32 bytes there,
-and compares them against the same offset read from the target's memory
-(`/proc/<pid>/mem`, the same mechanism `--hash` already uses — see
+find the target symbol's file-relative offset, and compares its bytes
+against the same offset read from the target's memory (`/proc/<pid>/mem`,
+the same mechanism `--hash` already uses — see
 `compare_render_symbol()`/`elf_find_symbol_offset()` in the daemon, and
 `render_hook_status_for()`/`find_lib_by_basename()` for the
 library/symbol-parameterized lookup all three APIs share). A classic
-inline/trampoline hook — patching the function's leading bytes to jump
-into injected code — changes those bytes; an unmodified process matches
+inline/trampoline hook — patching the function's bytes to jump into
+injected code — changes those bytes; an unmodified process matches
 byte-for-byte. The reference copy is whatever the target itself is
 currently using, read fresh at check time, so there's nothing to maintain
 as Mesa/NVIDIA driver or Vulkan loader versions change.
+
+**Compares the symbol's whole declared length, not a fixed guess.** The
+ELF symbol table carries each function's actual size (`st_size`); the
+check reads and compares exactly that many bytes (clamped to
+`[AC_HOOK_CHECK_MIN_BYTES, AC_HOOK_CHECK_MAX_BYTES]` = `[8, 512]`, or a
+32-byte default if a symbol's size is unavailable) instead of a fixed
+window that could either miss a hook placed further into a longer
+function, or — as a real earlier version of this check did — read a few
+bytes *past* a short one into whatever follows it. Verified against real
+data before relying on it: `glXSwapBuffers` is 17 bytes on a real system
+(smaller than the old fixed 32-byte window), `vkQueuePresentKHR` is 81.
+`test.sh` proves the actual capability this unlocks, not just that
+byte-0 hooks still work: it self-hooks `vkQueuePresentKHR` at offset 40
+— past where the old fixed window would have looked — and confirms the
+scan still flags it. `st_size` comes from the same
+attacker-influenceable file as everything else this check reads, so it's
+bounded, never trusted as authoritative on its own.
 
 Deliberately never `dlopen()`s that file, and this isn't a style
 preference: the path is resolved through the *target's own* mount
@@ -197,13 +214,13 @@ that specific gap is Vulkan-only; LD_PRELOAD interposition applies to all
 three APIs equally). `--check-preload` and `--check-vklayers` below
 partially cover both cases, as heuristic signals, not verdicts — see the
 environment-variable-only caveat on the Vulkan-layer one specifically.
-Also known and not yet covered: this only compares each symbol's first 32
-bytes, so a "detour"-style hook patching further into the function body
-rather than at its entry point wouldn't be caught, and hooks placed inside
-DXVK/VKD3D's own translation-layer code (rather than in `libvulkan.so`
-itself) or in the Vulkan loader's internal dispatch table (rather than the
-exported symbol) are both invisible to a check that only verifies the
-exported symbol's own bytes.
+Also known and not yet covered: hooks placed inside DXVK/VKD3D's own
+translation-layer code (rather than in `libvulkan.so` itself) or in the
+Vulkan loader's internal dispatch table (rather than the exported symbol)
+are both invisible to a check that only verifies the exported symbol's own
+bytes. A symbol with no size info in the ELF symbol table (stripped or
+unusual builds) falls back to the old 32-byte default window, so a
+sufficiently deep detour into an unsized symbol could still be missed.
 
 **Mount-namespace aware.** The kernel-side VMA scan reports a path
 string for the target's library; opening that string directly from the

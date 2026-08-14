@@ -435,7 +435,15 @@ static void baseline_path_for(const char *path, char out[PATH_MAX])
 /* (VK_LAYER_*) rather than patching vkQueuePresentKHR's bytes in      */
 /* place is not caught by this check -- see README.                    */
 /* ------------------------------------------------------------------ */
-#define AC_HOOK_CHECK_BYTES 32
+/* Fallback comparison length when the ELF symbol table doesn't carry a
+ * usable st_size (0, or absurdly large -- that field is read from the
+ * same attacker-influenceable file as everything else here, see the
+ * mount-namespace block comment above, so it's bounded, never trusted
+ * outright). AC_HOOK_CHECK_MIN_BYTES/MAX_BYTES clamp whatever st_size
+ * *does* say to a sane range either way. */
+#define AC_HOOK_CHECK_DEFAULT_BYTES 32
+#define AC_HOOK_CHECK_MIN_BYTES 8
+#define AC_HOOK_CHECK_MAX_BYTES 512
 #define AC_ELF_MAX_SHNUM    2048           /* generous; real .so files have <100 */
 #define AC_ELF_MAX_STRTAB   (4 * 1024 * 1024)
 #define AC_ELF_MAX_SYMS     500000
@@ -444,12 +452,15 @@ static void baseline_path_for(const char *path, char out[PATH_MAX])
  * only plain pread() -- never dlopen(), see the block comment above.
  * Returns 0 on success (fills *offset_out with the symbol's
  * file-relative offset, which for the ET_DYN shared libraries this
- * checks is the same value as its runtime offset from the load base),
- * -1 on any parse/read/bounds failure. Every failure is inconclusive,
- * never a positive detection -- a malformed or unexpected-shape ELF
- * file is a skip, same as an unreadable one. x86-64 only (ELFCLASS64 /
- * little-endian), matching the rest of this project's scope. */
-static int elf_find_symbol_offset(int fd, const char *symbol, uint64_t *offset_out)
+ * checks is the same value as its runtime offset from the load base,
+ * and *size_out with its declared st_size, 0 if the symbol table
+ * doesn't carry one), -1 on any parse/read/bounds failure. Every
+ * failure is inconclusive, never a positive detection -- a malformed or
+ * unexpected-shape ELF file is a skip, same as an unreadable one.
+ * x86-64 only (ELFCLASS64 / little-endian), matching the rest of this
+ * project's scope. */
+static int elf_find_symbol_offset(int fd, const char *symbol, uint64_t *offset_out,
+                                   uint64_t *size_out)
 {
     Elf64_Ehdr eh;
     Elf64_Shdr *shdrs = NULL;
@@ -526,6 +537,7 @@ static int elf_find_symbol_offset(int fd, const char *symbol, uint64_t *offset_o
             continue;
         if (strcmp(dynstrtab + syms[i].st_name, symbol) == 0) {
             *offset_out = syms[i].st_value;
+            *size_out = syms[i].st_size;
             ret = 0;
             break;
         }
@@ -539,10 +551,20 @@ out:
     return ret;
 }
 
-/* Reads `symbol`'s first AC_HOOK_CHECK_BYTES from libpath (resolved via
- * the target's own /proc/<pid>/root/ -- see below) and compares against
- * the same offset in the target pid's live memory (lib_base = that
- * mapping's lowest VMA start, i.e. its file-offset-0 load address).
+/* Reads `symbol` from libpath (resolved via the target's own
+ * /proc/<pid>/root/ -- see below) and compares against the same offset
+ * in the target pid's live memory (lib_base = that mapping's lowest VMA
+ * start, i.e. its file-offset-0 load address). Compares the symbol's
+ * *entire* declared length (its ELF st_size, clamped to
+ * [AC_HOOK_CHECK_MIN_BYTES, AC_HOOK_CHECK_MAX_BYTES], or
+ * AC_HOOK_CHECK_DEFAULT_BYTES if the symbol table has no usable size for
+ * it) rather than a fixed guess -- a "detour"-style hook patching
+ * further into the function body than a small fixed window would still
+ * be inside the function's own real bytes, and would still be caught.
+ * Empirically, real present-call functions are tiny (glXSwapBuffers is
+ * 17 bytes on a real system, smaller than the old fixed 32-byte
+ * window -- meaning that window used to read a few bytes *past* the
+ * real function into whatever follows it, which this also fixes).
  * Returns 1 if hooked, 0 if clean, -1 if inconclusive (never treated as
  * a positive detection -- an unreadable/unparseable library is a skip,
  * not an alert). Silent by design -- callers decide how (or whether) to
@@ -553,11 +575,12 @@ static int compare_render_symbol(int pid, const char *libpath,
                                   unsigned long long lib_base,
                                   const char *symbol)
 {
-    unsigned char expected[AC_HOOK_CHECK_BYTES];
-    unsigned char actual[AC_HOOK_CHECK_BYTES];
+    unsigned char expected[AC_HOOK_CHECK_MAX_BYTES];
+    unsigned char actual[AC_HOOK_CHECK_MAX_BYTES];
     char memp[64];
     char nspath[AC_VMA_PATH + 32];
-    uint64_t offset;
+    uint64_t offset, size;
+    size_t checklen;
     int fd;
     ssize_t r;
 
@@ -582,25 +605,34 @@ static int compare_render_symbol(int pid, const char *libpath,
     fd = open(nspath, O_RDONLY);
     if (fd < 0)
         return -1;
-    if (elf_find_symbol_offset(fd, symbol, &offset) != 0) {
+    if (elf_find_symbol_offset(fd, symbol, &offset, &size) != 0) {
         close(fd);
         return -1;
     }
-    r = pread(fd, expected, AC_HOOK_CHECK_BYTES, (off_t)offset);
+    if (size == 0)
+        checklen = AC_HOOK_CHECK_DEFAULT_BYTES;
+    else if (size < AC_HOOK_CHECK_MIN_BYTES)
+        checklen = AC_HOOK_CHECK_MIN_BYTES;
+    else if (size > AC_HOOK_CHECK_MAX_BYTES)
+        checklen = AC_HOOK_CHECK_MAX_BYTES;
+    else
+        checklen = (size_t)size;
+
+    r = pread(fd, expected, checklen, (off_t)offset);
     close(fd);
-    if (r != AC_HOOK_CHECK_BYTES)
+    if (r != (ssize_t)checklen)
         return -1;
 
     snprintf(memp, sizeof(memp), "/proc/%d/mem", pid);
     fd = open(memp, O_RDONLY);
     if (fd < 0)
         return -1;
-    r = pread(fd, actual, AC_HOOK_CHECK_BYTES, (off_t)(lib_base + offset));
+    r = pread(fd, actual, checklen, (off_t)(lib_base + offset));
     close(fd);
-    if (r != AC_HOOK_CHECK_BYTES)
+    if (r != (ssize_t)checklen)
         return -1;
 
-    return memcmp(expected, actual, AC_HOOK_CHECK_BYTES) != 0 ? 1 : 0;
+    return memcmp(expected, actual, checklen) != 0 ? 1 : 0;
 }
 
 /* Single streaming pass over the target's VMAs to find the load base of
