@@ -411,6 +411,7 @@ static int ac_drain_events(struct ac_event_list *out)
 struct ac_prot_entry {
     struct task_struct *task;
     pid_t pid;                  /* display only */
+    bool jit_allowed;
     char comm[AC_MAX_COMM];
 };
 
@@ -470,7 +471,7 @@ static struct task_struct *ac_find_task_in_ns_of(pid_t nr, pid_t ref_pid)
     return target;
 }
 
-static int ac_add_prot_task(struct task_struct *t)
+static int ac_add_prot_task(struct task_struct *t, bool jit_allowed)
 {
     unsigned long flags;
     int i, slot = -1;
@@ -479,6 +480,7 @@ static int ac_add_prot_task(struct task_struct *t)
     spin_lock_irqsave(&ac_prot_lock, flags);
     for (i = 0; i < AC_PROT_MAX; i++) {
         if (ac_prots[i].task == t) {
+            ac_prots[i].jit_allowed = jit_allowed;  /* updatable via re-protect */
             ret = 0;                    /* already protected */
             goto out;
         }
@@ -492,6 +494,7 @@ static int ac_add_prot_task(struct task_struct *t)
     get_task_struct(t);
     ac_prots[slot].task = t;
     ac_prots[slot].pid = t->pid;
+    ac_prots[slot].jit_allowed = jit_allowed;
     strscpy(ac_prots[slot].comm, t->comm, sizeof(ac_prots[slot].comm));
     ac_prot_count++;
 out:
@@ -499,7 +502,8 @@ out:
     return ret;
 }
 
-static int ac_add_prot_pid(pid_t pid, pid_t ref_pid, char *comm_out)
+static int ac_add_prot_pid(pid_t pid, pid_t ref_pid, bool jit_allowed,
+                            char *comm_out)
 {
     struct task_struct *t = ref_pid > 0 ? ac_find_task_in_ns_of(pid, ref_pid)
                                          : ac_find_task(pid);
@@ -509,7 +513,7 @@ static int ac_add_prot_pid(pid_t pid, pid_t ref_pid, char *comm_out)
         return -ESRCH;
     if (comm_out)
         strscpy(comm_out, t->comm, AC_MAX_COMM);
-    ret = ac_add_prot_task(t);
+    ret = ac_add_prot_task(t, jit_allowed);
     put_task_struct(t);
     return ret;
 }
@@ -529,6 +533,27 @@ static void ac_del_prot_task(struct task_struct *t)
         }
     }
     spin_unlock_irqrestore(&ac_prot_lock, flags);
+}
+
+/* Fork inheritance already extends *protection* itself to children (see
+ * ac_clone_ret()); mirror that for jit_allowed too, so a legitimate
+ * JIT-marked process's child processes don't generate false anon-exec
+ * reports just because the flag reset to false on them. */
+static bool ac_task_jit_allowed(struct task_struct *t)
+{
+    unsigned long flags;
+    int i;
+    bool jit_allowed = false;
+
+    spin_lock_irqsave(&ac_prot_lock, flags);
+    for (i = 0; i < AC_PROT_MAX; i++) {
+        if (ac_prots[i].task == t) {
+            jit_allowed = ac_prots[i].jit_allowed;
+            break;
+        }
+    }
+    spin_unlock_irqrestore(&ac_prot_lock, flags);
+    return jit_allowed;
 }
 
 static bool ac_is_protected_task(struct task_struct *t)
@@ -587,6 +612,7 @@ static int ac_list_protected(struct ac_prot_list *out)
         if (!ac_prots[i].task)
             continue;
         out->items[n].pid = ac_prots[i].pid;
+        out->items[n].jit_allowed = ac_prots[i].jit_allowed;
         strscpy(out->items[n].comm, ac_prots[i].comm,
                 sizeof(out->items[n].comm));
         n++;
@@ -705,7 +731,7 @@ static int ac_clone_ret(struct kretprobe_instance *ri, struct pt_regs *regs)
     if (!child)
         return 0;
     strscpy(pcomm, current->comm, sizeof(pcomm));
-    ac_add_prot_task(child);
+    ac_add_prot_task(child, ac_task_jit_allowed(current));
     ac_emit(AC_EV_FORK, child->pid, child->comm,
             "child of protected pid %d (%s); protection inherited",
             current->pid, pcomm);
@@ -1050,7 +1076,7 @@ static long ac_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 
         if (copy_from_user(&a, uarg, sizeof(a)))
             return -EFAULT;
-        ret = ac_add_prot_pid(a.pid, a.ref_pid, a.comm);
+        ret = ac_add_prot_pid(a.pid, a.ref_pid, a.jit_allowed != 0, a.comm);
         if (ret == 0 && ac_verbose)
             pr_info("protected pid %d (%s)\n", a.pid, a.comm);
         return ret;
