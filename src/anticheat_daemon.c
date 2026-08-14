@@ -42,6 +42,7 @@
 #include <stdarg.h>
 #include <stdint.h>
 #include <errno.h>
+#include <limits.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include <signal.h>
@@ -387,15 +388,34 @@ static const char *ac_baseline_dir(void)
     return (e && *e) ? e : AC_BASELINE_DIR;
 }
 
+/* Strict positive-integer parse for interval-override env vars, shared by
+ * every ac_*_check_interval() below. atoi() (the previous implementation,
+ * used identically six times over) can't tell "unset/garbage" apart from
+ * an explicit 0 and has no overflow bound; strtol() lets us reject both a
+ * malformed value (trailing garbage, non-numeric, empty) and one that
+ * over/underflows int, falling back to the caller's default in either
+ * case instead of silently misbehaving on operator typos. */
+static int ac_env_interval(const char *envname, int default_secs)
+{
+    const char *e = getenv(envname);
+    char *end;
+    long v;
+
+    if (!e || !*e)
+        return default_secs;
+    errno = 0;
+    v = strtol(e, &end, 10);
+    if (errno != 0 || *end != '\0' || end == e || v <= 0 || v > INT_MAX)
+        return default_secs;
+    return (int)v;
+}
+
 /* How often the daemon re-hashes protected processes' executables against
  * saved baselines. Overridable via AC_BASELINE_CHECK_INTERVAL (seconds) so
  * test.sh can exercise this on a live kernel without a real 60s wait. */
 static int ac_baseline_check_interval(void)
 {
-    const char *e = getenv("AC_BASELINE_CHECK_INTERVAL");
-    int v = e ? atoi(e) : 0;
-
-    return (v > 0) ? v : 60;
+    return ac_env_interval("AC_BASELINE_CHECK_INTERVAL", 60);
 }
 
 /* How often scan_protected_periodic() re-scans every protected process's
@@ -405,10 +425,7 @@ static int ac_baseline_check_interval(void)
  * wait for the default 30s interval. */
 static int ac_scan_check_interval(void)
 {
-    const char *e = getenv("AC_SCAN_CHECK_INTERVAL");
-    int v = e ? atoi(e) : 0;
-
-    return (v > 0) ? v : 30;
+    return ac_env_interval("AC_SCAN_CHECK_INTERVAL", 30);
 }
 
 static void ac_mkdir_baselines(void)
@@ -858,10 +875,7 @@ static void check_render_hooks_periodic(void)
  * each library it has, not just a cheap ioctl. */
 static int ac_render_hook_check_interval(void)
 {
-    const char *e = getenv("AC_RENDER_HOOK_CHECK_INTERVAL");
-    int v = e ? atoi(e) : 0;
-
-    return (v > 0) ? v : 30;
+    return ac_env_interval("AC_RENDER_HOOK_CHECK_INTERVAL", 30);
 }
 
 /* Full implementations are defined later, alongside the periodic
@@ -1588,10 +1602,7 @@ static void check_ld_preload_periodic(void)
 
 static int ac_ld_preload_check_interval(void)
 {
-    const char *e = getenv("AC_LD_PRELOAD_CHECK_INTERVAL");
-    int v = e ? atoi(e) : 0;
-
-    return (v > 0) ? v : 10;
+    return ac_env_interval("AC_LD_PRELOAD_CHECK_INTERVAL", 10);
 }
 
 /* Same warn-at-most-once-per-pid reasoning and slot-tracking pattern as
@@ -1681,10 +1692,7 @@ static void check_vk_layers_periodic(void)
 
 static int ac_vk_layer_check_interval(void)
 {
-    const char *e = getenv("AC_VK_LAYER_CHECK_INTERVAL");
-    int v = e ? atoi(e) : 0;
-
-    return (v > 0) ? v : 10;
+    return ac_env_interval("AC_VK_LAYER_CHECK_INTERVAL", 10);
 }
 
 /* ------------------------------------------------------------------ */
@@ -2122,10 +2130,7 @@ static void check_implicit_layers_periodic(void)
 
 static int ac_implicit_layer_check_interval(void)
 {
-    const char *e = getenv("AC_IMPLICIT_LAYER_CHECK_INTERVAL");
-    int v = e ? atoi(e) : 0;
-
-    return (v > 0) ? v : 30;
+    return ac_env_interval("AC_IMPLICIT_LAYER_CHECK_INTERVAL", 30);
 }
 
 static int scan_protected_periodic(void)

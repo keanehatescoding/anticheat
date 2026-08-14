@@ -190,7 +190,7 @@ if [ -n "$VK_PID" ]; then
     FIFO=$(mktemp -u)
     mkfifo "$FIFO"
     setsid ./test/render_hook_test >"$FIFO" 2>&1 &
-    HOOK_LINE=$(head -n1 "$FIFO")
+    HOOK_LINE=$(timeout 5 head -n1 "$FIFO")
     rm -f "$FIFO"
     HOOK_PID=$(printf '%s' "$HOOK_LINE" | sed -n 's/^READY pid=\([0-9]*\)$/\1/p')
     if [ -n "$HOOK_PID" ]; then
@@ -208,17 +208,17 @@ if [ -n "$VK_PID" ]; then
         # one-shot command is a diagnostic tool on top of it.
         if ./anticheat protect --pid "$HOOK_PID" >/dev/null 2>&1; then
             AC_RENDER_HOOK_CHECK_INTERVAL=2 ./anticheat start --foreground \
-                >/tmp/ac_render_hook_test.log 2>&1 &
+                >/tmp/ac_render_hook_test_$$.log 2>&1 &
             RENDER_DAEMON_PID=$!
             sleep 4
-            if grep -q "render hook detected" /tmp/ac_render_hook_test.log; then
+            if grep -q "render hook detected" /tmp/ac_render_hook_test_$$.log; then
                 ok "periodic monitoring loop detected the self-hooked process"
             else
                 bad "periodic monitoring loop did not detect the self-hooked process"
             fi
             kill "$RENDER_DAEMON_PID" 2>/dev/null
             wait "$RENDER_DAEMON_PID" 2>/dev/null
-            rm -f /tmp/ac_render_hook_test.log
+            rm -f /tmp/ac_render_hook_test_$$.log
         else
             bad "could not protect render_hook_test pid for the periodic check"
         fi
@@ -227,6 +227,10 @@ if [ -n "$VK_PID" ]; then
         wait "$HOOK_PID" 2>/dev/null
     else
         bad "render_hook_test did not report READY (output: $HOOK_LINE)"
+        # HOOK_PID was never captured (empty/timed-out READY line), so it
+        # can't be killed by pid -- if the harness is just slow rather than
+        # dead, it would otherwise leak as an orphan for the rest of the run.
+        pkill -f "test/render_hook_test" 2>/dev/null
     fi
 
     say "render-hook check: catches a hook past the old fixed 32-byte window"
@@ -240,7 +244,7 @@ if [ -n "$VK_PID" ]; then
     OFFFIFO=$(mktemp -u)
     mkfifo "$OFFFIFO"
     setsid ./test/render_hook_test libvulkan.so.1 vkQueuePresentKHR 40 >"$OFFFIFO" 2>&1 &
-    OFFHOOK_LINE=$(head -n1 "$OFFFIFO")
+    OFFHOOK_LINE=$(timeout 5 head -n1 "$OFFFIFO")
     rm -f "$OFFFIFO"
     OFFHOOK_PID=$(printf '%s' "$OFFHOOK_LINE" | sed -n 's/^READY pid=\([0-9]*\)$/\1/p')
     if [ -n "$OFFHOOK_PID" ]; then
@@ -254,6 +258,7 @@ if [ -n "$VK_PID" ]; then
         wait "$OFFHOOK_PID" 2>/dev/null
     else
         bad "offset-40 render_hook_test did not report READY (output: $OFFHOOK_LINE)"
+        pkill -f "test/render_hook_test" 2>/dev/null
     fi
 else
     say "no process with libvulkan loaded found on this machine, skipping both render-hook checks"
@@ -282,7 +287,7 @@ if [ -n "$GL_PID" ]; then
     GLFIFO=$(mktemp -u)
     mkfifo "$GLFIFO"
     setsid ./test/render_hook_test libGL.so.1 glXSwapBuffers >"$GLFIFO" 2>&1 &
-    GLHOOK_LINE=$(head -n1 "$GLFIFO")
+    GLHOOK_LINE=$(timeout 5 head -n1 "$GLFIFO")
     rm -f "$GLFIFO"
     GLHOOK_PID=$(printf '%s' "$GLHOOK_LINE" | sed -n 's/^READY pid=\([0-9]*\)$/\1/p')
     if [ -n "$GLHOOK_PID" ]; then
@@ -296,17 +301,17 @@ if [ -n "$GL_PID" ]; then
         say "render-hook check (GLX/OpenGL): periodic monitoring loop, not just one-shot scan"
         if ./anticheat protect --pid "$GLHOOK_PID" >/dev/null 2>&1; then
             AC_RENDER_HOOK_CHECK_INTERVAL=2 ./anticheat start --foreground \
-                >/tmp/ac_gl_render_hook_test.log 2>&1 &
+                >/tmp/ac_gl_render_hook_test_$$.log 2>&1 &
             GLRENDER_DAEMON_PID=$!
             sleep 4
-            if grep -q "render hook detected" /tmp/ac_gl_render_hook_test.log; then
+            if grep -q "render hook detected" /tmp/ac_gl_render_hook_test_$$.log; then
                 ok "periodic monitoring loop detected the self-hooked GLX process"
             else
                 bad "periodic monitoring loop did not detect the self-hooked GLX process"
             fi
             kill "$GLRENDER_DAEMON_PID" 2>/dev/null
             wait "$GLRENDER_DAEMON_PID" 2>/dev/null
-            rm -f /tmp/ac_gl_render_hook_test.log
+            rm -f /tmp/ac_gl_render_hook_test_$$.log
         else
             bad "could not protect GL render_hook_test pid for the periodic check"
         fi
@@ -315,6 +320,7 @@ if [ -n "$GL_PID" ]; then
         wait "$GLHOOK_PID" 2>/dev/null
     else
         bad "GL render_hook_test did not report READY (output: $GLHOOK_LINE)"
+        pkill -f "test/render_hook_test" 2>/dev/null
     fi
 else
     say "no process with libGL loaded found on this machine, skipping both GLX render-hook checks"
@@ -343,7 +349,7 @@ if [ -n "$EGL_PID" ]; then
     EGLFIFO=$(mktemp -u)
     mkfifo "$EGLFIFO"
     setsid ./test/render_hook_test libEGL.so.1 eglSwapBuffers >"$EGLFIFO" 2>&1 &
-    EGLHOOK_LINE=$(head -n1 "$EGLFIFO")
+    EGLHOOK_LINE=$(timeout 5 head -n1 "$EGLFIFO")
     rm -f "$EGLFIFO"
     EGLHOOK_PID=$(printf '%s' "$EGLHOOK_LINE" | sed -n 's/^READY pid=\([0-9]*\)$/\1/p')
     if [ -n "$EGLHOOK_PID" ]; then
@@ -357,17 +363,17 @@ if [ -n "$EGL_PID" ]; then
         say "render-hook check (EGL): periodic monitoring loop, not just one-shot scan"
         if ./anticheat protect --pid "$EGLHOOK_PID" >/dev/null 2>&1; then
             AC_RENDER_HOOK_CHECK_INTERVAL=2 ./anticheat start --foreground \
-                >/tmp/ac_egl_render_hook_test.log 2>&1 &
+                >/tmp/ac_egl_render_hook_test_$$.log 2>&1 &
             EGLRENDER_DAEMON_PID=$!
             sleep 4
-            if grep -q "render hook detected" /tmp/ac_egl_render_hook_test.log; then
+            if grep -q "render hook detected" /tmp/ac_egl_render_hook_test_$$.log; then
                 ok "periodic monitoring loop detected the self-hooked EGL process"
             else
                 bad "periodic monitoring loop did not detect the self-hooked EGL process"
             fi
             kill "$EGLRENDER_DAEMON_PID" 2>/dev/null
             wait "$EGLRENDER_DAEMON_PID" 2>/dev/null
-            rm -f /tmp/ac_egl_render_hook_test.log
+            rm -f /tmp/ac_egl_render_hook_test_$$.log
         else
             bad "could not protect EGL render_hook_test pid for the periodic check"
         fi
@@ -376,6 +382,7 @@ if [ -n "$EGL_PID" ]; then
         wait "$EGLHOOK_PID" 2>/dev/null
     else
         bad "EGL render_hook_test did not report READY (output: $EGLHOOK_LINE)"
+        pkill -f "test/render_hook_test" 2>/dev/null
     fi
 else
     say "no process with libEGL loaded found on this machine, skipping both EGL render-hook checks"
@@ -405,7 +412,7 @@ if [ -x ./test/mount_ns_probe ]; then
         mount --bind /usr/lib/libvulkan.so.1 '$NS_DIR/libvulkan.so.1' &&
         exec $PWD/test/mount_ns_probe '$NS_DIR/libvulkan.so.1'
     " >"$NS_FIFO" 2>&1 &
-    NS_LINE=$(head -n1 "$NS_FIFO")
+    NS_LINE=$(timeout 5 head -n1 "$NS_FIFO")
     rm -f "$NS_FIFO"
     NS_PID=$(printf '%s' "$NS_LINE" | sed -n 's/^READY pid=\([0-9]*\)$/\1/p')
     if [ -n "$NS_PID" ]; then
@@ -421,6 +428,7 @@ if [ -x ./test/mount_ns_probe ]; then
         wait "$NS_PID" 2>/dev/null
     else
         say "could not set up the test mount namespace (output: $NS_LINE), skipping"
+        pkill -f "test/mount_ns_probe" 2>/dev/null
     fi
     rm -rf "$NS_DIR"
 else
@@ -454,17 +462,17 @@ if [ -n "$LIBC_PATH" ] && [ -e "$LIBC_PATH" ]; then
 
     if ./anticheat protect --pid "$PRELOAD_PID" >/dev/null 2>&1; then
         AC_LD_PRELOAD_CHECK_INTERVAL=2 ./anticheat start --foreground \
-            >/tmp/ac_preload_test.log 2>&1 &
+            >/tmp/ac_preload_test_$$.log 2>&1 &
         PRELOAD_DAEMON_PID=$!
         sleep 4
-        if grep -q "LD_PRELOAD=$LIBC_PATH" /tmp/ac_preload_test.log; then
+        if grep -q "LD_PRELOAD=$LIBC_PATH" /tmp/ac_preload_test_$$.log; then
             ok "periodic monitoring loop detected LD_PRELOAD (LOG_WARNING, not a ban-pipeline report)"
         else
             bad "periodic monitoring loop did not detect LD_PRELOAD"
         fi
         kill "$PRELOAD_DAEMON_PID" 2>/dev/null
         wait "$PRELOAD_DAEMON_PID" 2>/dev/null
-        rm -f /tmp/ac_preload_test.log
+        rm -f /tmp/ac_preload_test_$$.log
     else
         bad "could not protect the LD_PRELOAD victim pid for the periodic check"
     fi
@@ -501,17 +509,17 @@ fi
 
 if ./anticheat protect --pid "$VKLAYER_PID" >/dev/null 2>&1; then
     AC_VK_LAYER_CHECK_INTERVAL=2 ./anticheat start --foreground \
-        >/tmp/ac_vklayer_test.log 2>&1 &
+        >/tmp/ac_vklayer_test_$$.log 2>&1 &
     VKLAYER_DAEMON_PID=$!
     sleep 4
-    if grep -q "VK_LAYER_PATH=/tmp" /tmp/ac_vklayer_test.log; then
+    if grep -q "VK_LAYER_PATH=/tmp" /tmp/ac_vklayer_test_$$.log; then
         ok "periodic monitoring loop detected VK_LAYER_PATH (LOG_WARNING, not a ban-pipeline report)"
     else
         bad "periodic monitoring loop did not detect VK_LAYER_PATH"
     fi
     kill "$VKLAYER_DAEMON_PID" 2>/dev/null
     wait "$VKLAYER_DAEMON_PID" 2>/dev/null
-    rm -f /tmp/ac_vklayer_test.log
+    rm -f /tmp/ac_vklayer_test_$$.log
 else
     bad "could not protect the VK_LAYER_PATH victim pid for the periodic check"
 fi
@@ -689,10 +697,10 @@ done
 [ "$REPORT_SERVER_READY" -eq 1 ] || bad "report server never became ready on port $REPORT_PORT"
 
 AC_BASELINE_CHECK_INTERVAL=2 AC_REPORT_URL="127.0.0.1:$REPORT_PORT" AC_REPORT_KEY="$REPORT_KEY" \
-    ./anticheat start --foreground >/tmp/ac_baseline_test.log 2>&1 &
+    ./anticheat start --foreground >/tmp/ac_baseline_test_$$.log 2>&1 &
 DAEMON_PID=$!
 sleep 4
-if grep -q "differs from saved baseline" /tmp/ac_baseline_test.log; then
+if grep -q "differs from saved baseline" /tmp/ac_baseline_test_$$.log; then
     ok "periodic baseline check detected tampering"
 else
     bad "periodic baseline check did not detect tampering"
@@ -718,7 +726,7 @@ kill "$REPORT_SERVER_PID" 2>/dev/null
 wait "$REPORT_SERVER_PID" 2>/dev/null
 rm -f "$REPORT_DB" "$REPORT_DB-wal" "$REPORT_DB-shm" "/tmp/ac_report_server_$$.log"
 DAEMON_PID=""
-rm -f /tmp/ac_baseline_test.log
+rm -f /tmp/ac_baseline_test_$$.log
 # The corruption above (sed -i ... deadbeef...) hits every saved baseline
 # in $BLDIR, not just VICTIM_PID's -- and baselines are keyed by file path,
 # not by pid, so a common shared library (libc.so.6, ld-linux...) stays
@@ -743,12 +751,12 @@ make anon-exec-test >/dev/null 2>&1
 
 FIFO1=$(mktemp -u); mkfifo "$FIFO1"
 setsid ./test/anon_exec_test >"$FIFO1" 2>&1 &
-AE1_LINE=$(head -n1 "$FIFO1"); rm -f "$FIFO1"
+AE1_LINE=$(timeout 5 head -n1 "$FIFO1"); rm -f "$FIFO1"
 AE1_PID=$(printf '%s' "$AE1_LINE" | sed -n 's/^READY pid=\([0-9]*\)$/\1/p')
 
 FIFO2=$(mktemp -u); mkfifo "$FIFO2"
 setsid ./test/anon_exec_test >"$FIFO2" 2>&1 &
-AE2_LINE=$(head -n1 "$FIFO2"); rm -f "$FIFO2"
+AE2_LINE=$(timeout 5 head -n1 "$FIFO2"); rm -f "$FIFO2"
 AE2_PID=$(printf '%s' "$AE2_LINE" | sed -n 's/^READY pid=\([0-9]*\)$/\1/p')
 
 if [ -n "$AE1_PID" ] && [ -n "$AE2_PID" ]; then
@@ -775,18 +783,18 @@ if [ -n "$AE1_PID" ] && [ -n "$AE2_PID" ]; then
     [ "$JIT_SERVER_READY" -eq 1 ] || bad "JIT-test report server never became ready on port $JIT_REPORT_PORT"
 
     AC_SCAN_CHECK_INTERVAL=2 AC_REPORT_URL="127.0.0.1:$JIT_REPORT_PORT" AC_REPORT_KEY="$JIT_REPORT_KEY" \
-        ./anticheat start --foreground >/tmp/ac_jit_test.log 2>&1 &
+        ./anticheat start --foreground >/tmp/ac_jit_test_$$.log 2>&1 &
     JIT_DAEMON_PID=$!
     sleep 3    # let the first scan cycle establish both pids' anon-exec baseline
     kill -USR1 "$AE1_PID" "$AE2_PID"
     sleep 3    # let the next scan cycle observe the growth
 
-    if grep -q "pid $AE1_PID .*possible code injection" /tmp/ac_jit_test.log; then
+    if grep -q "pid $AE1_PID .*possible code injection" /tmp/ac_jit_test_$$.log; then
         ok "non-allowlisted process's growth logged at CRITICAL"
     else
         bad "non-allowlisted process's growth was not logged as expected"
     fi
-    if grep -q "pid $AE2_PID .*expected for a JIT-marked process" /tmp/ac_jit_test.log; then
+    if grep -q "pid $AE2_PID .*expected for a JIT-marked process" /tmp/ac_jit_test_$$.log; then
         ok "allowlisted process's growth logged at WARNING, not CRITICAL"
     else
         bad "allowlisted process's growth was not logged as expected"
@@ -817,9 +825,13 @@ if [ -n "$AE1_PID" ] && [ -n "$AE2_PID" ]; then
     kill "$JIT_REPORT_SERVER_PID" 2>/dev/null
     wait "$JIT_REPORT_SERVER_PID" 2>/dev/null
     rm -f "$JIT_REPORT_DB" "$JIT_REPORT_DB-wal" "$JIT_REPORT_DB-shm" \
-        "/tmp/ac_jit_report_server_$$.log" /tmp/ac_jit_test.log
+        "/tmp/ac_jit_report_server_$$.log" /tmp/ac_jit_test_$$.log
 else
     bad "anon_exec_test harness(es) did not report READY (got: '$AE1_LINE' / '$AE2_LINE')"
+    # A pid that never got captured (empty/timed-out READY line) can't be
+    # killed by pid below -- catch it by binary path instead, or a slow
+    # (not dead) harness leaks as an orphan for the rest of the run.
+    pkill -f "test/anon_exec_test" 2>/dev/null
 fi
 kill "$AE1_PID" "$AE2_PID" 2>/dev/null
 wait "$AE1_PID" "$AE2_PID" 2>/dev/null
@@ -834,7 +846,7 @@ if rmmod anticheat 2>/dev/null; then bad "rmmod succeeded while locked"; else ok
 if ./anticheat unlock >/dev/null; then ok "unlocked"; else bad "unlock"; fi
 
 say "self-protection: daemon should register its own pid"
-./anticheat start --foreground >/tmp/ac_daemon.log 2>&1 &
+./anticheat start --foreground >/tmp/ac_daemon_$$.log 2>&1 &
 DAEMON_PID=$!
 sleep 1
 if ./anticheat list | grep -q "$DAEMON_PID"; then
