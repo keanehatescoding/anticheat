@@ -94,7 +94,7 @@ anticheat protect --pid N --ns-of REFPID   protect a pid namespace-relative
                                       to host-pid REFPID (see below)
 anticheat protect --pid N --jit      mark as a known JIT-using binary
                                       (anon-exec growth logs, isn't auto-reported)
-anticheat protect --comm NAME        protect by comm name
+anticheat protect --comm NAME [--jit]   protect by comm name
 anticheat unprotect --pid N
 anticheat list                       list protected processes
 anticheat scan --pid N               VMA scan, RWX + anon-exec detection
@@ -114,9 +114,10 @@ anticheat start [--foreground]       monitoring daemon (events + periodic checks
 The daemon (`start`) protects its own pid on startup (so it can't just be
 ptrace-attached or debugged away — see `AC_IOCTL_ADD_PROC` in `cmd_start`),
 polls security events, re-checks syscall integrity every 5 s, module
-visibility every 10 s, scans protected processes every 30 s for RWX
-mappings and for anonymous-executable mappings appearing *after* a process
-was first observed (each pid's baseline count is recorded on first scan;
+visibility every 10 s, scans protected processes every 30 s (override via
+`AC_SCAN_CHECK_INTERVAL`) for RWX mappings and for anonymous-executable
+mappings appearing *after* a process was first observed (each pid's
+baseline count is recorded on first scan;
 `vdso`/`vvar` never trigger since they're present from process start and
 never change — see `anon_baseline_check()`), and every 60 s re-hashes every
 protected process's executable, file-backed mappings against whatever
