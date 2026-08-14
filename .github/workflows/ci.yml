@@ -60,10 +60,23 @@ jobs:
           # signing smoke test step further down needs that tool; without
           # it DKMS silently skips signing and that step's own
           # `grep -q sig_id` assertion fails.
+          #
+          # MODULE_SIG_HASH has no prompt of its own -- it's a plain
+          # `string` symbol whose value is derived entirely from which
+          # MODULE_SIG_SHA* boolean choice is enabled (see kernel/module/
+          # Kconfig). Setting it directly via --set-val looked like it
+          # worked, but olddefconfig recomputes it from the choice on the
+          # next line and silently discards the forced value -- verified
+          # against a real build: it landed on sha1 (this kernel's
+          # apparent choice default), not sha256, even though the .config
+          # line briefly said otherwise. Enable the actual choice symbol
+          # instead so the derived value is stable under olddefconfig.
           ./linux-6.12/scripts/config --file linux-6.12/.config \
             --enable MODULE_SIG \
-            --set-val MODULE_SIG_HASH sha256
+            --enable MODULE_SIG_SHA256
           make -C linux-6.12 ARCH=x86_64 olddefconfig
+          grep -qx 'CONFIG_MODULE_SIG_SHA256=y' linux-6.12/.config
+          grep -qx 'CONFIG_MODULE_SIG_HASH="sha256"' linux-6.12/.config
           make -C linux-6.12 ARCH=x86_64 scripts
           make -C linux-6.12 ARCH=x86_64 modules_prepare
 
@@ -134,4 +147,10 @@ jobs:
           built_ko="$(find "/var/lib/dkms/anticheat/1.0.0/${KVER}" \
             -name 'anticheat.ko' -print -quit)"
           test -n "$built_ko" && test -s "$built_ko"
-          modinfo "$built_ko" | tee /dev/stderr | grep -q '^sig_id:\s*PKCS#7$'
+          # sig_id alone only proves *some* signature was applied, not
+          # which hash -- check sig_hashalgo too, the actual built-module
+          # confirmation that the sha256 requested in .config (checked
+          # earlier, before the build) is what really got used.
+          modinfo_out="$(modinfo "$built_ko" | tee /dev/stderr)"
+          printf '%s' "$modinfo_out" | grep -q '^sig_id:\s*PKCS#7$'
+          printf '%s' "$modinfo_out" | grep -q '^sig_hashalgo:\s*sha256$'
