@@ -92,7 +92,9 @@ anticheat status                     module status
 anticheat protect --pid N            protect a process (children inherit)
 anticheat protect --pid N --ns-of REFPID   protect a pid namespace-relative
                                       to host-pid REFPID (see below)
-anticheat protect --comm NAME        protect by comm name
+anticheat protect --pid N --jit      mark as a known JIT-using binary
+                                      (anon-exec growth logs, isn't auto-reported)
+anticheat protect --comm NAME [--jit]   protect by comm name
 anticheat unprotect --pid N
 anticheat list                       list protected processes
 anticheat scan --pid N               VMA scan, RWX + anon-exec detection
@@ -112,9 +114,10 @@ anticheat start [--foreground]       monitoring daemon (events + periodic checks
 The daemon (`start`) protects its own pid on startup (so it can't just be
 ptrace-attached or debugged away — see `AC_IOCTL_ADD_PROC` in `cmd_start`),
 polls security events, re-checks syscall integrity every 5 s, module
-visibility every 10 s, scans protected processes every 30 s for RWX
-mappings and for anonymous-executable mappings appearing *after* a process
-was first observed (each pid's baseline count is recorded on first scan;
+visibility every 10 s, scans protected processes every 30 s (override via
+`AC_SCAN_CHECK_INTERVAL`) for RWX mappings and for anonymous-executable
+mappings appearing *after* a process was first observed (each pid's
+baseline count is recorded on first scan;
 `vdso`/`vvar` never trigger since they're present from process start and
 never change — see `anon_baseline_check()`), and every 60 s re-hashes every
 protected process's executable, file-backed mappings against whatever
@@ -644,8 +647,17 @@ To run the same userspace checks locally: `make ci`.
   growth after a pid is first observed) keeps `vdso`/`vvar` quiet, but a
   JIT-heavy protected process will still show a legitimately growing count
   over its lifetime — this is a detection *signal* to correlate with other
-  evidence, not a standalone verdict. Per-pid allowlisting for known
-  JIT-using binaries is future work.
+  evidence, not a standalone verdict. `protect --pid N --jit` (or `--comm
+  NAME --jit`) marks a specific protected pid as a known JIT-using binary
+  at protect time — per-pid, not by comm name or path, since either of
+  those could be spoofed by a cheat process to gain immunity, while
+  `protect` itself already requires `CAP_SYS_ADMIN`. Growth on an
+  allowlisted pid is still logged (at `LOG_WARNING`, mirroring how
+  LD_PRELOAD/Vulkan-layer detection avoids the ban pipeline below), just
+  not auto-reported — it's a signal an operator can still see, not one
+  that gets silently dropped. Fork inheritance extends this the same way
+  it already extends protection itself: a JIT-marked process's children
+  inherit the flag too.
 - Self-protection (the daemon registers its own pid on startup) only stops
   ptrace-based attacks, via the same kprobe hook everything else uses. It
   does not stop `SIGKILL` from a root-privileged attacker — nothing in this

@@ -99,6 +99,11 @@ struct ac_proc_id {
                                 * current behavior. >0: resolve `pid`
                                 * within the pid namespace that host-pid
                                 * ref_pid lives in (see --ns-of). */
+    int  jit_allowed;          /* 0/1: mark this pid as a known
+                                 * JIT-using binary at protect time (see
+                                 * --jit). Anon-exec growth still logs,
+                                 * at reduced severity, not auto-reported
+                                 * to the ban pipeline. */
     char comm[AC_MAX_COMM];   /* informational, may be empty on input */
 };
 
@@ -164,6 +169,7 @@ struct ac_event_list {
 
 struct ac_prot_item {
     int  pid;
+    int  jit_allowed;    /* echoes the registry's current flag for this pid */
     char comm[AC_MAX_COMM];
 };
 

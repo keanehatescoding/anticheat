@@ -12,6 +12,11 @@
  *                           in-namespace pid is known but its host pid
  *                           isn't -- --comm below is usually simpler
  *                           when a comm name is available)
+ *   protect --pid N --jit  mark this pid as a known JIT-using binary
+ *                           (Mono/JVM/V8/...) -- anon-exec growth still
+ *                           logs, at reduced severity, but isn't
+ *                           auto-reported to the ban pipeline (also
+ *                           works combined with --comm)
  *   protect --comm NAME    protect all processes whose comm == NAME
  *   unprotect --pid N      remove protection
  *   list                   list protected processes
@@ -223,7 +228,7 @@ static int pid_of_comm(const char *comm, int *pids, int max)
 static int cmd_protect(int argc, char **argv)
 {
     struct ac_proc_id id;
-    int pid = -1, ref_pid = -1, i, n;
+    int pid = -1, ref_pid = -1, jit = 0, i, n;
     const char *comm = NULL;
 
     for (i = 0; i < argc; i++) {
@@ -233,9 +238,12 @@ static int cmd_protect(int argc, char **argv)
             comm = argv[++i];
         else if (strcmp(argv[i], "--ns-of") == 0 && i + 1 < argc)
             ref_pid = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--jit") == 0)
+            jit = 1;
     }
     if (pid < 0 && !comm)
-        die("usage: anticheat protect --pid N [--ns-of REFPID] | --comm NAME");
+        die("usage: anticheat protect --pid N [--ns-of REFPID] [--jit] | "
+            "--comm NAME [--jit]");
     if (ref_pid >= 0 && comm)
         die("usage: --ns-of cannot be combined with --comm");
     if (ref_pid >= 0 && pid < 0)
@@ -252,6 +260,7 @@ static int cmd_protect(int argc, char **argv)
         for (i = 0; i < n; i++) {
             memset(&id, 0, sizeof(id));
             id.pid = pids[i];
+            id.jit_allowed = jit;
             if (ioctl_ok(AC_IOCTL_ADD_PROC, &id) == 0)
                 printf("protected pid %d (%s)\n", pids[i], id.comm);
         }
@@ -260,6 +269,7 @@ static int cmd_protect(int argc, char **argv)
         memset(&id, 0, sizeof(id));
         id.pid = pid;
         id.ref_pid = ref_pid;
+        id.jit_allowed = jit;
         if (ioctl_ok(AC_IOCTL_ADD_PROC, &id) < 0)
             return 1;
         printf("protected pid %d (%s)\n", pid, id.comm);
@@ -386,6 +396,19 @@ static int ac_baseline_check_interval(void)
     int v = e ? atoi(e) : 0;
 
     return (v > 0) ? v : 60;
+}
+
+/* How often scan_protected_periodic() re-scans every protected process's
+ * VMAs (RWX + anon-exec growth). Overridable via AC_SCAN_CHECK_INTERVAL
+ * (seconds), mirroring ac_baseline_check_interval() above, so test.sh can
+ * exercise two consecutive anon-exec scan cycles without a real 60s+
+ * wait for the default 30s interval. */
+static int ac_scan_check_interval(void)
+{
+    const char *e = getenv("AC_SCAN_CHECK_INTERVAL");
+    int v = e ? atoi(e) : 0;
+
+    return (v > 0) ? v : 30;
 }
 
 static void ac_mkdir_baselines(void)
@@ -1309,18 +1332,28 @@ static void anon_baseline_forget_stale(const struct ac_prot_list *pl)
     }
 }
 
-static void anon_baseline_check(int pid, const char *comm, unsigned int count)
+static void anon_baseline_check(int pid, const char *comm, unsigned int count,
+                                 int jit_allowed)
 {
     unsigned int i, free_slot = AC_MAX_PROTS;
 
     for (i = 0; i < AC_MAX_PROTS; i++) {
         if (g_anon_baseline[i].in_use && g_anon_baseline[i].pid == pid) {
-            if (count > g_anon_baseline[i].count)
-                logmsg(LOG_CRIT, "pid %d (%s): %u new anonymous executable "
-                       "mapping(s) since first observed (was %u, now %u) -- "
-                       "possible code injection after process start",
-                       pid, comm, count - g_anon_baseline[i].count,
-                       g_anon_baseline[i].count, count);
+            if (count > g_anon_baseline[i].count) {
+                if (jit_allowed)
+                    logmsg(LOG_WARNING, "pid %d (%s): %u new anonymous "
+                           "executable mapping(s) since first observed "
+                           "(was %u, now %u) -- expected for a JIT-marked "
+                           "process, not auto-reported",
+                           pid, comm, count - g_anon_baseline[i].count,
+                           g_anon_baseline[i].count, count);
+                else
+                    logmsg(LOG_CRIT, "pid %d (%s): %u new anonymous executable "
+                           "mapping(s) since first observed (was %u, now %u) -- "
+                           "possible code injection after process start",
+                           pid, comm, count - g_anon_baseline[i].count,
+                           g_anon_baseline[i].count, count);
+            }
             g_anon_baseline[i].count = count;
             return;
         }
@@ -2114,7 +2147,8 @@ static int scan_protected_periodic(void)
                 logmsg(LOG_WARNING, "pid %d (%s): %u RWX mapping(s) present",
                        pl.items[i].pid, pl.items[i].comm, b.rwx_count);
             anon_baseline_check(pl.items[i].pid, pl.items[i].comm,
-                                 b.anon_exec_count);
+                                 b.anon_exec_count,
+                                 pl.items[i].jit_allowed != 0);
             ioctl(dev_fd, AC_IOCTL_SCAN_END, NULL);
         }
     }
@@ -2532,7 +2566,7 @@ static int cmd_start(int argc, char **argv)
             }
             if (now >= next_scan) {
                 scan_protected_periodic();
-                next_scan = now + 30;
+                next_scan = now + ac_scan_check_interval();
             }
             if (now >= next_baseline) {
                 check_baselines_periodic();
@@ -2569,7 +2603,7 @@ static void usage(const char *prog)
     printf("usage: %s <command> [options]\n"
            "\n"
            "  status                     kernel module status\n"
-           "  protect --pid N [--ns-of REFPID] | --comm NAME\n"
+           "  protect --pid N [--ns-of REFPID] [--jit] | --comm NAME [--jit]\n"
            "  unprotect --pid N\n"
            "  list                       list protected processes\n"
            "  scan --pid N [--hash [--save|--check]] [--check-hooks] "

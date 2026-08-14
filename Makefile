@@ -82,6 +82,16 @@ mount-ns-test: test/mount_ns_probe
 test/mount_ns_probe: test/mount_ns_probe.c
 	$(CC) $(CFLAGS) -o $@ $< -ldl
 
+# anon-exec/JIT-allowlist live test helper: on SIGUSR1, maps one new
+# anonymous executable page in itself (the same signal a JIT or injected
+# shellcode produces) so the --jit allowlist's severity-downgrade path
+# can be proven against a real, controllable growth event. Needs root to
+# run the scan against it -- see test.sh.
+anon-exec-test: test/anon_exec_test
+
+test/anon_exec_test: test/anon_exec_test.c
+	$(CC) $(CFLAGS) -o $@ $<
+
 # run the daemon CLI against the userspace mock (no kernel module, no root)
 test-mock: mock daemon
 	./test/mock_test.sh
@@ -96,7 +106,7 @@ ci:
 
 clean:
 	@if [ -d $(KDIR) ]; then $(MAKE) -C $(KDIR) M=$(PWD) clean; fi
-	rm -f anticheat test/libmock_anticheat.so test/priv_drop_test test/render_hook_test test/mount_ns_probe
+	rm -f anticheat test/libmock_anticheat.so test/priv_drop_test test/render_hook_test test/mount_ns_probe test/anon_exec_test
 
 install: all
 	install -D -m 0755 anticheat /usr/local/sbin/anticheat

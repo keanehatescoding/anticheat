@@ -719,6 +719,110 @@ wait "$REPORT_SERVER_PID" 2>/dev/null
 rm -f "$REPORT_DB" "$REPORT_DB-wal" "$REPORT_DB-shm" "/tmp/ac_report_server_$$.log"
 DAEMON_PID=""
 rm -f /tmp/ac_baseline_test.log
+# The corruption above (sed -i ... deadbeef...) hits every saved baseline
+# in $BLDIR, not just VICTIM_PID's -- and baselines are keyed by file path,
+# not by pid, so a common shared library (libc.so.6, ld-linux...) stays
+# corrupted for any process protected afterward that also maps it, not
+# just VICTIM_PID. Nothing downstream in this suite needs these restored
+# (only VICTIM_PID's own --hash --save/--check pair, already exercised
+# above), so clear them rather than leave a landmine for later tests --
+# check_baselines_periodic() already treats "no baseline file" as
+# "nothing to check," not an error (anticheat_daemon.c: "nothing saved
+# for this file -- nothing to check").
+[ -d "$BLDIR" ] && rm -f "$BLDIR"/*.txt
+
+say "JIT allowlist: --jit downgrades anon-exec growth so it's still logged but not auto-reported"
+# Two throwaway processes, both grow one new anonymous-executable mapping
+# on command (the same observable signal a JIT or injected shellcode
+# produces -- see test/anon_exec_test.c). One is protected plainly, the
+# other with --jit. Proves the actual end-to-end behavior difference:
+# both log the growth, but only the non-allowlisted one reaches the
+# ban-pipeline server -- not just that the code paths differ, but that a
+# real report is/isn't sent over real HTTP.
+make anon-exec-test >/dev/null 2>&1
+
+FIFO1=$(mktemp -u); mkfifo "$FIFO1"
+setsid ./test/anon_exec_test >"$FIFO1" 2>&1 &
+AE1_LINE=$(head -n1 "$FIFO1"); rm -f "$FIFO1"
+AE1_PID=$(printf '%s' "$AE1_LINE" | sed -n 's/^READY pid=\([0-9]*\)$/\1/p')
+
+FIFO2=$(mktemp -u); mkfifo "$FIFO2"
+setsid ./test/anon_exec_test >"$FIFO2" 2>&1 &
+AE2_LINE=$(head -n1 "$FIFO2"); rm -f "$FIFO2"
+AE2_PID=$(printf '%s' "$AE2_LINE" | sed -n 's/^READY pid=\([0-9]*\)$/\1/p')
+
+if [ -n "$AE1_PID" ] && [ -n "$AE2_PID" ]; then
+    ./anticheat protect --pid "$AE1_PID" >/dev/null
+    ./anticheat protect --pid "$AE2_PID" --jit >/dev/null
+
+    JIT_REPORT_PORT=18800
+    JIT_REPORT_KEY="test-jit-report-key-$$"
+    JIT_ADMIN_KEY="test-jit-admin-key-$$"
+    JIT_REPORT_DB="/tmp/ac_jit_report_test_$$.db"
+    AC_SERVER_REPORT_KEY="$JIT_REPORT_KEY" AC_SERVER_ADMIN_KEY="$JIT_ADMIN_KEY" \
+        python3 server/ac_server.py --host 127.0.0.1 --port "$JIT_REPORT_PORT" --db "$JIT_REPORT_DB" \
+        >/tmp/ac_jit_report_server_$$.log 2>&1 &
+    JIT_REPORT_SERVER_PID=$!
+    JIT_SERVER_READY=0
+    for _ in $(seq 1 50); do
+        if curl -s "http://127.0.0.1:$JIT_REPORT_PORT/banned/x" \
+            -H "Authorization: Bearer $JIT_ADMIN_KEY" 2>/dev/null | grep -q '"banned"'; then
+            JIT_SERVER_READY=1
+            break
+        fi
+        sleep 0.1
+    done
+    [ "$JIT_SERVER_READY" -eq 1 ] || bad "JIT-test report server never became ready on port $JIT_REPORT_PORT"
+
+    AC_SCAN_CHECK_INTERVAL=2 AC_REPORT_URL="127.0.0.1:$JIT_REPORT_PORT" AC_REPORT_KEY="$JIT_REPORT_KEY" \
+        ./anticheat start --foreground >/tmp/ac_jit_test.log 2>&1 &
+    JIT_DAEMON_PID=$!
+    sleep 3    # let the first scan cycle establish both pids' anon-exec baseline
+    kill -USR1 "$AE1_PID" "$AE2_PID"
+    sleep 3    # let the next scan cycle observe the growth
+
+    if grep -q "pid $AE1_PID .*possible code injection" /tmp/ac_jit_test.log; then
+        ok "non-allowlisted process's growth logged at CRITICAL"
+    else
+        bad "non-allowlisted process's growth was not logged as expected"
+    fi
+    if grep -q "pid $AE2_PID .*expected for a JIT-marked process" /tmp/ac_jit_test.log; then
+        ok "allowlisted process's growth logged at WARNING, not CRITICAL"
+    else
+        bad "allowlisted process's growth was not logged as expected"
+    fi
+
+    kill "$JIT_DAEMON_PID" 2>/dev/null
+    wait "$JIT_DAEMON_PID" 2>/dev/null
+
+    JIT_MACHINE_ID=$(cat /etc/machine-id 2>/dev/null)
+    [ -n "$JIT_MACHINE_ID" ] || JIT_MACHINE_ID=$(hostname)
+    JIT_REPORT_OUT=$(curl -s "http://127.0.0.1:$JIT_REPORT_PORT/reports/$JIT_MACHINE_ID" \
+        -H "Authorization: Bearer $JIT_ADMIN_KEY")
+    # Match the anon-exec-specific phrase plus "pid N (", not just "pid N"
+    # -- the JSON blob can carry other, unrelated report types (baseline
+    # tamper, RWX, ...) for the same pid, and a bare pid substring can also
+    # coincidentally match inside an unrelated numeric field (timestamps).
+    if printf '%s' "$JIT_REPORT_OUT" | grep -q "pid $AE1_PID (.*new anonymous executable"; then
+        ok "non-allowlisted process's growth reached the ban-pipeline server"
+    else
+        bad "non-allowlisted process's growth did NOT reach the ban-pipeline server (got: $JIT_REPORT_OUT)"
+    fi
+    if printf '%s' "$JIT_REPORT_OUT" | grep -q "pid $AE2_PID (.*new anonymous executable"; then
+        bad "allowlisted process's growth reached the ban-pipeline server (should have been suppressed; got: $JIT_REPORT_OUT)"
+    else
+        ok "allowlisted process's growth correctly did NOT reach the ban-pipeline server"
+    fi
+
+    kill "$JIT_REPORT_SERVER_PID" 2>/dev/null
+    wait "$JIT_REPORT_SERVER_PID" 2>/dev/null
+    rm -f "$JIT_REPORT_DB" "$JIT_REPORT_DB-wal" "$JIT_REPORT_DB-shm" \
+        "/tmp/ac_jit_report_server_$$.log" /tmp/ac_jit_test.log
+else
+    bad "anon_exec_test harness(es) did not report READY (got: '$AE1_LINE' / '$AE2_LINE')"
+fi
+kill "$AE1_PID" "$AE2_PID" 2>/dev/null
+wait "$AE1_PID" "$AE2_PID" 2>/dev/null
 
 say "unprotect + cleanup"
 if ./anticheat unprotect --pid "$VICTIM_PID" >/dev/null; then ok "unprotected"; else bad "unprotect"; fi
