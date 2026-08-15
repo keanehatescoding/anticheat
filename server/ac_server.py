@@ -31,12 +31,15 @@ is the deployment this was actually built and tested against.
 import argparse
 import hmac
 import http.server
+import ipaddress
 import json
 import re
+import signal
 import sqlite3
 import sys
 import threading
 import time
+import traceback
 
 CLIENT_ID_RE = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
 MAX_BODY_BYTES = 4096
@@ -194,14 +197,42 @@ class Store:
             conn.close()
 
 
-def make_handler(store, report_key, admin_key, rate_limiter):
+def make_handler(store, report_key, admin_key, rate_limiter, trust_proxy=False):
     class Handler(http.server.BaseHTTPRequestHandler):
         server_version = "ac_server/1"
 
         def log_message(self, fmt, *args):
             sys.stderr.write("%s - %s\n" % (self.address_string(), fmt % args))
 
+        def _log_exception(self):
+            # Distinct from the normal per-request access log line above,
+            # so a real bug is grep-able instead of blending into traffic.
+            self.log_message(
+                "ERROR %s %s -> %r", self.command, self.path, sys.exc_info()[1]
+            )
+            traceback.print_exc(file=sys.stderr)
+
+        def _dispatch(self, inner):
+            self._response_started = False
+            try:
+                inner()
+            except (BrokenPipeError, ConnectionResetError):
+                # Client hung up mid-response -- routine for any HTTP
+                # server, not worth a stack trace per occurrence.
+                pass
+            except Exception:
+                self._log_exception()
+                if not self._response_started:
+                    try:
+                        self._send_json(500, {"error": "internal error"})
+                    except Exception:
+                        pass  # connection's already in a bad state; give up
+
         def _send_json(self, code, obj, extra_headers=None):
+            # Set before any bytes go out, so a failure partway through
+            # this call never causes _dispatch to attempt a second,
+            # malformed response on the same connection.
+            self._response_started = True
             body = json.dumps(obj).encode("utf-8")
             self.send_response(code)
             self.send_header("Content-Type", "application/json")
@@ -211,8 +242,42 @@ def make_handler(store, report_key, admin_key, rate_limiter):
             self.end_headers()
             self.wfile.write(body)
 
+        def _client_ip(self):
+            if not trust_proxy:
+                return self.client_address[0]
+            # self.headers.get() returns only the FIRST occurrence of a
+            # repeated header -- a client could send its own
+            # X-Forwarded-For line ahead of the one the proxy adds and
+            # win outright, since .get() would return the attacker's
+            # value and never even see the proxy's. get_all() returns
+            # every occurrence; RFC 9110 SS5.3 treats repeated instances
+            # of the same field as equivalent to one field joined by
+            # commas in order, so joining them before re-splitting
+            # handles both a proxy that appends to an existing header
+            # (the common case, e.g. nginx's proxy_add_x_forwarded_for)
+            # and one that adds a second, separate header line.
+            xff_all = self.headers.get_all("X-Forwarded-For")
+            if not xff_all:
+                # Flag on but header absent: fall back to the raw peer --
+                # if a direct connection somehow bypasses the proxy, the
+                # raw peer IS the real source, so this is the safe/more
+                # correct direction, not less.
+                return self.client_address[0]
+            xff = ",".join(xff_all)
+            # The LAST entry is the one the trusted proxy itself appended
+            # (its own view of its immediate peer); everything before
+            # that is attacker-controlled request-header content. Taking
+            # the first entry would let any client bypass rate limiting
+            # and forge source_addr just by sending its own header.
+            candidate = xff.rsplit(",", 1)[-1].strip()
+            try:
+                ipaddress.ip_address(candidate)
+            except ValueError:
+                return self.client_address[0]
+            return candidate
+
         def _rate_limited(self):
-            if rate_limiter.allow(self.client_address[0]):
+            if rate_limiter.allow(self._client_ip()):
                 return False
             self._send_json(
                 429,
@@ -263,6 +328,9 @@ def make_handler(store, report_key, admin_key, rate_limiter):
             return isinstance(v, str) and CLIENT_ID_RE.match(v) is not None
 
         def do_POST(self):
+            self._dispatch(self._do_POST)
+
+        def _do_POST(self):
             if self._rate_limited():
                 return
             if self.path == "/report":
@@ -274,6 +342,9 @@ def make_handler(store, report_key, admin_key, rate_limiter):
             self._send_json(404, {"error": "not found"})
 
         def do_GET(self):
+            self._dispatch(self._do_GET)
+
+        def _do_GET(self):
             if self._rate_limited():
                 return
             if self.path.startswith("/banned/"):
@@ -301,7 +372,7 @@ def make_handler(store, report_key, admin_key, rate_limiter):
             if not isinstance(client_ts, (int, float)):
                 client_ts = None
             store.add_report(
-                client_id, event_type, detail, client_ts, self.client_address[0]
+                client_id, event_type, detail, client_ts, self._client_ip()
             )
             self._send_json(201, {"ok": True})
 
@@ -379,6 +450,18 @@ def main():
         default=60,
         help="rate-limit window in seconds (default: 60)",
     )
+    ap.add_argument(
+        "--trust-proxy",
+        action="store_true",
+        help="trust the last hop of the X-Forwarded-For header as the "
+        "real client IP for rate limiting and report source_addr, "
+        "instead of the raw TCP peer. Only enable this if a reverse "
+        "proxy you control -- configured to APPEND to any existing "
+        "X-Forwarded-For, e.g. nginx's proxy_add_x_forwarded_for -- is "
+        "the only thing that can reach this process; otherwise a client "
+        "can set this header itself to spoof its rate-limit bucket and "
+        "the audit trail (default: off, use the raw TCP peer)",
+    )
     args = ap.parse_args()
 
     import os
@@ -402,8 +485,21 @@ def main():
 
     store = Store(args.db)
     rate_limiter = RateLimiter(args.rate_limit, args.rate_window)
-    handler = make_handler(store, report_key, admin_key, rate_limiter)
+    handler = make_handler(
+        store, report_key, admin_key, rate_limiter, args.trust_proxy
+    )
     httpd = http.server.ThreadingHTTPServer((args.host, args.port), handler)
+
+    def _handle_sigterm(signum, frame):
+        sys.stderr.write("ac_server: received SIGTERM, shutting down\n")
+        # shutdown() blocks until serve_forever()'s loop notices and
+        # exits, and must be called from a thread OTHER than the one
+        # running serve_forever() or it deadlocks -- this signal handler
+        # runs in that same (main) thread, so hand it off.
+        threading.Thread(target=httpd.shutdown, daemon=True).start()
+
+    signal.signal(signal.SIGTERM, _handle_sigterm)
+
     sys.stderr.write(
         "ac_server: listening on %s:%d, db=%s, rate limit %d req/%ds per IP "
         "(plain HTTP -- put a TLS reverse proxy in front for anything "
@@ -414,6 +510,9 @@ def main():
         httpd.serve_forever()
     except KeyboardInterrupt:
         pass
+    finally:
+        httpd.shutdown()      # no-op/near-instant if SIGTERM already did this
+        httpd.server_close()
 
 
 if __name__ == "__main__":

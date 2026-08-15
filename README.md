@@ -453,6 +453,22 @@ reverse proxy that terminates TLS for anything reachable over an
 untrusted network — not a hardened, internet-facing service as shipped.
 That's a real gap for a production deployment, not an oversight papered
 over: this is the minimal version of the pipeline, not the finished one.
+If you do put it behind a reverse proxy, pass `--trust-proxy` so the rate
+limiter and the `source_addr` recorded on every report use the real
+client IP (the last, proxy-authored hop of `X-Forwarded-For`) instead of
+the proxy's own address — off by default, since trusting that header
+from anything other than a proxy you control would let a client spoof
+both.
+
+**Fails closed, not silently.** An uncaught exception in a request
+handler (a real disk-full or locked-database error, not just a bad
+request) returns a clean `500`, not a dropped connection with no
+response — and a client disconnecting mid-response is handled quietly
+rather than logged as if it were a bug. `SIGTERM` (what `systemd stop`
+and most orchestrators send by default) triggers the same clean shutdown
+as Ctrl-C already did; previously only `SIGINT` was handled; and
+`SIGTERM`'s default disposition would have hard-killed the process with
+no Python cleanup at all.
 
 `server/test_server.sh` exercises the full server (report → review → ban
 → query → unban → query) with no root and no kernel module, and CI runs
