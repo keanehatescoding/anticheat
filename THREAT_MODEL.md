@@ -1,7 +1,7 @@
 # Threat model
 
 This is a single place stating the adversary this project defends against,
-what's explicitly out of scope, and what "production ready" does and
+what's explicitly out of scope, and what "production-ready" does and
 doesn't claim today. Every individual limitation named here is already
 documented inline where the relevant code lives (mostly in README's
 "Design notes & limitations" and the render-hook/LD_PRELOAD sections) —
@@ -10,21 +10,49 @@ new.
 
 ## Adversary
 
-The adversary this defends against is a **cheat author with ordinary
-user-level access to their own machine** — the same privilege level as
-any other process the player can run, not someone who already has root or
-kernel-level code execution. That's the realistic threat for a game
-anticheat: cheats run as the player's own unprivileged process (or
-occasionally as a userspace process the player elevated themselves, e.g.
-via `sudo`), not as a kernel module the player installed to attack their
-own game.
+Root shows up on both sides of this model, in two different roles that
+must not be conflated:
 
-Everything this project detects follows from that framing: syscall-table
-hooks, hidden kernel modules, ptrace attaches, RWX/anon-exec memory
-regions, runtime code patching, and render-API inline hooks are all things
-an unprivileged-to-moderately-privileged userspace (or a cheat that
-itself loads a *less* trusted kernel module) attacker can attempt against
-a protected process.
+- **Trusted root — the operator.** Loading `anticheat.ko`, running the
+  daemon, and calling its ioctls (`protect`, `lock`, `scan`, ...) all
+  require root/`CAP_SYS_ADMIN` themselves. That's assumed trusted
+  throughout this document — it's the prerequisite for running the tool
+  at all, the same way `sudo make install`/DKMS's Secure Boot signing
+  already assume the person running them is legitimate. Nothing here
+  defends against the machine's own administrator; if the operator is
+  the adversary, no client-side or kernel-side tool can help.
+- **The attacker — a cheat author with ordinary user-level access to
+  their own machine.** This is the realistic adversary the project
+  actually defends against: the same starting privilege as any other
+  process the player can run, not someone who already has kernel-level
+  code execution equal to or greater than `anticheat.ko`'s own. Most
+  detections here don't check the *caller's* privilege at all — the
+  ptrace kprobe, syscall-table integrity check, and memory scans all run
+  in-kernel regardless of who's asking — so an attacker who escalates to
+  root *userspace* privilege (e.g. via `sudo`) *after* `anticheat.ko` is
+  already loaded and protecting a process does not, by itself, defeat
+  those checks. Two capabilities are explicit exceptions to that,
+  already called out below: `SIGKILL`-ing the daemon outright, and
+  unloading the module if it isn't `lock`ed. Loading their own kernel
+  module is also within this model's actual detection surface — module
+  enumeration exists specifically to catch a cheat's own loaded module
+  running alongside `anticheat.ko` — but a cheat module capable of
+  operating at full, undetectable kernel privilege (a genuine rootkit,
+  not just a hidden LKM) crosses into the next case.
+
+**Out of scope: an attacker who already has kernel-privileged code
+execution** — via a sufficiently sophisticated kernel module of their
+own, an unrelated kernel exploit, or any other means. See "Explicitly
+out of scope" below. This is a fundamental limit, not a gap specific to
+this project: no purely in-kernel detector can defend against an
+adversary operating at its own privilege level or higher.
+
+Everything this project detects follows from the middle case above:
+syscall-table hooks, hidden kernel modules, ptrace attaches, RWX/anon-exec
+memory regions, runtime code patching, and render-API inline hooks are
+all things a user-level-to-root-userspace attacker can attempt against a
+protected process without yet having kernel-level code execution of
+their own.
 
 ## Trust boundaries
 
@@ -36,12 +64,18 @@ a protected process.
   otherwise an ordinary process.
 - **The protected process** — the thing being defended; untrusted from
   the module's point of view until proven otherwise by the checks above.
-- **`server/ac_server.py`** — a *separate* trust domain on a different
-  host. It receives reports from daemon instances it does not control and
-  treats every report as an **unverified claim**, never as ground truth
-  (see "Reports never auto-ban" in the README) — this is deliberate: the
-  daemon runs on the exact machine a cheat author controls, so a report
-  can be wrong, spoofed, or replayed.
+- **`server/ac_server.py`** — a separate trust domain regardless of where
+  it's physically deployed. The README documents it running on localhost,
+  on the LAN, or on a genuinely separate host as equally supported —
+  "separate trust domain" describes the *authorization* boundary (it
+  never trusts a report as ground truth, no matter who's asking), not a
+  requirement to run it on different hardware. It receives reports from
+  daemon instances it does not control and treats every report as an
+  **unverified claim**, never as ground truth (see "Reports never
+  auto-ban" in the README) — this is deliberate: the daemon runs on the
+  exact machine a cheat author controls, so a report can be wrong,
+  spoofed, or replayed, whether the server happens to be co-located on
+  that same machine or not.
 
 ## Explicitly out of scope
 
@@ -106,7 +140,7 @@ where the relevant code lives:
   enrollment via the firmware's "MOK Management" screen) — nothing here
   can or should auto-approve a new trusted key.
 
-## What "production ready" claims today
+## What "production-ready" claims today
 
 Everything above is a *design* boundary — accepted scope, not a bug to
 fix. Separately, there are engineering gates not yet closed that this
@@ -120,7 +154,7 @@ doc does **not** paper over:
   testing is functional (does the detection work), not adversarial
   (does the module survive malformed/racing input to its own interfaces).
 
-Until those close, "production ready" means: safe to run in the
+Until those close, "production-ready" means: safe to run in the
 deployment this project has actually been built and tested against (a
 machine you control, a server on localhost/LAN or behind the TLS reverse
 proxy documented in the README) — not yet a claim that this is safe to

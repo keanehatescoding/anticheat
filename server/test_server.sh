@@ -638,7 +638,12 @@ rm -f "$NOTP_DB" "$NOTP_DB-wal" "$NOTP_DB-shm" "/tmp/ac_server_notp_test_$$.log"
 # window and that tiers still stay separate (the old report key doesn't
 # work on admin endpoints, and vice versa).
 ROT_PORT=18808
-ROT_DB="/tmp/ac_server_rot_test_$$.db"
+# mktemp -d, not a $$-derived name directly under /tmp: a predictable
+# path there is pre-creatable/symlinkable by another local user ahead of
+# this test (CWE-377) -- same reasoning as TESTDIR up in the mock/live
+# test scripts elsewhere in this repo.
+ROT_TESTDIR="$(mktemp -d /tmp/ac_server_rot_test.XXXXXXXX)"
+ROT_DB="$ROT_TESTDIR/ac_server.db"
 ROT_REPORT_KEY="rot-report-new-$$"
 ROT_REPORT_KEY_OLD="rot-report-old-$$"
 ROT_ADMIN_KEY="rot-admin-new-$$"
@@ -648,7 +653,7 @@ AC_SERVER_REPORT_KEY="$ROT_REPORT_KEY" AC_SERVER_ADMIN_KEY="$ROT_ADMIN_KEY" \
     AC_SERVER_ADMIN_KEY_OLD="$ROT_ADMIN_KEY_OLD" \
     python3 ./ac_server.py --host 127.0.0.1 --port "$ROT_PORT" --db "$ROT_DB" \
     --rate-limit 500 --rate-window 60 \
-    >/tmp/ac_server_rot_test_$$.log 2>&1 &
+    >"$ROT_TESTDIR/server.log" 2>&1 &
 ROT_SERVER_PID=$!
 ROT_BASE="http://127.0.0.1:$ROT_PORT"
 ROT_CID="test-rot-$$"
@@ -703,7 +708,7 @@ fi
 kill "$ROT_SERVER_PID" 2>/dev/null
 wait "$ROT_SERVER_PID" 2>/dev/null
 ROT_SERVER_PID=""
-rm -f "$ROT_DB" "$ROT_DB-wal" "$ROT_DB-shm" "/tmp/ac_server_rot_test_$$.log"
+rm -rf "$ROT_TESTDIR"
 
 # Startup-failure paths: no server needed, just exit code + stderr.
 if AC_SERVER_REPORT_KEY='' AC_SERVER_ADMIN_KEY='' python3 ./ac_server.py \
@@ -734,14 +739,15 @@ rm -f "/tmp/ac_badrl_$$.log"
 # an -old key that overlaps the other tier's current key is just as much
 # a tier-separation break as report-key == admin-key -- must be rejected
 # at startup too, not just the non-rotation case.
+BADROT_TESTDIR="$(mktemp -d /tmp/ac_server_badrot_test.XXXXXXXX)"
 if AC_SERVER_REPORT_KEY=r AC_SERVER_ADMIN_KEY=a AC_SERVER_REPORT_KEY_OLD=a \
-    python3 ./ac_server.py --port 18809 --db "/tmp/ac_server_badrot_$$.db" \
-    >/tmp/ac_badrot_$$.log 2>&1; then
+    python3 ./ac_server.py --port 18809 --db "$BADROT_TESTDIR/ac_server.db" \
+    >"$BADROT_TESTDIR/server.log" 2>&1; then
     fail "server should refuse to start when an old report key equals the admin key"
 else
     pass "server refuses to start when an old report key equals the admin key"
 fi
-rm -f "/tmp/ac_badrot_$$.log"
+rm -rf "$BADROT_TESTDIR"
 
 echo
 if [ "$FAIL" -eq 0 ]; then

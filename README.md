@@ -484,7 +484,7 @@ put a reverse proxy in front for anything beyond localhost/LAN and pass
 reflect the real client rather than the proxy. A minimal Caddy config
 (automatic cert via Let's Encrypt):
 
-```
+```caddy
 ac.example.com {
     reverse_proxy 127.0.0.1:8787
 }
@@ -494,7 +494,7 @@ or nginx, terminating TLS and forwarding with `X-Forwarded-For` appended
 (the default behavior of `proxy_add_x_forwarded_for`, which `--trust-proxy`
 depends on — see `_client_ip()`'s handling of the header's *last* hop):
 
-```
+```nginx
 server {
     listen 443 ssl;
     server_name ac.example.com;
@@ -510,10 +510,16 @@ server {
 
 **Key rotation.** `--report-key`/`--admin-key` (and their `AC_SERVER_*`
 env-var equivalents) are static for the life of the process — there's no
-way to change them without a restart. For a restart with zero dropped
-requests, each tier also accepts one additional "-old" key
-(`--report-key-old`/`--admin-key-old`, or `AC_SERVER_REPORT_KEY_OLD`/
-`AC_SERVER_ADMIN_KEY_OLD`):
+way to change them without a restart. To avoid a hard cutover where every
+daemon and admin client must be updated in lockstep with the server, each
+tier also accepts one additional "-old" key (`--report-key-old`/
+`--admin-key-old`, or `AC_SERVER_REPORT_KEY_OLD`/`AC_SERVER_ADMIN_KEY_OLD`)
+during a rotation window. This is *not* zero-downtime in the connection
+sense: `ac_server.service` is a plain `Type=simple` unit with no socket
+activation, so `systemctl restart` still stops the listener before
+starting the replacement — a request arriving in that gap is refused or
+times out like any other brief service restart, same as restarting for
+any other reason. What the "-old" key avoids is a *coordinated* cutover:
 
 1. Restart with the *new* key as `--report-key`/`--admin-key` and the
    *current* (about-to-be-retired) key as `--report-key-old`/
@@ -529,13 +535,19 @@ server refuses to start if e.g. `--report-key-old` collides with
 **Backups.** The `bans` table is the one piece of state that actually
 matters operationally (`reports` is useful history but not
 authoritative). SQLite's own online backup handles this without stopping
-the server:
+the server, using the external `sqlite3` CLI (a separate package on most
+distros — it's not a Python dependency and isn't installed just because
+`ac_server.py` imports the stdlib `sqlite3` module):
 
 ```sh
+sudo install -d -m 0700 -o anticheat -g anticheat /var/lib/anticheat/backups
 sqlite3 /var/lib/anticheat/ac_server.db ".backup /var/lib/anticheat/backups/ac_server-$(date +%F).db"
 ```
 
-Run that from cron/a systemd timer; WAL mode (already enabled — see
+The backup directory must exist before the first run — `.backup` fails
+with "unable to open database file" if its parent directory is missing,
+it won't create one. Run the `sqlite3` line from cron/a systemd timer
+once the directory's in place; WAL mode (already enabled — see
 `Store._connect()`) means this doesn't block concurrent reads/writes
 while it runs.
 
@@ -666,7 +678,7 @@ To run the same userspace checks locally: `make ci`.
 ## Design notes & limitations
 
 See [`THREAT_MODEL.md`](THREAT_MODEL.md) for the adversary this defends
-against, what's explicitly out of scope, and what "production ready"
+against, what's explicitly out of scope, and what "production-ready"
 claims today — a single-place compilation of the per-feature limitations
 below plus the ones documented earlier in this file (render-hook blind
 spots, LD_PRELOAD/Vulkan-layer heuristics, the ban pipeline's no-auto-ban

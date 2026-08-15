@@ -539,11 +539,16 @@ def main():
 
     signal.signal(signal.SIGTERM, _handle_sigterm)
 
+    accepted_old_keys = []
+    if report_key_old:
+        accepted_old_keys.append("report-key-old")
+    if admin_key_old:
+        accepted_old_keys.append("admin-key-old")
     rotation_note = ""
-    if report_key_old or admin_key_old:
-        rotation_note = " (key rotation in progress: %s%s-old accepted)\n" % (
-            "report-key " if report_key_old else "",
-            "admin-key " if admin_key_old else "",
+    if accepted_old_keys:
+        rotation_note = (
+            " (key rotation in progress: %s accepted)\n"
+            % ", ".join(accepted_old_keys)
         )
     sys.stderr.write(
         "ac_server: listening on %s:%d, db=%s, rate limit %d req/%ds per IP "
