@@ -26,6 +26,7 @@ TERM_SERVER_PID=""
 TERM_KILLER_PID=""
 TP_SERVER_PID=""
 NOTP_SERVER_PID=""
+ROT_SERVER_PID=""
 # cleanup is invoked via trap below; shellcheck cannot always see that
 # shellcheck disable=SC2317,SC2329
 cleanup() {
@@ -38,12 +39,14 @@ cleanup() {
     [ -n "$TERM_KILLER_PID" ] && kill "$TERM_KILLER_PID" 2>/dev/null
     [ -n "$TP_SERVER_PID" ] && kill "$TP_SERVER_PID" 2>/dev/null
     [ -n "$NOTP_SERVER_PID" ] && kill "$NOTP_SERVER_PID" 2>/dev/null
+    [ -n "$ROT_SERVER_PID" ] && kill "$ROT_SERVER_PID" 2>/dev/null
     wait "$SERVER_PID" 2>/dev/null
     wait "$RL_SERVER_PID" 2>/dev/null
     wait "$TERM_SERVER_PID" 2>/dev/null
     wait "$TERM_KILLER_PID" 2>/dev/null
     wait "$TP_SERVER_PID" 2>/dev/null
     wait "$NOTP_SERVER_PID" 2>/dev/null
+    wait "$ROT_SERVER_PID" 2>/dev/null
     rm -f "$DB" "$DB-wal" "$DB-shm"
 }
 trap cleanup EXIT
@@ -630,6 +633,83 @@ kill "$NOTP_SERVER_PID" 2>/dev/null
 wait "$NOTP_SERVER_PID" 2>/dev/null
 rm -f "$NOTP_DB" "$NOTP_DB-wal" "$NOTP_DB-shm" "/tmp/ac_server_notp_test_$$.log"
 
+# Key rotation: a dedicated instance started with both a current and an
+# "-old" key per tier, proving both are accepted during the rotation
+# window and that tiers still stay separate (the old report key doesn't
+# work on admin endpoints, and vice versa).
+ROT_PORT=18808
+# mktemp -d, not a $$-derived name directly under /tmp: a predictable
+# path there is pre-creatable/symlinkable by another local user ahead of
+# this test (CWE-377) -- same reasoning as TESTDIR up in the mock/live
+# test scripts elsewhere in this repo.
+ROT_TESTDIR="$(mktemp -d /tmp/ac_server_rot_test.XXXXXXXX)"
+ROT_DB="$ROT_TESTDIR/ac_server.db"
+ROT_REPORT_KEY="rot-report-new-$$"
+ROT_REPORT_KEY_OLD="rot-report-old-$$"
+ROT_ADMIN_KEY="rot-admin-new-$$"
+ROT_ADMIN_KEY_OLD="rot-admin-old-$$"
+AC_SERVER_REPORT_KEY="$ROT_REPORT_KEY" AC_SERVER_ADMIN_KEY="$ROT_ADMIN_KEY" \
+    AC_SERVER_REPORT_KEY_OLD="$ROT_REPORT_KEY_OLD" \
+    AC_SERVER_ADMIN_KEY_OLD="$ROT_ADMIN_KEY_OLD" \
+    python3 ./ac_server.py --host 127.0.0.1 --port "$ROT_PORT" --db "$ROT_DB" \
+    --rate-limit 500 --rate-window 60 \
+    >"$ROT_TESTDIR/server.log" 2>&1 &
+ROT_SERVER_PID=$!
+ROT_BASE="http://127.0.0.1:$ROT_PORT"
+ROT_CID="test-rot-$$"
+
+ROT_READY=0
+for _ in $(seq 1 50); do
+    if curl -s "$ROT_BASE/banned/x" -H "Authorization: Bearer $ROT_ADMIN_KEY" 2>/dev/null \
+        | grep -q '"banned"'; then
+        ROT_READY=1
+        break
+    fi
+    sleep 0.1
+done
+
+if [ "$ROT_READY" -eq 1 ]; then
+    CODE=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$ROT_BASE/report" \
+        -H "Authorization: Bearer $ROT_REPORT_KEY" -H 'Content-Type: application/json' \
+        -d "{\"client_id\":\"$ROT_CID\",\"event_type\":\"X\",\"detail\":\"new-key\",\"ts\":1}")
+    if [ "$CODE" = "201" ]; then
+        pass "rotation: current report key still accepted -> 201"
+    else
+        fail "rotation: current report key should be 201 (got $CODE)"
+    fi
+
+    CODE=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$ROT_BASE/report" \
+        -H "Authorization: Bearer $ROT_REPORT_KEY_OLD" -H 'Content-Type: application/json' \
+        -d "{\"client_id\":\"$ROT_CID\",\"event_type\":\"X\",\"detail\":\"old-key\",\"ts\":1}")
+    if [ "$CODE" = "201" ]; then
+        pass "rotation: old report key accepted during rotation window -> 201"
+    else
+        fail "rotation: old report key should be 201 during rotation (got $CODE)"
+    fi
+
+    CODE=$(curl -s -o /dev/null -w '%{http_code}' "$ROT_BASE/banned/$ROT_CID" \
+        -H "Authorization: Bearer $ROT_ADMIN_KEY_OLD")
+    if [ "$CODE" = "200" ]; then
+        pass "rotation: old admin key accepted during rotation window -> 200"
+    else
+        fail "rotation: old admin key should be 200 during rotation (got $CODE)"
+    fi
+
+    CODE=$(curl -s -o /dev/null -w '%{http_code}' "$ROT_BASE/banned/$ROT_CID" \
+        -H "Authorization: Bearer $ROT_REPORT_KEY_OLD")
+    if [ "$CODE" = "401" ]; then
+        pass "rotation: old report key still rejected on admin endpoints -> 401"
+    else
+        fail "rotation: old report key on admin endpoint should be 401 (got $CODE)"
+    fi
+else
+    fail "key-rotation test server never became ready on port $ROT_PORT"
+fi
+kill "$ROT_SERVER_PID" 2>/dev/null
+wait "$ROT_SERVER_PID" 2>/dev/null
+ROT_SERVER_PID=""
+rm -rf "$ROT_TESTDIR"
+
 # Startup-failure paths: no server needed, just exit code + stderr.
 if AC_SERVER_REPORT_KEY='' AC_SERVER_ADMIN_KEY='' python3 ./ac_server.py \
     --port 18804 --db "/tmp/ac_server_nokeys_$$.db" >/tmp/ac_nokeys_$$.log 2>&1; then
@@ -655,6 +735,19 @@ else
     pass "server refuses to start with --rate-limit 0"
 fi
 rm -f "/tmp/ac_badrl_$$.log"
+
+# an -old key that overlaps the other tier's current key is just as much
+# a tier-separation break as report-key == admin-key -- must be rejected
+# at startup too, not just the non-rotation case.
+BADROT_TESTDIR="$(mktemp -d /tmp/ac_server_badrot_test.XXXXXXXX)"
+if AC_SERVER_REPORT_KEY=r AC_SERVER_ADMIN_KEY=a AC_SERVER_REPORT_KEY_OLD=a \
+    python3 ./ac_server.py --port 18809 --db "$BADROT_TESTDIR/ac_server.db" \
+    >"$BADROT_TESTDIR/server.log" 2>&1; then
+    fail "server should refuse to start when an old report key equals the admin key"
+else
+    pass "server refuses to start when an old report key equals the admin key"
+fi
+rm -rf "$BADROT_TESTDIR"
 
 echo
 if [ "$FAIL" -eq 0 ]; then

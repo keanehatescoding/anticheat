@@ -24,9 +24,12 @@ Two things this deliberately is NOT:
 Storage is a single SQLite file (zero extra services to run). Auth is two
 static bearer tokens: a report key (used by daemon instances, via
 AC_REPORT_KEY) and an admin key (used by whoever reviews/bans/queries).
-There is no built-in TLS -- run this behind a reverse proxy for anything
-reachable over an untrusted network, or keep it LAN/localhost-only, which
-is the deployment this was actually built and tested against.
+Each tier optionally accepts one additional "-old" key
+(AC_SERVER_REPORT_KEY_OLD / AC_SERVER_ADMIN_KEY_OLD) for a zero-downtime
+rotation window -- see --report-key-old/--admin-key-old below. There is no
+built-in TLS -- run this behind a reverse proxy for anything reachable
+over an untrusted network, or keep it LAN/localhost-only, which is the
+deployment this was actually built and tested against.
 """
 import argparse
 import hmac
@@ -197,7 +200,7 @@ class Store:
             conn.close()
 
 
-def make_handler(store, report_key, admin_key, rate_limiter, trust_proxy=False):
+def make_handler(store, report_keys, admin_keys, rate_limiter, trust_proxy=False):
     class Handler(http.server.BaseHTTPRequestHandler):
         server_version = "ac_server/1"
 
@@ -292,12 +295,17 @@ def make_handler(store, report_key, admin_key, rate_limiter, trust_proxy=False):
                 return None
             return auth[len("Bearer "):]
 
-        def _authed(self, expected):
+        def _authed(self, expected_keys):
             got = self._bearer()
+            if got is None:
+                return False
             # hmac.compare_digest is constant-time; a naive == here would
             # leak key-prefix-match timing to anyone who can hit this
-            # endpoint repeatedly.
-            return got is not None and hmac.compare_digest(got, expected)
+            # endpoint repeatedly. expected_keys is at most 2 (current +
+            # one still-valid-during-rotation previous key), so comparing
+            # against each candidate doesn't turn this into a meaningful
+            # timing side channel between candidates either.
+            return any(hmac.compare_digest(got, k) for k in expected_keys)
 
         def _read_json_body(self):
             try:
@@ -354,7 +362,7 @@ def make_handler(store, report_key, admin_key, rate_limiter, trust_proxy=False):
             self._send_json(404, {"error": "not found"})
 
         def _handle_report(self):
-            if not self._authed(report_key):
+            if not self._authed(report_keys):
                 return self._send_json(401, {"error": "unauthorized"})
             body = self._read_json_body()
             if not body:
@@ -377,7 +385,7 @@ def make_handler(store, report_key, admin_key, rate_limiter, trust_proxy=False):
             self._send_json(201, {"ok": True})
 
         def _handle_ban(self):
-            if not self._authed(admin_key):
+            if not self._authed(admin_keys):
                 return self._send_json(401, {"error": "unauthorized"})
             body = self._read_json_body()
             if not body:
@@ -392,7 +400,7 @@ def make_handler(store, report_key, admin_key, rate_limiter, trust_proxy=False):
             self._send_json(200, {"ok": True})
 
         def _handle_unban(self):
-            if not self._authed(admin_key):
+            if not self._authed(admin_keys):
                 return self._send_json(401, {"error": "unauthorized"})
             body = self._read_json_body()
             if not body:
@@ -404,14 +412,14 @@ def make_handler(store, report_key, admin_key, rate_limiter, trust_proxy=False):
             self._send_json(200, {"ok": True, "was_banned": existed})
 
         def _handle_banned(self, client_id):
-            if not self._authed(admin_key):
+            if not self._authed(admin_keys):
                 return self._send_json(401, {"error": "unauthorized"})
             if not self._valid_client_id(client_id):
                 return self._send_json(400, {"error": "invalid client_id"})
             self._send_json(200, store.ban_status(client_id))
 
         def _handle_reports(self, client_id):
-            if not self._authed(admin_key):
+            if not self._authed(admin_keys):
                 return self._send_json(401, {"error": "unauthorized"})
             if not self._valid_client_id(client_id):
                 return self._send_json(400, {"error": "invalid client_id"})
@@ -436,6 +444,22 @@ def main():
         default=None,
         help="bearer token for ban/unban/query endpoints "
         "(default: $AC_SERVER_ADMIN_KEY)",
+    )
+    ap.add_argument(
+        "--report-key-old",
+        default=None,
+        help="a previous report key still accepted alongside --report-key, "
+        "for a zero-downtime rotation window: start the server with both "
+        "the new --report-key and the old one here, roll every daemon "
+        "over to the new key, then restart once more without this flag "
+        "to finish the rotation (default: $AC_SERVER_REPORT_KEY_OLD)",
+    )
+    ap.add_argument(
+        "--admin-key-old",
+        default=None,
+        help="a previous admin key still accepted alongside --admin-key, "
+        "same rotation-window purpose as --report-key-old "
+        "(default: $AC_SERVER_ADMIN_KEY_OLD)",
     )
     ap.add_argument(
         "--rate-limit",
@@ -475,8 +499,23 @@ def main():
             "auth configured\n"
         )
         sys.exit(1)
-    if report_key == admin_key:
-        sys.stderr.write("ac_server: report-key and admin-key must differ\n")
+
+    report_key_old = args.report_key_old or os.environ.get("AC_SERVER_REPORT_KEY_OLD")
+    admin_key_old = args.admin_key_old or os.environ.get("AC_SERVER_ADMIN_KEY_OLD")
+    report_keys = frozenset({report_key} | ({report_key_old} if report_key_old else set()))
+    admin_keys = frozenset({admin_key} | ({admin_key_old} if admin_key_old else set()))
+
+    # Any key valid for one tier must not also be valid for the other --
+    # otherwise a daemon holding a report key (or an old one still in its
+    # rotation window) could authenticate to the admin-only ban/unban/query
+    # endpoints. This generalizes the original report_key == admin_key
+    # check to cover the old keys too.
+    if report_keys & admin_keys:
+        sys.stderr.write(
+            "ac_server: a report key and an admin key (current or "
+            "-old) are identical -- report and admin tiers must not "
+            "overlap\n"
+        )
         sys.exit(1)
 
     if args.rate_limit <= 0 or args.rate_window <= 0:
@@ -486,7 +525,7 @@ def main():
     store = Store(args.db)
     rate_limiter = RateLimiter(args.rate_limit, args.rate_window)
     handler = make_handler(
-        store, report_key, admin_key, rate_limiter, args.trust_proxy
+        store, report_keys, admin_keys, rate_limiter, args.trust_proxy
     )
     httpd = http.server.ThreadingHTTPServer((args.host, args.port), handler)
 
@@ -500,12 +539,25 @@ def main():
 
     signal.signal(signal.SIGTERM, _handle_sigterm)
 
+    accepted_old_keys = []
+    if report_key_old:
+        accepted_old_keys.append("report-key-old")
+    if admin_key_old:
+        accepted_old_keys.append("admin-key-old")
+    rotation_note = ""
+    if accepted_old_keys:
+        rotation_note = (
+            " (key rotation in progress: %s accepted)\n"
+            % ", ".join(accepted_old_keys)
+        )
     sys.stderr.write(
         "ac_server: listening on %s:%d, db=%s, rate limit %d req/%ds per IP "
         "(plain HTTP -- put a TLS reverse proxy in front for anything "
         "beyond localhost/LAN)\n"
         % (args.host, args.port, args.db, args.rate_limit, args.rate_window)
     )
+    if rotation_note:
+        sys.stderr.write("ac_server:%s" % rotation_note)
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:

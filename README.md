@@ -470,6 +470,87 @@ as Ctrl-C already did; previously only `SIGINT` was handled; and
 `SIGTERM`'s default disposition would have hard-killed the process with
 no Python cleanup at all.
 
+**Deployment (systemd).** `server/ac_server.service` is a ready-to-copy
+unit — dedicated non-root user, `Restart=on-failure`, and a handful of
+standard systemd sandboxing directives (`ProtectSystem=strict`,
+`NoNewPrivileges=true`, etc. — the process only ever touches its own DB
+file and the network). It relies on the `SIGTERM` handling above for a
+clean stop/restart, so no `KillSignal=` override is needed. See the
+comment block at the top of the file for the install steps.
+
+**TLS.** There's no TLS in `ac_server.py` itself (see "No TLS" above) —
+put a reverse proxy in front for anything beyond localhost/LAN and pass
+`--trust-proxy` so rate limiting and each report's recorded `source_addr`
+reflect the real client rather than the proxy. A minimal Caddy config
+(automatic cert via Let's Encrypt):
+
+```caddy
+ac.example.com {
+    reverse_proxy 127.0.0.1:8787
+}
+```
+
+or nginx, terminating TLS and forwarding with `X-Forwarded-For` appended
+(the default behavior of `proxy_add_x_forwarded_for`, which `--trust-proxy`
+depends on — see `_client_ip()`'s handling of the header's *last* hop):
+
+```nginx
+server {
+    listen 443 ssl;
+    server_name ac.example.com;
+    ssl_certificate     /etc/letsencrypt/live/ac.example.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/ac.example.com/privkey.pem;
+
+    location / {
+        proxy_pass http://127.0.0.1:8787;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    }
+}
+```
+
+**Key rotation.** `--report-key`/`--admin-key` (and their `AC_SERVER_*`
+env-var equivalents) are static for the life of the process — there's no
+way to change them without a restart. To avoid a hard cutover where every
+daemon and admin client must be updated in lockstep with the server, each
+tier also accepts one additional "-old" key (`--report-key-old`/
+`--admin-key-old`, or `AC_SERVER_REPORT_KEY_OLD`/`AC_SERVER_ADMIN_KEY_OLD`)
+during a rotation window. This is *not* zero-downtime in the connection
+sense: `ac_server.service` is a plain `Type=simple` unit with no socket
+activation, so `systemctl restart` still stops the listener before
+starting the replacement — a request arriving in that gap is refused or
+times out like any other brief service restart, same as restarting for
+any other reason. What the "-old" key avoids is a *coordinated* cutover:
+
+1. Restart with the *new* key as `--report-key`/`--admin-key` and the
+   *current* (about-to-be-retired) key as `--report-key-old`/
+   `--admin-key-old`. Both are accepted during this window.
+2. Roll every daemon (`AC_REPORT_KEY`) and admin client over to the new
+   key.
+3. Restart once more without the `-old` flags to finish the rotation.
+
+A key can never be valid for both tiers at once, `-old` included — the
+server refuses to start if e.g. `--report-key-old` collides with
+`--admin-key` (see the startup check next to `report_keys & admin_keys`).
+
+**Backups.** The `bans` table is the one piece of state that actually
+matters operationally (`reports` is useful history but not
+authoritative). SQLite's own online backup handles this without stopping
+the server, using the external `sqlite3` CLI (a separate package on most
+distros — it's not a Python dependency and isn't installed just because
+`ac_server.py` imports the stdlib `sqlite3` module):
+
+```sh
+sudo install -d -m 0700 -o anticheat -g anticheat /var/lib/anticheat/backups
+sqlite3 /var/lib/anticheat/ac_server.db ".backup /var/lib/anticheat/backups/ac_server-$(date +%F).db"
+```
+
+The backup directory must exist before the first run — `.backup` fails
+with "unable to open database file" if its parent directory is missing,
+it won't create one. Run the `sqlite3` line from cron/a systemd timer
+once the directory's in place; WAL mode (already enabled — see
+`Store._connect()`) means this doesn't block concurrent reads/writes
+while it runs.
+
 `server/test_server.sh` exercises the full server (report → review → ban
 → query → unban → query) with no root and no kernel module, and CI runs
 it on every push. `test.sh`'s baseline-tamper check additionally starts a
@@ -596,6 +677,13 @@ To run the same userspace checks locally: `make ci`.
 
 ## Design notes & limitations
 
+See [`THREAT_MODEL.md`](THREAT_MODEL.md) for the adversary this defends
+against, what's explicitly out of scope, and what "production-ready"
+claims today — a single-place compilation of the per-feature limitations
+below plus the ones documented earlier in this file (render-hook blind
+spots, LD_PRELOAD/Vulkan-layer heuristics, the ban pipeline's no-auto-ban
+design).
+
 - **Heuristic, not provably secure.** A determined rootkit with kernel
   privileges can defeat any in-band detector. This tool is defense-in-depth:
   it raises the cost and detects the *typical* hook points.
@@ -685,6 +773,7 @@ To run the same userspace checks locally: `make ci`.
 ```
 Makefile                 build (module + daemon + mock), install/uninstall
 README.md                this file
+THREAT_MODEL.md          adversary, explicit non-goals, production-readiness status
 .github/workflows/ci.yml CI: userspace build + mock suite, module smoke build
 test.sh                  end-to-end live test (root)
 diag.sh                  root diagnostics (dmesg, discovery, module walk)
@@ -703,6 +792,7 @@ src/anticheat_module.c   the kernel module
 src/anticheat_daemon.c   userspace daemon + CLI
 src/sha256.{c,h}         SHA-256 for integrity baselines
 server/ac_server.py      ban-pipeline server: report ingestion + ban lookup
+server/ac_server.service systemd unit for ac_server.py (see "Deployment" above)
 server/test_server.sh    server test suite (no root): `./server/test_server.sh`
 ```
 
