@@ -23,6 +23,7 @@ fail() { printf '  \033[1;31mFAIL\033[0m  %s\n' "$*"; FAIL=1; }
 SERVER_PID=""
 RL_SERVER_PID=""
 TERM_SERVER_PID=""
+TERM_KILLER_PID=""
 TP_SERVER_PID=""
 NOTP_SERVER_PID=""
 # cleanup is invoked via trap below; shellcheck cannot always see that
@@ -34,11 +35,13 @@ cleanup() {
     [ -n "$SERVER_PID" ] && kill "$SERVER_PID" 2>/dev/null
     [ -n "$RL_SERVER_PID" ] && kill "$RL_SERVER_PID" 2>/dev/null
     [ -n "$TERM_SERVER_PID" ] && kill "$TERM_SERVER_PID" 2>/dev/null
+    [ -n "$TERM_KILLER_PID" ] && kill "$TERM_KILLER_PID" 2>/dev/null
     [ -n "$TP_SERVER_PID" ] && kill "$TP_SERVER_PID" 2>/dev/null
     [ -n "$NOTP_SERVER_PID" ] && kill "$NOTP_SERVER_PID" 2>/dev/null
     wait "$SERVER_PID" 2>/dev/null
     wait "$RL_SERVER_PID" 2>/dev/null
     wait "$TERM_SERVER_PID" 2>/dev/null
+    wait "$TERM_KILLER_PID" 2>/dev/null
     wait "$TP_SERVER_PID" 2>/dev/null
     wait "$NOTP_SERVER_PID" 2>/dev/null
     rm -f "$DB" "$DB-wal" "$DB-shm"
@@ -433,6 +436,7 @@ if [ "$TERM_READY" -eq 1 ]; then
     fi
     kill "$TERM_KILLER_PID" 2>/dev/null
     wait "$TERM_KILLER_PID" 2>/dev/null
+    TERM_KILLER_PID=""
     if [ "$TERM_EXITED" -eq 1 ]; then
         pass "SIGTERM shuts the server down cleanly, no -9 needed"
     else
@@ -534,12 +538,16 @@ rm -f "$TP_DB" "$TP_DB-wal" "$TP_DB-shm" "/tmp/ac_server_tp_test_$$.log"
 # which would let a client evade rate limiting entirely.
 TPRL_PORT=18807
 TPRL_DB="/tmp/ac_server_tprl_test_$$.db"
-# Wider than the main rate-limit block's 3/2s: this test issues 4 real
-# HTTP round-trips (3 to consume the budget, 1 to assert it's exhausted)
-# sequentially, not just checked against a mock clock -- a slower/loaded
-# CI runner could plausibly let the window roll over mid-test with a
-# tighter margin, silently turning a real trip into a false pass.
-TPRL_LIMIT=5
+# Window wider than the main rate-limit block's 2s (this test issues
+# real HTTP round-trips sequentially, not against a mock clock -- a
+# slower/loaded CI runner could plausibly let a tight window roll over
+# mid-test, silently turning a real trip into a false pass), but the
+# limit itself stays low: fewer requests needed to exhaust the budget
+# means less cumulative request time consumed before the assertion
+# request, which is *more* margin against that same boundary risk, not
+# less -- widening both proportionally would have given back some of
+# the margin the wider window was meant to add.
+TPRL_LIMIT=3
 TPRL_WINDOW=5
 AC_SERVER_REPORT_KEY="$REPORT_KEY" AC_SERVER_ADMIN_KEY="$ADMIN_KEY" \
     python3 ./ac_server.py --host 127.0.0.1 --port "$TPRL_PORT" --db "$TPRL_DB" \
