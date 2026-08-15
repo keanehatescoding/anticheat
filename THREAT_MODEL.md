@@ -155,8 +155,14 @@ doc does **not** paper over:
   (does the module survive malformed/racing input to its own interfaces).
 
 Until those close, "production-ready" means: safe to run in the
-deployment this project has actually been built and tested against (a
-machine you control, a server on localhost/LAN or behind the TLS reverse
-proxy documented in the README) — not yet a claim that this is safe to
-distribute to end users' machines you don't control, or to expose to the
-open internet without the operator's own additional review.
+deployment this project has actually been built and tested against — a
+machine you control, with the server on localhost or on a trusted,
+isolated LAN, or behind the documented TLS reverse proxy for anything
+else. That LAN case is narrower than it sounds: `ac_server.service` runs
+`ac_server.py` with no TLS, so `Authorization: Bearer` keys go out in
+plaintext — fine on a network with no untrusted parties able to observe
+traffic, not fine on a LAN an attacker (or just another tenant) can
+sniff or sit on-path of, where the reverse proxy is required, not
+optional. None of this is yet a claim that this is safe to distribute to
+end users' machines you don't control, or to expose to the open internet
+without the operator's own additional review.

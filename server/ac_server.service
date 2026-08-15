@@ -11,7 +11,14 @@
 #   sudo install -d -m 0700 -o anticheat -g anticheat /var/lib/anticheat
 #   # 0700/0750, not world-readable: /var/lib/anticheat holds the SQLite
 #   # DB (bans + raw reports) and /etc/anticheat holds the auth keys.
-#   sudo install -m 640 -o root -g anticheat /dev/null /etc/anticheat/ac_server.env
+#   # -n: only create it the first time -- these are install/upgrade steps
+#   # meant to be re-run (e.g. after `git pull`), and unconditionally
+#   # installing /dev/null over an existing env file would silently wipe
+#   # out already-configured bearer keys on every re-run.
+#   sudo test -e /etc/anticheat/ac_server.env || \
+#       sudo install -m 640 -o root -g anticheat /dev/null /etc/anticheat/ac_server.env
+#   sudo chown root:anticheat /etc/anticheat/ac_server.env
+#   sudo chmod 640 /etc/anticheat/ac_server.env
 #   sudo $EDITOR /etc/anticheat/ac_server.env   # AC_SERVER_REPORT_KEY=...
 #                                                # AC_SERVER_ADMIN_KEY=...
 #   sudo install -D -m 0755 server/ac_server.py /opt/anticheat/server/ac_server.py
