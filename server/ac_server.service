@@ -1,0 +1,57 @@
+# systemd unit for the ban-pipeline server (server/ac_server.py).
+#
+# Install:
+#   sudo useradd --system --no-create-home --shell /usr/sbin/nologin anticheat
+#   sudo mkdir -p /etc/anticheat /var/lib/anticheat
+#   sudo install -m 640 -o root -g anticheat /dev/null /etc/anticheat/ac_server.env
+#   sudo $EDITOR /etc/anticheat/ac_server.env   # AC_SERVER_REPORT_KEY=...
+#                                                # AC_SERVER_ADMIN_KEY=...
+#   sudo chown anticheat:anticheat /var/lib/anticheat
+#   sudo cp server/ac_server.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now ac_server
+#
+# Key rotation: add AC_SERVER_REPORT_KEY_OLD / AC_SERVER_ADMIN_KEY_OLD to
+# the EnvironmentFile alongside the new AC_SERVER_REPORT_KEY /
+# AC_SERVER_ADMIN_KEY, `systemctl restart ac_server`, roll every daemon
+# and admin client over to the new keys, then remove the *_OLD lines and
+# restart once more -- see the README's "Key rotation" section.
+#
+# This binds to 127.0.0.1 by default (see ExecStart) -- pair with a TLS
+# reverse proxy (README's "TLS" section) for anything reachable beyond
+# localhost/LAN, and pass --trust-proxy there so rate limiting and the
+# source_addr recorded on reports reflect the real client, not the proxy.
+
+[Unit]
+Description=hypranticheat ban-pipeline server (ac_server.py)
+After=network.target
+
+[Service]
+Type=simple
+User=anticheat
+Group=anticheat
+EnvironmentFile=/etc/anticheat/ac_server.env
+ExecStart=/usr/bin/python3 /opt/anticheat/server/ac_server.py \
+    --host 127.0.0.1 --port 8787 --db /var/lib/anticheat/ac_server.db
+# ac_server.py already turns SIGTERM into a clean ThreadingHTTPServer
+# shutdown (see _handle_sigterm) -- this is systemd's default stop
+# signal, so no KillSignal= override is needed.
+Restart=on-failure
+RestartSec=2s
+
+# Sandboxing: this process only needs its own DB file and the network --
+# nothing else on the system.
+WorkingDirectory=/var/lib/anticheat
+ReadWritePaths=/var/lib/anticheat
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+NoNewPrivileges=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+LockPersonality=true
+
+[Install]
+WantedBy=multi-user.target
