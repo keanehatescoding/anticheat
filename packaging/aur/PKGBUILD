@@ -1,0 +1,61 @@
+# Maintainer: keanehatescoding
+#
+# Split package: the DKMS-built kernel module (hypranticheat-dkms) and
+# the userspace daemon/CLI (hypranticheat) are separate so either can be
+# reinstalled/rebuilt without touching the other -- the normal reason
+# kernel-module AUR packages split this way. See RELEASING.md in the
+# upstream repo for how pkgver here is kept in sync with dkms.conf's
+# PACKAGE_VERSION / MODULE_VERSION(...).
+pkgbase=hypranticheat
+pkgname=(hypranticheat hypranticheat-dkms)
+pkgver=1.0.0
+pkgrel=1
+pkgdesc="Kernel-mode anticheat: syscall/module integrity, ptrace denial, RWX/anon-exec detection"
+arch=('x86_64')
+url="https://github.com/keanehatescoding/hypranticheat"
+license=('GPL-2.0-only')
+makedepends=('git' 'dkms')
+source=("git+https://github.com/keanehatescoding/hypranticheat.git#tag=v${pkgver}")
+sha256sums=('SKIP')
+
+build() {
+    cd hypranticheat
+    # The Makefile's own CFLAGS default (-O2 -Wall -Wextra) has no
+    # hardening flags of its own; makepkg's environment already carries
+    # them (see /etc/makepkg.conf), so pass both through explicitly
+    # rather than relying on the Makefile default -- otherwise RELRO/PIE
+    # flags silently never reach the linker.
+    make CFLAGS="${CFLAGS}" LDFLAGS="${LDFLAGS}" daemon
+}
+
+package_hypranticheat() {
+    pkgdesc="Userspace daemon and CLI for a kernel-mode anticheat -- pairs with the companion DKMS package for the kernel module"
+    depends=('glibc')
+    optdepends=('hypranticheat-dkms: kernel-level detection -- required for real use; the daemon alone can only run against its userspace mock')
+
+    cd hypranticheat
+    install -Dm755 anticheat "$pkgdir/usr/bin/anticheat"
+    install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
+    install -Dm644 THREAT_MODEL.md "$pkgdir/usr/share/doc/$pkgname/THREAT_MODEL.md"
+    install -Dm644 TROUBLESHOOTING.md "$pkgdir/usr/share/doc/$pkgname/TROUBLESHOOTING.md"
+    install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+    # Owned by root here -- the daemon itself creates/chmods per-file
+    # baselines under this at runtime as root; nothing needs write access
+    # to the directory itself except the daemon, which already runs as
+    # root (see README's "Load / use").
+    install -dm755 "$pkgdir/var/lib/anticheat/baselines"
+}
+
+package_hypranticheat-dkms() {
+    pkgdesc="Kernel module (DKMS) for a kernel-mode anticheat: syscall/module integrity, ptrace denial, RWX/anon-exec detection"
+    depends=('dkms')
+    provides=('anticheat-dkms')
+    install=hypranticheat-dkms.install
+
+    cd hypranticheat
+    local _dkmsdir="$pkgdir/usr/src/anticheat-${pkgver}"
+    install -Dm644 Makefile "$_dkmsdir/Makefile"
+    install -Dm644 dkms.conf "$_dkmsdir/dkms.conf"
+    cp -a src "$_dkmsdir/"
+    install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}

@@ -1,0 +1,22 @@
+pkgbase = hypranticheat
+	pkgdesc = Kernel-mode anticheat: syscall/module integrity, ptrace denial, RWX/anon-exec detection
+	pkgver = 1.0.0
+	pkgrel = 1
+	url = https://github.com/keanehatescoding/hypranticheat
+	arch = x86_64
+	license = GPL-2.0-only
+	makedepends = git
+	makedepends = dkms
+	source = git+https://github.com/keanehatescoding/hypranticheat.git#tag=v1.0.0
+	sha256sums = SKIP
+
+pkgname = hypranticheat
+	pkgdesc = Userspace daemon and CLI for a kernel-mode anticheat -- pairs with the companion DKMS package for the kernel module
+	depends = glibc
+	optdepends = hypranticheat-dkms: kernel-level detection -- required for real use; the daemon alone can only run against its userspace mock
+
+pkgname = hypranticheat-dkms
+	pkgdesc = Kernel module (DKMS) for a kernel-mode anticheat: syscall/module integrity, ptrace denial, RWX/anon-exec detection
+	install = hypranticheat-dkms.install
+	depends = dkms
+	provides = anticheat-dkms

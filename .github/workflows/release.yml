@@ -1,0 +1,129 @@
+name: Release
+
+# Runs only on a version tag push (see RELEASING.md) -- this is
+# deliberately separate from ci.yml, which runs on every push/PR and
+# produces ephemeral build artifacts. This workflow's whole point is to
+# turn one specific, versioned commit into permanent, attached Release
+# assets instead.
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  # Fail fast if the tag doesn't match the version this commit actually
+  # declares -- catches "forgot to bump dkms.conf/MODULE_VERSION before
+  # tagging" (RELEASING.md step 2) before spending CI time on a release
+  # that would ship the wrong version string.
+  check-version:
+    name: tag matches declared version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Compare tag to dkms.conf / MODULE_VERSION
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          PKG_VER="$(awk -F'"' '/^PACKAGE_VERSION=/{print $2}' dkms.conf)"
+          MOD_VER="$(grep -oP 'MODULE_VERSION\("\K[^"]+' src/anticheat_module.c)"
+          echo "tag=$TAG dkms.conf=$PKG_VER MODULE_VERSION=$MOD_VER"
+          if [ "$TAG" != "$PKG_VER" ] || [ "$TAG" != "$MOD_VER" ]; then
+            echo "::error::version mismatch -- tag v$TAG, dkms.conf PACKAGE_VERSION=$PKG_VER, MODULE_VERSION(...)=$MOD_VER. Bump both to match before tagging (see RELEASING.md)." >&2
+            exit 1
+          fi
+
+  # Same build ci.yml's userspace job already does; kept minimal here
+  # since the release's only job is to produce the artifact, not
+  # re-run the mock suite (that already gated this commit's merge).
+  build-daemon:
+    name: build userspace daemon
+    needs: check-version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Build with warnings-as-errors
+        run: make CFLAGS="-O2 -Wall -Wextra -Werror" daemon
+      - uses: actions/upload-artifact@v7
+        with:
+          name: release-daemon
+          path: anticheat
+          if-no-files-found: error
+
+  # Same linux-6.12-headers compile-smoke-test build ci.yml's module job
+  # already does on every push -- see that job's own comments for why
+  # each step is there (MODULE_SIG_SHA256 vs. olddefconfig, the
+  # synthesized Module.symvers workaround). Kept in sync with ci.yml by
+  # hand rather than factored into a shared reusable workflow, since
+  # ci.yml's module job also runs a DKMS+signing smoke test this release
+  # build doesn't need (that's already verified by the time a commit is
+  # tag-worthy) -- duplicating the small compile-only subset is more
+  # legible than threading conditionals through the shared one.
+  build-module:
+    name: kernel module build (linux-6.12 headers)
+    needs: check-version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq bc flex bison libelf-dev libssl-dev dwarves
+
+      - name: Fetch and prepare kernel headers (6.12 LTS, x86_64)
+        run: |
+          curl -fsSL https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.12.tar.xz | tar -xJ
+          make -C linux-6.12 ARCH=x86_64 defconfig
+          ./linux-6.12/scripts/config --file linux-6.12/.config \
+            --enable MODULE_SIG \
+            --enable MODULE_SIG_SHA256
+          make -C linux-6.12 ARCH=x86_64 olddefconfig
+          grep -qx 'CONFIG_MODULE_SIG_SHA256=y' linux-6.12/.config
+          grep -qx 'CONFIG_MODULE_SIG_HASH="sha256"' linux-6.12/.config
+          make -C linux-6.12 ARCH=x86_64 scripts
+          make -C linux-6.12 ARCH=x86_64 modules_prepare
+
+      - name: Build the LKM
+        run: |
+          make KDIR="$PWD/linux-6.12" module 2>&1 | tail -3 || true
+          nm -u src/anticheat_module.o | awk '{print $2}' | sort -u | \
+            awk '{printf "0x00000000\t%s\tvmlinux\tEXPORT_SYMBOL\t\n", $1}' \
+            > "$PWD/ksymvers"
+          make KDIR="$PWD/linux-6.12" KBUILD_EXTRA_SYMBOLS="$PWD/ksymvers" module
+          test -s anticheat.ko
+          modinfo ./anticheat.ko | head -6
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: release-module-ko
+          path: anticheat.ko
+          if-no-files-found: error
+
+  release:
+    name: publish GitHub Release
+    needs: [build-daemon, build-module]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v7
+        with:
+          path: dist
+
+      - name: Name assets after the tag + kernel floor
+        run: |
+          mkdir -p release
+          cp "dist/release-daemon/anticheat" "release/anticheat-${GITHUB_REF_NAME}-x86_64"
+          cp "dist/release-module-ko/anticheat.ko" "release/anticheat-${GITHUB_REF_NAME}-linux6.12.ko"
+
+      - name: Create the release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release/*
+          generate_release_notes: true
+          body: |
+            Compile-smoke-tested against linux-6.12 headers (this
+            project's stated kernel floor) -- not a substitute for
+            real load-time testing on your own running kernel. See
+            `TROUBLESHOOTING.md` if `insmod` fails and `RELEASING.md`
+            for how these assets were built.
