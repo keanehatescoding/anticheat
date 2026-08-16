@@ -560,6 +560,12 @@ just that each compiles.
 
 ## Build
 
+**x86-64 only.** The kernel module hooks `__x64_sys_*`/`__ia32_sys_*` kprobe
+symbols specifically, CI only builds/tests against `ARCH=x86_64` kernel trees,
+and nothing here has been ported or tested on ARM64 or any other
+architecture. This is a stated scope boundary, not an oversight yet to be
+noticed as a bug report — porting is unscoped work (see `THREAT_MODEL.md`).
+
 Requires a C compiler for the userspace daemon. The kernel module additionally
 needs kernel headers for a kernel **>= 6.12** (it uses `sized_strscpy`, the
 `_noprof` allocators, `for_class_mod_mem_type`, and maple-tree VMA iteration);
@@ -655,6 +661,11 @@ sudo ./test.sh
 This loads the module, protects a victim `sleep` process, verifies fork
 inheritance, attempts a `strace -p` attach (must be denied), runs scans and
 baselines, and verifies lock/unlock semantics.
+
+If a live test (or normal use) ever ends in a crash or hang instead of a
+clean result, see `TROUBLESHOOTING.md` for how to recognize it, keep the
+module from loading again, and collect enough information to file a
+useful bug report.
 
 ## Continuous integration
 
@@ -774,6 +785,7 @@ design).
 Makefile                 build (module + daemon + mock), install/uninstall
 README.md                this file
 THREAT_MODEL.md          adversary, explicit non-goals, production-readiness status
+TROUBLESHOOTING.md       crash/panic recovery, blacklisting, filing a bug report
 .github/workflows/ci.yml CI: userspace build + mock suite, module smoke build
 test.sh                  end-to-end live test (root)
 diag.sh                  root diagnostics (dmesg, discovery, module walk)
