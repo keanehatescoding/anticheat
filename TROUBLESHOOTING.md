@@ -22,8 +22,15 @@ nothing from before the crash — you need either `journalctl -b -1`
 (persistent journal, if `Storage=persistent` in journald's config) or a
 real crash dump (see below).
 
-If the oops/panic backtrace mentions any of these, the module's kprobes
-are implicated (all `pr_fmt`-prefixed, all in `src/anticheat_module.c`):
+These two are different claims — keep them separate:
+
+**Module implicated** (this module is involved *somewhere*, not
+necessarily its kprobes specifically): any frame in `anticheat_module.c`
+at all, or `anticheat` in the "Tainted:" line's loaded-module list right
+before the backtrace.
+
+**A kprobe path specifically implicated** (all `pr_fmt`-prefixed, all in
+`src/anticheat_module.c`):
 
 - `ac_ptrace_pre` — the `__x64_sys_ptrace`/`__ia32_sys_ptrace` kprobe
 - `ac_exit_pre` — the `do_exit` kprobe
@@ -32,9 +39,8 @@ are implicated (all `pr_fmt`-prefixed, all in `src/anticheat_module.c`):
 - `ac_kill_worker` — the deferred `SIGKILL` of a ptrace offender, running
   in the `anticheat` workqueue rather than kprobe context (the only thing
   that workqueue is used for — everything else, including the VMA scan,
-  runs synchronously in ioctl context, not deferred)
-- any frame in `anticheat_module.c` at all, or `anticheat` in the
-  "Tainted:" line's loaded-module list right before the backtrace
+  runs synchronously in ioctl context, not deferred, so a VMA-scan crash
+  would show up as "module implicated" above, not one of these names)
 
 ## Immediate steps
 
@@ -55,27 +61,43 @@ are implicated (all `pr_fmt`-prefixed, all in `src/anticheat_module.c`):
 
 ## Keeping it from loading again
 
-**If installed via `make install` or `install-deck`:** don't run
-`insmod`/`modprobe anticheat` again until you understand the cause.
-There's no service that auto-loads it — you (or a script you wrote) are
-the only thing that inserts it, so simply not doing that is sufficient.
+Nothing in this project auto-*loads* the module on boot, DKMS included —
+worth being precise about, since it's easy to assume otherwise.
+`AUTOINSTALL="yes"` in `dkms.conf` only makes DKMS automatically
+*rebuild and install* `anticheat.ko` for each newly-installed kernel (via
+the distro's `/etc/kernel/postinst.d/dkms` hook); it does not `modprobe`
+or otherwise load the freshly-built module. `scripts/dkms-install.sh`
+says so explicitly at the end of a fresh install: `load it with: sudo
+modprobe anticheat` — that step is manual today, on every install and
+every subsequent kernel upgrade alike.
 
-**If installed via DKMS** (`scripts/dkms-install.sh`), DKMS's
-kernel-postinst hook `modprobe`s it automatically on every subsequent
-kernel install/boot per its `AUTOINSTALL="yes"` setting in `dkms.conf`.
-To stop that without uninstalling the DKMS registration entirely:
+So in the state this project ships in:
 
-```sh
-echo "blacklist anticheat" | sudo tee /etc/modprobe.d/blacklist-anticheat.conf
-sudo depmod -a
-```
+- **If you never load it again, it never runs again.** Whatever
+  `insmod`/`modprobe` invocation loaded it the first time (by hand, or
+  from a script/cron job you set up yourself) is the only thing that can
+  load it again — check for exactly that, since this project provides no
+  such mechanism on its own (no `/etc/modules-load.d/` entry, no
+  `systemd` unit for the module itself, no `modprobe_on_install` in
+  DKMS's `framework.conf`).
+- **Blacklist it anyway, as a hard stop against forgetting:**
 
-A blacklist entry only stops *automatic* loading via `modprobe`
-(including DKMS's own hook, which itself shells out to `modprobe`); it
-has no effect on someone manually running `insmod ./anticheat.ko`
-directly, since that bypasses `modprobe`/`depmod` entirely. To fully
-remove it: `sudo dkms remove -m anticheat -v 1.0.0 --all` (see
-`dkms.conf`'s `PACKAGE_VERSION`).
+  ```sh
+  echo "blacklist anticheat" | sudo tee /etc/modprobe.d/blacklist-anticheat.conf
+  sudo depmod -a
+  ```
+
+  This makes any future `modprobe anticheat` — yours, a script's, or a
+  future reintroduction of an autoload mechanism — fail loudly instead
+  of silently succeeding. It has no effect on `insmod ./anticheat.ko`
+  run directly, since that bypasses `modprobe`/`depmod` entirely; the
+  blacklist is a safety net for the loading path this project's own
+  instructions actually tell you to use, not a guarantee against every
+  possible way to load a `.ko`.
+- **To remove the DKMS registration entirely** (if installed via
+  `scripts/dkms-install.sh`): `sudo dkms remove -m anticheat -v 1.0.0
+  --all` (see `dkms.conf`'s `PACKAGE_VERSION`). This stops future
+  rebuild-on-kernel-upgrade too, not just loading.
 
 ## Getting a real crash dump
 
@@ -89,7 +111,7 @@ to be worth debugging properly, set up `kdump` (Debian/Ubuntu:
 made it to disk.
 
 If EFI pstore is available (`/sys/fs/pstore` populated after a panic on
-most UEFI systems with `CONFIG_PSTORE`/`CONFIG_EFI_VARS` enabled) and
+most UEFI systems with `CONFIG_PSTORE`/`CONFIG_EFI_VARS_PSTORE` enabled) and
 kdump isn't set up, check there first — it's a much lower bar than
 configuring kdump and often has at least the panic backtrace:
 
