@@ -405,9 +405,12 @@ surface for no security benefit:
   presence bit is set) give a 12-character vendor ID string identifying
   which one — `KVMKVMKVM\0\0\0`, `VMwareVMware`, `VBoxVBoxVBox`,
   `Microsoft Hv`, `XenVMMXenVMM`, `TCGTCGTCGTCG` (QEMU's own software CPU
-  emulation, distinct from KVM-accelerated QEMU), `prl hyperv  `
-  (Parallels), `bhyve bhyve `. `__cpuid()` is used rather than the
-  leaf-range-checked `__get_cpuid()` deliberately — leaf `0x40000000` is
+  emulation, distinct from KVM-accelerated QEMU), `prl hyperv␠␠`
+  (Parallels), `bhyve bhyve␠` (where `␠` denotes an ASCII space — spaces
+  are part of these vendor ID strings, but literal trailing spaces
+  inside a code span are stripped/ambiguous in Markdown rendering).
+  `__cpuid()` is used rather than the leaf-range-checked
+  `__get_cpuid()` deliberately — leaf `0x40000000` is
   a hypervisor-reserved leaf, not a standard one, and the checked
   function would refuse to read past whatever leaf 0 reports as the max
   standard leaf.
