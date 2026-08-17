@@ -4,7 +4,8 @@
 #
 # Exercises every command and code path without a kernel module or root:
 #   status, protect/list/unprotect, scan (+hash baselines), syscalls
-#   (clean AND compromised), modules (hidden module detection), events,
+#   (clean AND compromised), modules (hidden module detection), vmcheck
+#   (CPUID/DMI, needs no mock -- see its own section below), events,
 #   lock/unlock, and the monitoring daemon (incl. graceful SIGTERM exit).
 #
 # Build:  make test-mock
@@ -84,6 +85,18 @@ echo "== hidden module detection =="
 expect_rc  "modules -> rc 2 (hidden)" 2 ./anticheat modules
 expect_out "modules: hidden count"     "hidden modules: 1" ./anticheat modules
 expect_out "modules: hidden name"      "hidden_rootkit" ./anticheat modules
+
+echo "== vmcheck =="
+# Pure userspace CPUID/DMI reads -- doesn't touch /dev/anticheat at all,
+# so this needs no mock and its outcome (hypervisor detected or not)
+# genuinely depends on whatever machine runs this test. Assert structure
+# (exits 0, prints the expected header) rather than a specific outcome,
+# which would be wrong on a bare-metal dev machine and right in CI (a
+# virtualized GitHub Actions runner) or vice versa.
+expect_rc  "vmcheck"                  0 ./anticheat vmcheck
+expect_out "vmcheck header"            "VM/hypervisor check:" ./anticheat vmcheck
+expect_out "vmcheck CPUID line"        "CPUID hypervisor bit" ./anticheat vmcheck
+expect_out "vmcheck DMI line"          "DMI/SMBIOS strings"   ./anticheat vmcheck
 
 echo "== events =="
 expect_out "events: ptrace denied"     "PTRACE-DENIED"  env AC_MOCK_ATTACK=1 ./anticheat events
