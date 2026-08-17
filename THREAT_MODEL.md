@@ -120,6 +120,14 @@ where the relevant code lives:
 - **Report authenticity.** The server never auto-bans on a report alone —
   a report is one client's unverified claim about itself, reviewed by a
   human before any ban.
+- **A hypervisor deliberately configured to hide itself.** `vmcheck`'s
+  CPUID hypervisor-present bit and DMI/SMBIOS strings are both attacker-
+  controllable at the hypervisor-configuration level (VMware's
+  `hypervisor.cpuid.v0 = FALSE`, VirtualBox's equivalent, KVM/QEMU CPUID
+  masking, QEMU's `-smbios` flag) — an attacker who controls the VM
+  configuration itself, not just the guest OS, can suppress both
+  signatures. Fundamental to the technique, not something more detection
+  logic closes.
 
 ## Operating assumptions
 

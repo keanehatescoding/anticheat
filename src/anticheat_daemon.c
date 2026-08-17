@@ -28,6 +28,7 @@
  *   scan --pid N --check-implicit-layers   implicit Vulkan-layer manifest check (heuristic)
  *   syscalls               verify syscall table integrity
  *   modules                list modules + detect hidden modules
+ *   vmcheck                VM/hypervisor detection (heuristic, CPUID + DMI)
  *   events [--watch]       dump pending security events (--watch: poll)
  *   lock | unlock          pin / unpin the kernel module
  *   start [--foreground]   monitoring daemon (poll events + periodic checks)
@@ -49,6 +50,7 @@
 #include <time.h>
 #include <dirent.h>
 #include <ctype.h>
+#include <cpuid.h>
 #include <elf.h>
 #include <netdb.h>
 #include <poll.h>
@@ -1234,6 +1236,186 @@ static int cmd_modules(void)
     if (hidden < 0)
         return 1;
     return hidden ? 2 : 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* command: vmcheck                                                    */
+/* ------------------------------------------------------------------ */
+/* Two independent, purely-userspace signals that the OS itself (not any
+ * specific process) is running inside a virtual machine. Neither needs
+ * the kernel module or any elevated privilege: CPUID and
+ * /sys/class/dmi/id/ files both already return the real, authoritative
+ * hardware/firmware answer to any process on the machine, so routing
+ * this through anticheat_module.c would add ioctl surface for no
+ * security benefit -- same reasoning as the LD_PRELOAD/Vulkan-layer
+ * checks above, which are also pure userspace reads.
+ *
+ * Heuristic like those checks too: running in a VM is completely normal
+ * for plenty of legitimate reasons (cloud gaming, CI, testing,
+ * GPU-passthrough streaming rigs), so this is never wired into the ban
+ * pipeline -- see cmd_start()'s call site, which logs at
+ * LOG_WARNING/LOG_INFO, never LOG_ALERT/LOG_CRIT.
+ *
+ * Known, unavoidable limitation: a hypervisor can be explicitly
+ * configured to hide the CPUID leaf below (VMware's
+ * "hypervisor.cpuid.v0 = FALSE", VirtualBox's equivalent, KVM/QEMU CPUID
+ * masking) and to override the DMI strings below (QEMU's -smbios flag).
+ * That defeats both checks here -- a property of the technique itself,
+ * not a bug to fix (see THREAT_MODEL.md's "Explicitly out of scope").
+ */
+
+/* CPUID leaf 1, ECX bit 31: the standard "running under a hypervisor"
+ * signal essentially every hypervisor sets by default. __cpuid() (not
+ * the leaf-range-checked __get_cpuid()) is used deliberately -- leaf
+ * 0x40000000 below is a hypervisor-reserved leaf, not a standard one,
+ * and __get_cpuid() would refuse to read past whatever leaf 0 reports
+ * as the max standard leaf. Returns 1 if the bit is set (and fills
+ * vendor_out with the 12-char vendor ID string from leaf 0x40000000,
+ * only architecturally defined once the presence bit is set), 0
+ * otherwise. x86-64 only, matching this project's stated scope. */
+static int detect_hypervisor_cpuid(char *vendor_out, size_t outsz)
+{
+    unsigned int eax, ebx, ecx, edx;
+
+    if (vendor_out && outsz)
+        vendor_out[0] = '\0';
+
+    __cpuid(1, eax, ebx, ecx, edx);
+    if (!(ecx & (1u << 31)))
+        return 0;
+
+    /* "KVMKVMKVM\0\0\0", "VMwareVMware", "VBoxVBoxVBox", "Microsoft Hv",
+     * "XenVMMXenVMM", "TCGTCGTCGTCG" (QEMU's own software CPU
+     * emulation, distinct from KVM-accelerated QEMU), "prl hyperv  "
+     * (Parallels), "bhyve bhyve " are the known real-world values. */
+    if (vendor_out && outsz >= 13) {
+        __cpuid(0x40000000, eax, ebx, ecx, edx);
+        memcpy(vendor_out + 0, &ebx, 4);
+        memcpy(vendor_out + 4, &ecx, 4);
+        memcpy(vendor_out + 8, &edx, 4);
+        vendor_out[12] = '\0';
+    }
+    return 1;
+}
+
+static int read_dmi_field(const char *name, char *out, size_t outsz)
+{
+    char path[64];
+    FILE *f;
+    size_t n;
+
+    out[0] = '\0';
+    snprintf(path, sizeof(path), "/sys/class/dmi/id/%s", name);
+    f = fopen(path, "r");
+    if (!f)
+        return -1;
+    if (!fgets(out, (int)outsz, f)) {
+        fclose(f);
+        return -1;
+    }
+    fclose(f);
+    n = strlen(out);
+    while (n > 0 && (out[n - 1] == '\n' || out[n - 1] == '\r'))
+        out[--n] = '\0';
+    return 0;
+}
+
+/* Corroborating signal, not authoritative on its own: catches a
+ * hypervisor that masks the CPUID leaf above but leaves default
+ * BIOS/DMI strings in place. sys_vendor/product_name/board_vendor are
+ * typically world-readable (unlike product_uuid/serial_number, which
+ * are root-only and deliberately not read here -- nothing here needs
+ * them); a permission or read failure just leaves that field empty
+ * rather than failing the whole check. "Microsoft Corporation" is
+ * matched only in combination with product_name containing "Virtual
+ * Machine" (Hyper-V's actual value), not on sys_vendor alone -- real
+ * Microsoft Surface hardware also reports sys_vendor=Microsoft
+ * Corporation and would otherwise be a false positive. Returns 1 (and
+ * fills `out` with which vendor/field matched) if any known VM
+ * signature is found, 0 otherwise. */
+static int detect_hypervisor_dmi(char *out, size_t outsz)
+{
+    char sys_vendor[128];
+    char product_name[128];
+    char board_vendor[128];
+
+    read_dmi_field("sys_vendor", sys_vendor, sizeof(sys_vendor));
+    read_dmi_field("product_name", product_name, sizeof(product_name));
+    read_dmi_field("board_vendor", board_vendor, sizeof(board_vendor));
+
+    if (out && outsz)
+        out[0] = '\0';
+
+    if (strstr(sys_vendor, "QEMU") || strstr(product_name, "QEMU")) {
+        snprintf(out, outsz, "QEMU (sys_vendor=\"%s\")", sys_vendor);
+        return 1;
+    }
+    if (strstr(sys_vendor, "VMware")) {
+        snprintf(out, outsz, "VMware (sys_vendor=\"%s\")", sys_vendor);
+        return 1;
+    }
+    if (strstr(sys_vendor, "innotek GmbH") || strstr(product_name, "VirtualBox")) {
+        snprintf(out, outsz, "VirtualBox (sys_vendor=\"%s\")", sys_vendor);
+        return 1;
+    }
+    if (strcmp(sys_vendor, "Microsoft Corporation") == 0 &&
+        strstr(product_name, "Virtual Machine")) {
+        snprintf(out, outsz, "Hyper-V (product_name=\"%s\")", product_name);
+        return 1;
+    }
+    if (strstr(sys_vendor, "Xen")) {
+        snprintf(out, outsz, "Xen (sys_vendor=\"%s\")", sys_vendor);
+        return 1;
+    }
+    if (strstr(sys_vendor, "Parallels")) {
+        snprintf(out, outsz, "Parallels (sys_vendor=\"%s\")", sys_vendor);
+        return 1;
+    }
+    if (strstr(sys_vendor, "Google")) {
+        snprintf(out, outsz, "Google Compute Engine (sys_vendor=\"%s\")", sys_vendor);
+        return 1;
+    }
+    if (strstr(sys_vendor, "Amazon EC2") || strstr(board_vendor, "Amazon EC2")) {
+        snprintf(out, outsz, "Amazon EC2 (sys_vendor=\"%s\")", sys_vendor);
+        return 1;
+    }
+    if (strstr(product_name, "Bochs")) {
+        snprintf(out, outsz, "Bochs (product_name=\"%s\")", product_name);
+        return 1;
+    }
+    return 0;
+}
+
+static int cmd_vmcheck(void)
+{
+    char cpuid_vendor[16];
+    char dmi_desc[192];
+    int cpuid_hit, dmi_hit;
+
+    cpuid_hit = detect_hypervisor_cpuid(cpuid_vendor, sizeof(cpuid_vendor));
+    dmi_hit = detect_hypervisor_dmi(dmi_desc, sizeof(dmi_desc));
+
+    printf("VM/hypervisor check:\n");
+    if (cpuid_hit)
+        printf("  CPUID hypervisor bit : present (vendor id: %s)\n", cpuid_vendor);
+    else
+        printf("  CPUID hypervisor bit : not present\n");
+    if (dmi_hit)
+        printf("  DMI/SMBIOS strings   : %s\n", dmi_desc);
+    else
+        printf("  DMI/SMBIOS strings   : no known VM vendor string found\n");
+
+    if (cpuid_hit || dmi_hit) {
+        printf("  result               : running inside a virtual machine\n"
+               "    (informational only -- common for entirely legitimate\n"
+               "     reasons: cloud gaming, CI, testing, GPU-passthrough\n"
+               "     streaming rigs. Not a verdict -- and not something a\n"
+               "     hypervisor configured to hide these signatures would\n"
+               "     even show here. See THREAT_MODEL.md.)\n");
+    } else {
+        printf("  result               : no hypervisor detected\n");
+    }
+    return 0;
 }
 
 /* ------------------------------------------------------------------ */
@@ -2538,6 +2720,27 @@ static int cmd_start(int argc, char **argv)
             logmsg(LOG_INFO, "self-protected (pid %d)", self.pid);
     }
     {
+        /* Checked once here, not polled: whether the OS itself is
+         * virtualized can't change mid-boot the way RWX growth or
+         * hidden modules can. LOG_WARNING/LOG_INFO only, deliberately
+         * never LOG_ALERT/LOG_CRIT -- see cmd_vmcheck()'s own comment
+         * block for why this must never auto-feed the ban pipeline. */
+        char cpuid_vendor[16];
+        char dmi_desc[192];
+        int cpuid_hit = detect_hypervisor_cpuid(cpuid_vendor, sizeof(cpuid_vendor));
+        int dmi_hit = detect_hypervisor_dmi(dmi_desc, sizeof(dmi_desc));
+
+        if (cpuid_hit)
+            logmsg(LOG_WARNING, "running inside a virtual machine "
+                   "(CPUID vendor id: %s%s%s) -- informational, not a verdict",
+                   cpuid_vendor, dmi_hit ? "; " : "", dmi_hit ? dmi_desc : "");
+        else if (dmi_hit)
+            logmsg(LOG_WARNING, "running inside a virtual machine "
+                   "(%s) -- informational, not a verdict", dmi_desc);
+        else
+            logmsg(LOG_INFO, "no hypervisor detected (CPUID/DMI checks)");
+    }
+    {
         time_t next_sys = 0, next_mod = 0, next_scan = 0, next_baseline = 0;
         time_t next_render = 0, next_preload = 0, next_vklayer = 0;
         time_t next_implicit = 0;
@@ -2616,6 +2819,7 @@ static void usage(const char *prog)
            "           [--check-vklayers] [--check-implicit-layers]\n"
            "  syscalls                   verify syscall table integrity\n"
            "  modules                    kernel module list + hidden module check\n"
+           "  vmcheck                    VM/hypervisor detection (heuristic)\n"
            "  events [--watch]           dump security events\n"
            "  lock | unlock              pin / unpin the kernel module\n"
            "  start [--foreground]       run the monitoring daemon\n"
@@ -2647,6 +2851,8 @@ int main(int argc, char **argv)
         return cmd_syscalls();
     if (strcmp(cmd, "modules") == 0)
         return cmd_modules();
+    if (strcmp(cmd, "vmcheck") == 0)
+        return cmd_vmcheck();
     if (strcmp(cmd, "events") == 0)
         return cmd_events(argc - 2, argv + 2);
     if (strcmp(cmd, "lock") == 0)

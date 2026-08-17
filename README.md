@@ -106,6 +106,7 @@ anticheat scan --pid N --check-vklayers Vulkan-layer env var check (heuristic, n
 anticheat scan --pid N --check-implicit-layers  implicit Vulkan-layer manifest check (heuristic)
 anticheat syscalls                   verify syscall table integrity
 anticheat modules                    detect modules hidden from /proc/modules
+anticheat vmcheck                    VM/hypervisor detection (heuristic, not a verdict)
 anticheat events [--watch]           dump security events
 anticheat lock | unlock              pin / unpin the kernel module
 anticheat start [--foreground]       monitoring daemon (events + periodic checks)
@@ -113,7 +114,10 @@ anticheat start [--foreground]       monitoring daemon (events + periodic checks
 
 The daemon (`start`) protects its own pid on startup (so it can't just be
 ptrace-attached or debugged away — see `AC_IOCTL_ADD_PROC` in `cmd_start`),
-polls security events, re-checks syscall integrity every 5 s, module
+runs the same VM/hypervisor check as `vmcheck` once at startup (logged,
+not re-polled — unlike the other periodic checks below, whether the OS
+itself is virtualized can't change mid-session), polls security events,
+re-checks syscall integrity every 5 s, module
 visibility every 10 s, scans protected processes every 30 s (override via
 `AC_SCAN_CHECK_INTERVAL`) for RWX mappings and for anonymous-executable
 mappings appearing *after* a process was first observed (each pid's
@@ -376,6 +380,62 @@ it.
 resolve a *different* user's paths to mean anything): the negative case,
 the positive case, `disable_environment` suppression, and the periodic
 baseline/growth behavior, all against a real loaded module.
+
+### VM/hypervisor detection
+
+`anticheat vmcheck` checks whether the OS itself (not any specific
+process) is running inside a virtual machine — cheat authors routinely
+develop and test inside a VM specifically to keep their real hardware
+unbanned, or run the target game itself in one to reverse-engineer this
+project in a disposable environment. This is deliberately a system-wide,
+one-shot check: unlike the process-specific, continuously-repeated checks
+above, whether the OS is virtualized is a fact about the machine as a
+whole that can't change mid-session, so `cmd_start()` runs it once at
+startup and logs the result rather than polling it on a timer.
+
+Two independent, purely userspace signals, needing no kernel module
+involvement at all — CPUID and `/sys/class/dmi/id/` both already return
+the real, authoritative hardware/firmware answer to any process on the
+machine, so routing this through `anticheat_module.c` would add ioctl
+surface for no security benefit:
+
+- **CPUID hypervisor-present bit** (leaf 1, ECX bit 31) — the standard
+  signal essentially every hypervisor sets by default. If set, leaf
+  `0x40000000`'s EBX/ECX/EDX (only architecturally defined once the
+  presence bit is set) give a 12-character vendor ID string identifying
+  which one — `KVMKVMKVM\0\0\0`, `VMwareVMware`, `VBoxVBoxVBox`,
+  `Microsoft Hv`, `XenVMMXenVMM`, `TCGTCGTCGTCG` (QEMU's own software CPU
+  emulation, distinct from KVM-accelerated QEMU), `prl hyperv  `
+  (Parallels), `bhyve bhyve `. `__cpuid()` is used rather than the
+  leaf-range-checked `__get_cpuid()` deliberately — leaf `0x40000000` is
+  a hypervisor-reserved leaf, not a standard one, and the checked
+  function would refuse to read past whatever leaf 0 reports as the max
+  standard leaf.
+- **DMI/SMBIOS strings** (`sys_vendor`, `product_name`, `board_vendor`
+  under `/sys/class/dmi/id/`, typically world-readable) — a corroborating
+  signal, not authoritative on its own, that also catches a hypervisor
+  that masks the CPUID leaf above but leaves default BIOS/DMI strings in
+  place. `Microsoft Corporation` is matched only in combination with a
+  `product_name` containing `Virtual Machine` (Hyper-V's actual value),
+  not on `sys_vendor` alone — real Microsoft Surface hardware also
+  reports `sys_vendor=Microsoft Corporation` and would otherwise be a
+  false positive.
+
+**Deliberately heuristic, like the LD_PRELOAD/Vulkan-layer checks above.**
+Running in a VM is completely normal for plenty of legitimate reasons —
+cloud gaming, CI, testing, GPU-passthrough streaming rigs — so this never
+feeds the ban pipeline on its own: both the one-shot CLI command and the
+startup check log at `LOG_WARNING`/`LOG_INFO`, never `LOG_ALERT`/
+`LOG_CRIT` (the auto-report hook in `logmsg()` is scoped to
+`pri <= LOG_CRIT` specifically so heuristics like this stay visible to an
+operator without auto-accumulating as a report against a `client_id`).
+
+**Known, unavoidable limitation.** A hypervisor can be explicitly
+configured to hide the CPUID leaf above (VMware's
+`hypervisor.cpuid.v0 = FALSE`, VirtualBox's equivalent, KVM/QEMU CPUID
+masking) and to override the DMI strings above (QEMU's `-smbios` flag).
+That defeats both checks — a property of the technique itself, not a
+bug more engineering closes (see `THREAT_MODEL.md`).
 
 ### Ban-pipeline reporting (server-side)
 
@@ -784,6 +844,12 @@ design).
   does not stop `SIGKILL` from a root-privileged attacker — nothing in this
   design can, without a much larger effort to hide/harden the daemon process
   itself, which brings its own detection-evasion tradeoffs.
+- `vmcheck`'s CPUID/DMI hypervisor detection can be defeated outright by a
+  hypervisor deliberately configured to hide both signatures (VMware's
+  `hypervisor.cpuid.v0 = FALSE`, VirtualBox's equivalent, KVM/QEMU CPUID
+  masking, and QEMU's `-smbios` flag for the DMI side) — a fundamental
+  limit of any hypervisor-presence check, not a gap more engineering
+  closes.
 
 ## Files
 
