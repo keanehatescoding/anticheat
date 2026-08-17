@@ -1,0 +1,32 @@
+name: Server stress test
+
+# Deliberately separate from ci.yml: this runs for minutes under
+# sustained concurrent load, not seconds -- not something every push/PR
+# should have to wait on. Runs nightly plus on-demand.
+on:
+  schedule:
+    - cron: "17 3 * * *" # nightly, off-the-hour to avoid GitHub's own peak-load minute
+  workflow_dispatch:
+    inputs:
+      duration:
+        description: "Seconds each worker hammers the server"
+        default: "300"
+      concurrency:
+        description: "Number of concurrent workers"
+        default: "30"
+
+permissions:
+  contents: read
+
+jobs:
+  stress:
+    name: server/stress_test.sh (sustained concurrent load)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Run the stress test
+        env:
+          STRESS_DURATION: ${{ inputs.duration || '300' }}
+          STRESS_CONCURRENCY: ${{ inputs.concurrency || '30' }}
+        run: ./server/stress_test.sh
