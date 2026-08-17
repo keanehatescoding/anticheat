@@ -137,13 +137,20 @@ jobs:
         # Deliberately not build-module's .ko -- see its own upload
         # step's comment for why that artifact isn't fit to publish as
         # a generic downloadable module.
-        uses: actions/download-artifact@v7
+        #
+        # Pinned to a commit SHA (verified against the real v7 tag),
+        # not the mutable @v7 tag -- this job runs with contents: write,
+        # so a compromised or retagged action here could push arbitrary
+        # content as a Release under this repo's identity.
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
         with:
           name: release-daemon
           path: release
 
       - name: Create the release
-        uses: softprops/action-gh-release@v2
+        # Same reasoning as the pin above -- verified against the real
+        # v2 tag.
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           files: release/*
           generate_release_notes: true
