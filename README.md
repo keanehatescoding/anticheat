@@ -558,6 +558,17 @@ real `ac_server.py` instance and confirms the daemon's report actually
 arrives over real HTTP — proof the two sides' wire format agrees, not
 just that each compiles.
 
+None of that runs under sustained concurrent load, though, which is what
+`server/test_ratelimiter_unit.py` (fast, every push — proves
+`RateLimiter._buckets` actually shrinks after `_prune()` runs rather than
+growing one entry per distinct source IP forever) and
+`server/stress_test.sh` (slower — `$STRESS_CONCURRENCY` workers hammering
+`/report` in parallel for `$STRESS_DURATION` seconds, confirming every
+successful report lands durably in the DB and the server stays responsive
+throughout) cover instead. The latter runs nightly
+(`.github/workflows/stress.yml`), not on every push — `STRESS_DURATION=1800
+STRESS_CONCURRENCY=50 ./server/stress_test.sh` for a longer soak locally.
+
 ## Build
 
 **x86-64 only.** The kernel module hooks `__x64_sys_*`/`__ia32_sys_*` kprobe
@@ -815,6 +826,8 @@ src/sha256.{c,h}         SHA-256 for integrity baselines
 server/ac_server.py      ban-pipeline server: report ingestion + ban lookup
 server/ac_server.service systemd unit for ac_server.py (see "Deployment" above)
 server/test_server.sh    server test suite (no root): `./server/test_server.sh`
+server/test_ratelimiter_unit.py  fast RateLimiter bucket-pruning unit test (no root, no network)
+server/stress_test.sh    sustained concurrent load test (no root): `./server/stress_test.sh`
 ```
 
 ## Security & ethics
