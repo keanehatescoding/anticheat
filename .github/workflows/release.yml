@@ -11,7 +11,7 @@ on:
       - "v*"
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   # Fail fast if the tag doesn't match the version this commit actually
@@ -45,10 +45,18 @@ jobs:
       - uses: actions/checkout@v7
       - name: Build with warnings-as-errors
         run: make CFLAGS="-O2 -Wall -Wextra -Werror" daemon
+      - name: Archive with the executable bit preserved
+        # actions/upload-artifact does not reliably round-trip Unix
+        # permissions on a bare file (neither does a raw GitHub Release
+        # asset download) -- the +x bit is only guaranteed to survive
+        # inside an archive's own metadata, not on the file directly.
+        # Named after its final release-asset name now so the release
+        # job below can publish it verbatim, no renaming needed.
+        run: tar -czf "anticheat-${GITHUB_REF_NAME}-x86_64.tar.gz" anticheat
       - uses: actions/upload-artifact@v7
         with:
           name: release-daemon
-          path: anticheat
+          path: anticheat-${{ github.ref_name }}-x86_64.tar.gz
           if-no-files-found: error
 
   # Same linux-6.12-headers compile-smoke-test build ci.yml's module job
@@ -95,6 +103,20 @@ jobs:
           test -s anticheat.ko
           modinfo ./anticheat.ko | head -6
 
+      # Ephemeral CI artifact only (same 90-day default as ci.yml's own
+      # module-build artifact) -- deliberately NOT published as a
+      # Release asset below. This .ko is linked against a *synthesized*
+      # Module.symvers (see the step above) purely to get modpost to
+      # complete; it is a compile smoke test, not a module verified to
+      # actually load on any real machine's exact running kernel
+      # (vermagic and, if the target enables CONFIG_MODVERSIONS, symbol
+      # CRC checks would very plausibly reject it against a real distro
+      # kernel that isn't this exact prepared 6.12 tree/config). Publishing
+      # it as if it were a generic, installable "linux 6.12 module"
+      # would be actively misleading -- see RELEASING.md for why the
+      # Release ships source + the daemon, and points at DKMS/the AUR
+      # package/`make module` for an actually-loadable module built
+      # against the installing machine's own kernel.
       - uses: actions/upload-artifact@v7
         with:
           name: release-module-ko
@@ -103,18 +125,22 @@ jobs:
 
   release:
     name: publish GitHub Release
+    # Still gated on build-module succeeding (don't ship a release where
+    # the module doesn't even compile against the stated floor kernel)
+    # even though its artifact isn't one of the published assets below.
     needs: [build-daemon, build-module]
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
-      - uses: actions/download-artifact@v7
+      - name: Download the daemon archive only
+        # Deliberately not build-module's .ko -- see its own upload
+        # step's comment for why that artifact isn't fit to publish as
+        # a generic downloadable module.
+        uses: actions/download-artifact@v7
         with:
-          path: dist
-
-      - name: Name assets after the tag + kernel floor
-        run: |
-          mkdir -p release
-          cp "dist/release-daemon/anticheat" "release/anticheat-${GITHUB_REF_NAME}-x86_64"
-          cp "dist/release-module-ko/anticheat.ko" "release/anticheat-${GITHUB_REF_NAME}-linux6.12.ko"
+          name: release-daemon
+          path: release
 
       - name: Create the release
         uses: softprops/action-gh-release@v2
@@ -122,8 +148,16 @@ jobs:
           files: release/*
           generate_release_notes: true
           body: |
-            Compile-smoke-tested against linux-6.12 headers (this
-            project's stated kernel floor) -- not a substitute for
-            real load-time testing on your own running kernel. See
-            `TROUBLESHOOTING.md` if `insmod` fails and `RELEASING.md`
-            for how these assets were built.
+            The kernel module isn't published here as a raw `.ko` --
+            see `RELEASING.md` for why a generic downloadable module
+            isn't something this project can honestly ship (kernel
+            modules aren't portable across kernel builds/configs the
+            way a plain binary is). Build it for your own kernel via
+            `make module`, `scripts/dkms-install.sh`, or the AUR
+            package under `packaging/aur/`.
+
+            The daemon archive above preserves its executable bit;
+            extract it with `tar -xzf anticheat-*-x86_64.tar.gz` before
+            running it. See `TROUBLESHOOTING.md` if `insmod` fails on
+            the module you build yourself, and `RELEASING.md` for how
+            this release's assets were built.

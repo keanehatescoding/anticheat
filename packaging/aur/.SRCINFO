@@ -5,9 +5,8 @@ pkgbase = hypranticheat
 	url = https://github.com/keanehatescoding/hypranticheat
 	arch = x86_64
 	license = GPL-2.0-only
-	makedepends = git
 	makedepends = dkms
-	source = git+https://github.com/keanehatescoding/hypranticheat.git#tag=v1.0.0
+	source = hypranticheat-1.0.0.tar.gz::https://github.com/keanehatescoding/hypranticheat/archive/refs/tags/v1.0.0.tar.gz
 	sha256sums = SKIP
 
 pkgname = hypranticheat
@@ -20,3 +19,4 @@ pkgname = hypranticheat-dkms
 	install = hypranticheat-dkms.install
 	depends = dkms
 	provides = anticheat-dkms
+	backup = etc/dkms/framework.conf.d/anticheat.conf

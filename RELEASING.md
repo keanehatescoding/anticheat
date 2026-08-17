@@ -56,20 +56,33 @@ the same protocol" case this guards against), independent of whatever
    ```
 
 5. The tag push triggers `.github/workflows/release.yml`, which builds
-   the userspace daemon and the same `linux-6.12`-headers `.ko` build
-   `ci.yml` already does on every push, and creates a GitHub Release at
-   that tag with both attached — this is the actual point of
-   tagging a version: CI-built artifacts from a plain push are ephemeral
-   (expire, aren't a stable download link); a Release's attached assets
-   are permanent.
-6. Sanity-check the published Release assets before announcing anything:
-   at minimum `modinfo` each attached `.ko` and confirm its reported
-   version line matches, and run the attached daemon binary's `--help`/
+   the userspace daemon (packaged as a permission-preserving
+   `anticheat-<tag>-x86_64.tar.gz` — a bare binary asset doesn't reliably
+   keep its executable bit through a GitHub Release download) and
+   creates a Release at that tag with it attached — this is the actual
+   point of tagging a version: CI-built artifacts from a plain push are
+   ephemeral (expire, aren't a stable download link); a Release's
+   attached assets are permanent.
+
+   **The kernel module is deliberately not published as a raw `.ko`
+   asset.** The workflow still builds it (same `linux-6.12`-headers
+   compile-smoke-test build `ci.yml` does on every push, gating the
+   Release on it actually compiling) but doesn't attach it — a `.ko`
+   linked against a synthesized `Module.symvers` to satisfy modpost is
+   not the same thing as a module verified to load on any real running
+   kernel (vermagic and, on a target with `CONFIG_MODVERSIONS`, symbol
+   CRC checks would plausibly reject it against a real distro kernel).
+   Publishing it as a generic downloadable "linux 6.12 module" would
+   overstate what was actually verified. `make module`,
+   `scripts/dkms-install.sh`, or the AUR package build a real one
+   against the installing machine's own kernel instead.
+6. Sanity-check the published Release before announcing anything:
+   download the daemon archive, `tar -xzf` it, confirm the extracted
+   binary is executable without a manual `chmod`, and run its `--help`/
    `status` against the userspace mock (`make test-mock`-style, doesn't
-   need root). This is **not** a substitute for real load-time testing on
-   a live kernel — the CI matrix is a compile smoke test only (see
-   `ci.yml`'s own comments on this) — just a check that the released
-   artifacts aren't obviously broken.
+   need root). This is **not** a substitute for real load-time testing of
+   the kernel module on a live kernel — see point 5 above — just a check
+   that the one asset actually shipped isn't obviously broken.
 7. Update the AUR package (`PKGBUILD`) to match:
 
    ```sh

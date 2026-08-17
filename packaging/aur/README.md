@@ -19,24 +19,41 @@ AUR. See `RELEASING.md` at the repo root for the update procedure.
 Split so either half can be reinstalled or rebuilt independently — the
 normal reason kernel-module AUR packages are structured this way.
 
-## `source=` references a tag that doesn't exist yet
+## `source=` references a release tarball that doesn't exist yet
 
-`PKGBUILD`'s `source=` points at `#tag=v${pkgver}`, i.e. a real upstream
-git tag — this only resolves once that version is actually tagged (see
-`RELEASING.md`). Until then, this can't be built as committed; to test
-mechanically before a real tag exists, point `source=` at a local
-checkout instead (e.g. `git+file:///path/to/hypranticheat#branch=master`),
-build, and revert before committing — do not commit a modified `source=`
-pointing anywhere other than the real upstream tag.
+`PKGBUILD`'s `source=` points at the GitHub release archive for
+`v${pkgver}` — an immutable tag-pinned tarball, not a mutable VCS ref, so
+`sha256sums` is a real, checkable checksum rather than the `SKIP` a
+`git+#tag=` source would force. This only resolves once that version is
+actually tagged (see `RELEASING.md`); `sha256sums` is a placeholder until
+then. To test mechanically before a real tag exists: build a local
+tarball with the same layout GitHub's archive produces —
+
+```sh
+git archive --format=tar --prefix=hypranticheat-<pkgver>/ HEAD \
+    | gzip > hypranticheat-<pkgver>.tar.gz
+```
+
+— point `source=` at it with a `file://` URL, run `updpkgsums` (computes
+a real checksum against the local file, same as it will against the real
+release tarball), build, and revert both `source=`/`sha256sums` before
+committing — do not commit anything pointing anywhere other than the
+real upstream release tarball.
 
 ## Verified locally
 
 Built and packaged successfully with `makepkg` on Arch Linux (both split
-packages), `namcap`-clean (the three remaining warnings — an
-intentionally-empty state directory, and two informational/false-positive
-notes about the `-dkms` package having no ELF files and namcap not
-detecting `dkms`'s use from a shell script — are expected, not bugs), and
-`hypranticheat-dkms.install` is `shellcheck`-clean. Not yet verified: an
-actual `pacman -U` install/upgrade/remove cycle (would mutate the testing
+packages, including a full run through the `git archive`-based local
+tarball test above — confirmed the extraction directory name matches a
+real GitHub archive's layout, and that `updpkgsums` computes a genuine
+checksum rather than a no-op). `namcap`-clean except expected/benign
+warnings: an intentionally-empty state directory, the private (`0700`)
+MOK key directory correctly flagged as non-world-readable/executable,
+and two informational/false-positive notes about the `-dkms` package
+having no ELF files and namcap not detecting `dkms`'s use from a shell
+script. `hypranticheat-dkms.install` is `shellcheck -s bash`-clean (no
+shebang is correct/required — pacman sources `.install` files as
+functions, it doesn't execute them). Not yet verified: an actual
+`pacman -U` install/upgrade/remove cycle (would mutate the testing
 machine's real DKMS registry and `/etc/dkms/framework.conf.d/`, so this
 needs a disposable VM/container, not the machine this was authored on).
