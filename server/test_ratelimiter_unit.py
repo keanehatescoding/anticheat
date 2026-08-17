@@ -55,7 +55,13 @@ check(f"buckets populated ({N_KEYS} distinct keys)", len(rl._buckets) == N_KEYS)
 # _prune() only runs opportunistically from inside allow() (roughly once
 # per window -- see allow()'s "now - self._last_prune >= self.window"
 # check), so an actual elapsed window plus one more allow() call is what
-# it takes to trigger it for real, not a mocked clock.
+# it takes to trigger it for real, not a mocked clock. Captured before
+# the sleep so the assertion below can prove _prune() actually moved
+# this value forward, not just that it happens to already be recent --
+# _last_prune is set at construction time too, so comparing only against
+# a fixed time.time()-derived threshold would pass even if _prune()
+# silently never ran at all.
+last_prune_before = rl._last_prune
 time.sleep(WINDOW + 0.1)
 rl.allow("trigger-prune")
 
@@ -74,10 +80,12 @@ check(
 # every single allow() call after the window would re-scan the (by now
 # empty) dict for no reason forever, which isn't a correctness bug but
 # would be a silent perf regression from the "roughly once per window"
-# design this class documents for itself.
+# design this class documents for itself. Compared against the captured
+# before-value, not a fixed time-based threshold, so this actually
+# fails if _prune() didn't run rather than passing by coincidence.
 check(
     "_last_prune advanced past the window (prune isn't re-scanning every call)",
-    rl._last_prune > time.time() - WINDOW - 0.5,
+    rl._last_prune > last_prune_before,
 )
 
 print()

@@ -22,12 +22,29 @@ cd "$(dirname "$0")" || exit 1
 
 DURATION="${STRESS_DURATION:-90}"
 CONCURRENCY="${STRESS_CONCURRENCY:-20}"
+# A zero/negative/non-numeric value here wouldn't fail loudly -- $end
+# below could equal or precede "now", so every worker's while-loop would
+# run zero times and this script would still report success on zero
+# actual load, and `seq 1 "$CONCURRENCY"` with a bad value fails
+# unpredictably rather than cleanly. Reject both explicitly up front.
+if ! [[ "$DURATION" =~ ^[1-9][0-9]*$ && "$CONCURRENCY" =~ ^[1-9][0-9]*$ ]]; then
+    printf 'STRESS_DURATION and STRESS_CONCURRENCY must be positive integers (got DURATION=%s CONCURRENCY=%s)\n' \
+        "$DURATION" "$CONCURRENCY" >&2
+    exit 2
+fi
 PORT=18900
 TESTDIR="$(mktemp -d /tmp/ac_server_stress.XXXXXXXX)"
 DB="$TESTDIR/ac_server.db"
 REPORT_KEY="stress-report-key-$$"
 ADMIN_KEY="stress-admin-key-$$"
 BASE="http://127.0.0.1:$PORT"
+# Every curl call below uses this: without a bound, a stalled connection
+# or response could block a worker past $DURATION, and the top-level
+# `wait` would then block indefinitely too -- the same class of hang
+# this script's cleanup()/trap handling already exists to guard against,
+# just from the opposite direction (a stuck request instead of a killed
+# process).
+CURL_TIMEOUT=(--connect-timeout 2 --max-time 5)
 
 FAIL=0
 pass() { printf '  \033[1;32mPASS\033[0m  %s\n' "$*"; }
@@ -76,7 +93,7 @@ SERVER_PID=$!
 
 READY=0
 for _ in $(seq 1 50); do
-    if curl -s "$BASE/banned/x" -H "Authorization: Bearer $ADMIN_KEY" 2>/dev/null \
+    if curl -s "${CURL_TIMEOUT[@]}" "$BASE/banned/x" -H "Authorization: Bearer $ADMIN_KEY" 2>/dev/null \
         | grep -q '"banned"'; then
         READY=1
         break
@@ -101,7 +118,7 @@ worker() {
     local end=$(( $(date +%s) + DURATION ))
     while [ "$(date +%s)" -lt "$end" ]; do
         n=$((n + 1))
-        code=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$BASE/report" \
+        code=$(curl -s "${CURL_TIMEOUT[@]}" -o /dev/null -w '%{http_code}' -X POST "$BASE/report" \
             -H "Authorization: Bearer $REPORT_KEY" -H 'Content-Type: application/json' \
             -d "{\"client_id\":\"$cid\",\"event_type\":\"X\",\"detail\":\"n=$n\",\"ts\":$n}")
         if [ "$code" = "201" ]; then
@@ -159,7 +176,7 @@ else
 fi
 
 echo "-- confirming the server is still responsive after sustained load --"
-CODE=$(curl -s -o /dev/null -w '%{http_code}' "$BASE/banned/x" -H "Authorization: Bearer $ADMIN_KEY")
+CODE=$(curl -s "${CURL_TIMEOUT[@]}" -o /dev/null -w '%{http_code}' "$BASE/banned/x" -H "Authorization: Bearer $ADMIN_KEY")
 if [ "$CODE" = "200" ]; then
     pass "server still responsive after sustained load"
 else
