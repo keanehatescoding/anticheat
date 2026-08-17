@@ -1,0 +1,85 @@
+# Maintainer: keanehatescoding
+#
+# Split package: the DKMS-built kernel module (hypranticheat-dkms) and
+# the userspace daemon/CLI (hypranticheat) are separate so either can be
+# reinstalled/rebuilt without touching the other -- the normal reason
+# kernel-module AUR packages split this way. See RELEASING.md in the
+# upstream repo for how pkgver here is kept in sync with dkms.conf's
+# PACKAGE_VERSION / MODULE_VERSION(...).
+pkgbase=hypranticheat
+pkgname=(hypranticheat hypranticheat-dkms)
+pkgver=1.0.0
+pkgrel=1
+pkgdesc="Kernel-mode anticheat: syscall/module integrity, ptrace denial, RWX/anon-exec detection"
+arch=('x86_64')
+url="https://github.com/keanehatescoding/hypranticheat"
+license=('GPL-2.0-only')
+makedepends=('dkms')
+# A git+#tag= VCS source is always sha256sums=('SKIP') by design (there's
+# no meaningful checksum for a mutable ref) -- which also means a moved
+# tag would silently change what gets built with no integrity failure.
+# An immutable release tarball avoids that: the checksum below is real
+# and `updpkgsums` (see RELEASING.md step 7) actually computes it,
+# instead of being a no-op against a VCS source.
+source=("$pkgbase-$pkgver.tar.gz::https://github.com/keanehatescoding/hypranticheat/archive/refs/tags/v${pkgver}.tar.gz")
+sha256sums=('SKIP') # placeholder until v${pkgver} is tagged upstream and `updpkgsums` can fetch it for real -- see RELEASING.md
+
+build() {
+    cd "$pkgbase-$pkgver"
+    # The Makefile's own CFLAGS default (-O2 -Wall -Wextra) has no
+    # hardening flags of its own; makepkg's environment already carries
+    # them (see /etc/makepkg.conf), so pass both through explicitly
+    # rather than relying on the Makefile default -- otherwise RELRO/PIE
+    # flags silently never reach the linker.
+    make CFLAGS="${CFLAGS}" LDFLAGS="${LDFLAGS}" daemon
+}
+
+package_hypranticheat() {
+    pkgdesc="Userspace daemon and CLI for a kernel-mode anticheat -- pairs with the companion DKMS package for the kernel module"
+    depends=('glibc')
+    optdepends=('hypranticheat-dkms: kernel-level detection -- required for real use; the daemon alone can only run against its userspace mock')
+
+    cd "$pkgbase-$pkgver"
+    install -Dm755 anticheat "$pkgdir/usr/bin/anticheat"
+    install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
+    install -Dm644 THREAT_MODEL.md "$pkgdir/usr/share/doc/$pkgname/THREAT_MODEL.md"
+    install -Dm644 TROUBLESHOOTING.md "$pkgdir/usr/share/doc/$pkgname/TROUBLESHOOTING.md"
+    install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+    # Owned by root here -- the daemon itself creates/chmods per-file
+    # baselines under this at runtime as root; nothing needs write access
+    # to the directory itself except the daemon, which already runs as
+    # root (see README's "Load / use").
+    install -dm755 "$pkgdir/var/lib/anticheat/baselines"
+}
+
+package_hypranticheat-dkms() {
+    pkgdesc="Kernel module (DKMS) for a kernel-mode anticheat: syscall/module integrity, ptrace denial, RWX/anon-exec detection"
+    depends=('dkms')
+    provides=('anticheat-dkms')
+    install=hypranticheat-dkms.install
+    # /etc/dkms/framework.conf.d/anticheat.conf is shared, system-wide
+    # DKMS config (see the note in dkms.conf) -- it must be a
+    # pacman-tracked, backed-up file installed once here, NOT something
+    # the .install script overwrites on every upgrade. backup=() is what
+    # makes pacman diff a locally-modified copy against the new package
+    # version and leave a .pacnew instead of silently clobbering it, the
+    # same protection every other /etc config file on the system gets.
+    backup=('etc/dkms/framework.conf.d/anticheat.conf')
+
+    cd "$pkgbase-$pkgver"
+    local _dkmsdir="$pkgdir/usr/src/anticheat-${pkgver}"
+    install -Dm644 Makefile "$_dkmsdir/Makefile"
+    install -Dm644 dkms.conf "$_dkmsdir/dkms.conf"
+    cp -a src "$_dkmsdir/"
+    install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+
+    install -Dm644 /dev/stdin \
+        "$pkgdir/etc/dkms/framework.conf.d/anticheat.conf" <<-EOF
+	mok_signing_key="/var/lib/anticheat/mok/mok.priv"
+	mok_certificate="/var/lib/anticheat/mok/mok.der"
+	EOF
+    # DKMS's own signing step creates the key pair here on first build;
+    # pre-create the (empty, private) directory so that has somewhere to
+    # write regardless of install order.
+    install -dm700 "$pkgdir/var/lib/anticheat/mok"
+}

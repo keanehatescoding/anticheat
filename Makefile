@@ -30,6 +30,7 @@ KDIR ?= /lib/modules/$(KVER)/build
 PWD  := $(shell pwd)
 CC   ?= gcc
 CFLAGS ?= -O2 -Wall -Wextra
+LDFLAGS ?=
 DECK_PREFIX ?= $(HOME)/.local/share/anticheat
 
 # If the running kernel was built with clang/LLVM, build the module with
@@ -47,12 +48,12 @@ module:
 	$(MAKE) -C $(KDIR) M=$(PWD) LLVM=$(LLVM) modules
 
 daemon: src/anticheat_daemon.c src/sha256.c src/sha256.h src/anticheat.h
-	$(CC) $(CFLAGS) -o anticheat src/anticheat_daemon.c src/sha256.c
+	$(CC) $(CFLAGS) -o anticheat src/anticheat_daemon.c src/sha256.c $(LDFLAGS)
 
 mock: test/libmock_anticheat.so
 
 test/libmock_anticheat.so: test/mock_anticheat.c src/anticheat.h
-	$(CC) $(CFLAGS) -fPIC -shared -o $@ $< -ldl
+	$(CC) $(CFLAGS) -fPIC -shared -o $@ $< -ldl $(LDFLAGS)
 
 # real (non-mock) live test helper: proves ac_ioctl() rechecks
 # CAP_SYS_ADMIN by opening /dev/anticheat as root, dropping privileges,
@@ -61,7 +62,7 @@ test/libmock_anticheat.so: test/mock_anticheat.c src/anticheat.h
 priv-drop-test: test/priv_drop_test
 
 test/priv_drop_test: test/priv_drop_test.c src/anticheat.h
-	$(CC) $(CFLAGS) -o $@ $<
+	$(CC) $(CFLAGS) -o $@ $< $(LDFLAGS)
 
 # render-hook live test helper: self-hooks vkQueuePresentKHR in its own
 # process (harmless -- the patched bytes are never called) so `scan
@@ -70,7 +71,7 @@ test/priv_drop_test: test/priv_drop_test.c src/anticheat.h
 render-hook-test: test/render_hook_test
 
 test/render_hook_test: test/render_hook_test.c src/anticheat.h
-	$(CC) $(CFLAGS) -o $@ $< -ldl
+	$(CC) $(CFLAGS) -o $@ $< -ldl $(LDFLAGS)
 
 # mount-namespace live test helper: dlopen()s an explicit path inside a
 # private mount namespace test.sh sets up, so the render-hook check's
@@ -80,7 +81,7 @@ test/render_hook_test: test/render_hook_test.c src/anticheat.h
 mount-ns-test: test/mount_ns_probe
 
 test/mount_ns_probe: test/mount_ns_probe.c
-	$(CC) $(CFLAGS) -o $@ $< -ldl
+	$(CC) $(CFLAGS) -o $@ $< -ldl $(LDFLAGS)
 
 # anon-exec/JIT-allowlist live test helper: on SIGUSR1, maps one new
 # anonymous executable page in itself (the same signal a JIT or injected
@@ -90,7 +91,7 @@ test/mount_ns_probe: test/mount_ns_probe.c
 anon-exec-test: test/anon_exec_test
 
 test/anon_exec_test: test/anon_exec_test.c
-	$(CC) $(CFLAGS) -o $@ $<
+	$(CC) $(CFLAGS) -o $@ $< $(LDFLAGS)
 
 # run the daemon CLI against the userspace mock (no kernel module, no root)
 test-mock: mock daemon

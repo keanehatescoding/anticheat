@@ -1,0 +1,170 @@
+name: Release
+
+# Runs only on a version tag push (see RELEASING.md) -- this is
+# deliberately separate from ci.yml, which runs on every push/PR and
+# produces ephemeral build artifacts. This workflow's whole point is to
+# turn one specific, versioned commit into permanent, attached Release
+# assets instead.
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  # Fail fast if the tag doesn't match the version this commit actually
+  # declares -- catches "forgot to bump dkms.conf/MODULE_VERSION before
+  # tagging" (RELEASING.md step 2) before spending CI time on a release
+  # that would ship the wrong version string.
+  check-version:
+    name: tag matches declared version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Compare tag to dkms.conf / MODULE_VERSION
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          PKG_VER="$(awk -F'"' '/^PACKAGE_VERSION=/{print $2}' dkms.conf)"
+          MOD_VER="$(grep -oP 'MODULE_VERSION\("\K[^"]+' src/anticheat_module.c)"
+          echo "tag=$TAG dkms.conf=$PKG_VER MODULE_VERSION=$MOD_VER"
+          if [ "$TAG" != "$PKG_VER" ] || [ "$TAG" != "$MOD_VER" ]; then
+            echo "::error::version mismatch -- tag v$TAG, dkms.conf PACKAGE_VERSION=$PKG_VER, MODULE_VERSION(...)=$MOD_VER. Bump both to match before tagging (see RELEASING.md)." >&2
+            exit 1
+          fi
+
+  # Same build ci.yml's userspace job already does; kept minimal here
+  # since the release's only job is to produce the artifact, not
+  # re-run the mock suite (that already gated this commit's merge).
+  build-daemon:
+    name: build userspace daemon
+    needs: check-version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Build with warnings-as-errors
+        run: make CFLAGS="-O2 -Wall -Wextra -Werror" daemon
+      - name: Archive with the executable bit preserved
+        # actions/upload-artifact does not reliably round-trip Unix
+        # permissions on a bare file (neither does a raw GitHub Release
+        # asset download) -- the +x bit is only guaranteed to survive
+        # inside an archive's own metadata, not on the file directly.
+        # Named after its final release-asset name now so the release
+        # job below can publish it verbatim, no renaming needed.
+        run: tar -czf "anticheat-${GITHUB_REF_NAME}-x86_64.tar.gz" anticheat
+      - uses: actions/upload-artifact@v7
+        with:
+          name: release-daemon
+          path: anticheat-${{ github.ref_name }}-x86_64.tar.gz
+          if-no-files-found: error
+
+  # Same linux-6.12-headers compile-smoke-test build ci.yml's module job
+  # already does on every push -- see that job's own comments for why
+  # each step is there (MODULE_SIG_SHA256 vs. olddefconfig, the
+  # synthesized Module.symvers workaround). Kept in sync with ci.yml by
+  # hand rather than factored into a shared reusable workflow, since
+  # ci.yml's module job also runs a DKMS+signing smoke test this release
+  # build doesn't need (that's already verified by the time a commit is
+  # tag-worthy) -- duplicating the small compile-only subset is more
+  # legible than threading conditionals through the shared one.
+  build-module:
+    name: kernel module build (linux-6.12 headers)
+    needs: check-version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq bc flex bison libelf-dev libssl-dev dwarves
+
+      - name: Fetch and prepare kernel headers (6.12 LTS, x86_64)
+        run: |
+          curl -fsSL https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.12.tar.xz | tar -xJ
+          make -C linux-6.12 ARCH=x86_64 defconfig
+          ./linux-6.12/scripts/config --file linux-6.12/.config \
+            --enable MODULE_SIG \
+            --enable MODULE_SIG_SHA256
+          make -C linux-6.12 ARCH=x86_64 olddefconfig
+          grep -qx 'CONFIG_MODULE_SIG_SHA256=y' linux-6.12/.config
+          grep -qx 'CONFIG_MODULE_SIG_HASH="sha256"' linux-6.12/.config
+          make -C linux-6.12 ARCH=x86_64 scripts
+          make -C linux-6.12 ARCH=x86_64 modules_prepare
+
+      - name: Build the LKM
+        run: |
+          make KDIR="$PWD/linux-6.12" module 2>&1 | tail -3 || true
+          nm -u src/anticheat_module.o | awk '{print $2}' | sort -u | \
+            awk '{printf "0x00000000\t%s\tvmlinux\tEXPORT_SYMBOL\t\n", $1}' \
+            > "$PWD/ksymvers"
+          make KDIR="$PWD/linux-6.12" KBUILD_EXTRA_SYMBOLS="$PWD/ksymvers" module
+          test -s anticheat.ko
+          modinfo ./anticheat.ko | head -6
+
+      # Ephemeral CI artifact only (same 90-day default as ci.yml's own
+      # module-build artifact) -- deliberately NOT published as a
+      # Release asset below. This .ko is linked against a *synthesized*
+      # Module.symvers (see the step above) purely to get modpost to
+      # complete; it is a compile smoke test, not a module verified to
+      # actually load on any real machine's exact running kernel
+      # (vermagic and, if the target enables CONFIG_MODVERSIONS, symbol
+      # CRC checks would very plausibly reject it against a real distro
+      # kernel that isn't this exact prepared 6.12 tree/config). Publishing
+      # it as if it were a generic, installable "linux 6.12 module"
+      # would be actively misleading -- see RELEASING.md for why the
+      # Release ships source + the daemon, and points at DKMS/the AUR
+      # package/`make module` for an actually-loadable module built
+      # against the installing machine's own kernel.
+      - uses: actions/upload-artifact@v7
+        with:
+          name: release-module-ko
+          path: anticheat.ko
+          if-no-files-found: error
+
+  release:
+    name: publish GitHub Release
+    # Still gated on build-module succeeding (don't ship a release where
+    # the module doesn't even compile against the stated floor kernel)
+    # even though its artifact isn't one of the published assets below.
+    needs: [build-daemon, build-module]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download the daemon archive only
+        # Deliberately not build-module's .ko -- see its own upload
+        # step's comment for why that artifact isn't fit to publish as
+        # a generic downloadable module.
+        #
+        # Pinned to a commit SHA (verified against the real v7 tag),
+        # not the mutable @v7 tag -- this job runs with contents: write,
+        # so a compromised or retagged action here could push arbitrary
+        # content as a Release under this repo's identity.
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          name: release-daemon
+          path: release
+
+      - name: Create the release
+        # Same reasoning as the pin above -- verified against the real
+        # v2 tag.
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+        with:
+          files: release/*
+          generate_release_notes: true
+          body: |
+            The kernel module isn't published here as a raw `.ko` --
+            see `RELEASING.md` for why a generic downloadable module
+            isn't something this project can honestly ship (kernel
+            modules aren't portable across kernel builds/configs the
+            way a plain binary is). Build it for your own kernel via
+            `make module`, `scripts/dkms-install.sh`, or the AUR
+            package under `packaging/aur/`.
+
+            The daemon archive above preserves its executable bit;
+            extract it with `tar -xzf anticheat-*-x86_64.tar.gz` before
+            running it. See `TROUBLESHOOTING.md` if `insmod` fails on
+            the module you build yourself, and `RELEASING.md` for how
+            this release's assets were built.

@@ -1,0 +1,113 @@
+# DKMS registration + Secure Boot MOK enrollment prompt, mirroring
+# scripts/dkms-install.sh in the upstream repo. pacman passes the
+# package's pkgver-pkgrel as $1 (and, on upgrade, the old one as $2) to
+# these hooks -- DKMS only cares about pkgver (dkms.conf's
+# PACKAGE_VERSION), so _dkms_version() strips the trailing "-pkgrel".
+#
+# /etc/dkms/framework.conf.d/anticheat.conf (the system-wide signing-key
+# config DKMS's built-in Secure Boot signing reads) and
+# /var/lib/anticheat/mok/ are installed by the PKGBUILD's package()
+# instead of written from here -- the config file in particular is
+# pacman-tracked with backup=(), so a locally-modified copy is never
+# silently overwritten on upgrade the way an install-hook `printf > file`
+# would do it.
+
+_dkms_version() {
+    printf '%s' "${1%-*}"
+}
+
+# DKMS's own exit code for "kernel headers for this kernel cannot be
+# found" is 21 (see prepare_kernel() in /usr/bin/dkms) -- stable,
+# documented in dkms's own source header, and distinct from every other
+# failure class (compile errors: 7, install/depmod problems: 6, signing
+# and everything else). Only that specific code is a "this will build
+# itself later via AUTOINSTALL" situation; every other nonzero exit is a
+# real failure and must not be reported as if it were fine.
+_dkms_install() {
+    local ver="$1"
+    shift
+    dkms install -m anticheat -v "$ver" "$@"
+    local rc=$?
+    case "$rc" in
+        0)
+            return 0
+            ;;
+        21)
+            echo "==> dkms install deferred -- no matching kernel headers yet;" \
+                 "it will build automatically the next time a kernel with" \
+                 "headers installed is booted (AUTOINSTALL, see dkms.conf)."
+            echo "==> note: the Secure Boot signing key also won't exist until" \
+                 "that later build actually happens, and this hook has no way" \
+                 "to prompt for MOK enrollment for a build that hasn't run yet" \
+                 "-- after your next kernel/headers upgrade, check"
+            echo "==>   sudo dkms status -m anticheat"
+            echo "==> and re-run 'sudo pacman -S hypranticheat-dkms' (or"
+            echo "==>   sudo mokutil --import /var/lib/anticheat/mok/mok.der"
+            echo "==> directly) once it shows installed, to pick up enrollment."
+            return 0
+            ;;
+        *)
+            echo "==> dkms install FAILED (exit $rc, not the missing-headers" \
+                 "case above) -- see the dkms output above for the real" \
+                 "error, and 'sudo dkms status -m anticheat' /" \
+                 "/var/lib/dkms/anticheat/$ver/*/log/make.log for detail."
+            return "$rc"
+            ;;
+    esac
+}
+
+_enroll_mok_if_needed() {
+    cert=/var/lib/anticheat/mok/mok.der
+    [ -e "$cert" ] || return 0
+    if ! command -v mokutil >/dev/null 2>&1; then
+        echo "==> mokutil not found -- if Secure Boot is on, install it and run:"
+        echo "==>   sudo mokutil --import $cert"
+        return 0
+    fi
+    mokutil --sb-state 2>/dev/null | grep -qi enabled || return 0
+    if mokutil --test-key "$cert" 2>/dev/null | grep -qi "already enrolled"; then
+        return 0
+    fi
+    echo "==> Secure Boot is ON and hypranticheat's signing key is not yet trusted."
+    echo "==> Enrolling it now -- you will be asked to set a one-time password."
+    echo "==> REBOOT after this and approve it in the blue 'MOK Management' screen"
+    echo "==> (Enroll MOK -> Continue -> enter the password -> Reboot). Until you"
+    echo "==> do this, the signed module will still fail to load."
+    mokutil --import "$cert" || \
+        echo "==> mokutil --import failed -- enroll manually: sudo mokutil --import $cert"
+}
+
+post_install() {
+    ver="$(_dkms_version "$1")"
+    dkms add -m anticheat -v "$ver"
+    _dkms_install "$ver"
+    rc=$?
+    _enroll_mok_if_needed
+    [ "$rc" -eq 0 ] && echo "==> load it with: sudo modprobe anticheat"
+    return "$rc"
+}
+
+post_upgrade() {
+    new="$(_dkms_version "$1")"
+    old="$(_dkms_version "$2")"
+    if [ "$new" != "$old" ]; then
+        dkms remove -m anticheat -v "$old" --all 2>/dev/null || true
+    fi
+    # "already added" (dkms exit 3) is expected and benign here: a
+    # pkgrel-only bump (same dkms pkgver) re-upgrades without needing a
+    # fresh `dkms add`.
+    dkms add -m anticheat -v "$new" 2>/dev/null || true
+    _dkms_install "$new" --force
+    rc=$?
+    _enroll_mok_if_needed
+    if [ "$rc" -eq 0 ] && [ "$new" != "$old" ]; then
+        echo "==> module rebuilt for v$new -- reload it:" \
+             "sudo rmmod anticheat && sudo modprobe anticheat"
+    fi
+    return "$rc"
+}
+
+pre_remove() {
+    ver="$(_dkms_version "$1")"
+    dkms remove -m anticheat -v "$ver" --all 2>/dev/null || true
+}

@@ -636,6 +636,12 @@ the firmware's blue "MOK Management" screen — that's a UEFI requirement (no
 software can auto-approve a new trusted key, by design) and only happens
 once per machine, not per kernel update.
 
+**Arch Linux / AUR:** `packaging/aur/` has a `hypranticheat`/
+`hypranticheat-dkms` split-package `PKGBUILD` that does the same DKMS +
+MOK setup as `scripts/dkms-install.sh`, wired into `pacman`'s own
+`post_install`/`post_upgrade`/`pre_remove` hooks instead of a manual
+script run — see `packaging/aur/README.md`.
+
 ### SteamOS / Steam Deck / other immutable distros
 
 `/lib/modules` and `/usr` are read-only on SteamOS and get replaced
@@ -786,6 +792,9 @@ Makefile                 build (module + daemon + mock), install/uninstall
 README.md                this file
 THREAT_MODEL.md          adversary, explicit non-goals, production-readiness status
 TROUBLESHOOTING.md       crash/panic recovery, blacklisting, filing a bug report
+RELEASING.md             versioning scheme + release checklist
+LICENSE                  GPL-2.0
+packaging/aur/           AUR PKGBUILD (hypranticheat + hypranticheat-dkms split package)
 .github/workflows/ci.yml CI: userspace build + mock suite, module smoke build
 test.sh                  end-to-end live test (root)
 diag.sh                  root diagnostics (dmesg, discovery, module walk)
