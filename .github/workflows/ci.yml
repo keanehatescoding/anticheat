@@ -105,6 +105,42 @@ jobs:
           path: anticheat.ko
           if-no-files-found: error
 
+      # --- static analysis (sparse) ---
+      # Kbuild has first-class sparse support built in (C=1/C=2), so this
+      # needs no custom integration -- just the tool and a re-invocation
+      # of the same build with checking turned on. C=2 (not C=1) is used
+      # deliberately: C=1 only re-checks files Kbuild decides need
+      # recompiling, and anticheat_module.o was already built to
+      # completion by the step above; C=2 forces sparse over every file
+      # regardless of up-to-date status. Reuses the same prepared tree
+      # and the ksymvers workaround from the build step above -- no
+      # separate kernel fetch, no `make clean` needed (the changed
+      # C=2/CF= flags alone are enough for Kbuild's .cmd dependency
+      # tracking to recompile the object under sparse this time).
+      #
+      # Non-blocking for now (reports findings, doesn't fail the job):
+      # this is the first static-analysis pass ever run against this
+      # module, so whether there are real pre-existing findings to triage
+      # isn't known yet -- see the project notes on tightening this to
+      # fail-on-warning once a clean baseline is established.
+      - name: Static analysis (sparse)
+        run: |
+          sudo apt-get install -y -qq sparse
+          make KDIR="$PWD/linux-6.12" KBUILD_EXTRA_SYMBOLS="$PWD/ksymvers" \
+            C=2 CF="-D__CHECK_ENDIAN__" module 2>&1 | tee sparse.log
+          if grep -qE '(warning|error):' sparse.log; then
+            echo "::warning::sparse reported findings -- see the job log above"
+          else
+            echo "sparse: no findings"
+          fi
+
+      - name: Upload sparse log
+        uses: actions/upload-artifact@v7
+        with:
+          name: sparse-log
+          path: sparse.log
+          if-no-files-found: error
+
       # --- DKMS path: exercises dkms.conf + Secure Boot signing end to end ---
       # This is the same packaging a player's machine actually uses (see
       # scripts/dkms-install.sh), not just a raw `make module`. It reuses
