@@ -155,13 +155,18 @@ fix. Separately, there are engineering gates not yet closed that this
 doc does **not** paper over:
 
 - The kernel module (`src/anticheat_module.c`) has had no independent
-  security audit and no fuzzing of the ioctl interface — a memory-safety
-  bug there is a ring-0 crash or exploit, a materially worse failure mode
-  than a userspace bug anywhere else in this project. CI does run
-  `sparse` over it on every push (currently clean) — real, but narrow:
-  sparse catches type/context/locking-annotation violations, not general
-  logic bugs, use-after-free, or races. It closes a small slice of this
-  gap, not the gap itself.
+  security audit — a memory-safety bug there is a ring-0 crash or
+  exploit, a materially worse failure mode than a userspace bug anywhere
+  else in this project. CI does run `sparse` over it on every push
+  (currently clean) — real, but narrow: sparse catches type/context/
+  locking-annotation violations, not general logic bugs, use-after-free,
+  or races. A fuzz harness for the ioctl interface now exists
+  (`test/ioctl_fuzz.c`) and runs in CI — but only a dry run against the
+  userspace mock, which proves the harness itself is correct, not that
+  the kernel survives malformed input (the mock has none of the kernel's
+  own `copy_from_user()`/`access_ok()` to stress). The run that would
+  actually close this gap — root, a real loaded module, watching `dmesg`
+  for oops/warnings — hasn't happened yet.
 - No KASAN/lockdep-instrumented boot testing has been done — current
   testing is functional (does the detection work), not adversarial
   (does the module survive malformed/racing input to its own interfaces).
