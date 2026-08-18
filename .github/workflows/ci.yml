@@ -135,6 +135,14 @@ jobs:
           echo "sparse: no findings"
 
       - name: Upload sparse log
+        # Steps default to if: success(), which would skip this exact
+        # step precisely when it's most wanted: the sparse step above
+        # exits 1 on a finding, and without this override the log a
+        # failure needs to be diagnosed would never make it off the
+        # runner. !cancelled() runs regardless of the sparse step's own
+        # outcome, only skipping on a cancelled workflow (where the log
+        # may never have been written at all).
+        if: ${{ !cancelled() }}
         uses: actions/upload-artifact@v7
         with:
           name: sparse-log
