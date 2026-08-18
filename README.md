@@ -762,7 +762,12 @@ and no root. The shell scripts are also checked with `shellcheck`.
    one from the object's undefined symbols (`KBUILD_EXTRA_SYMBOLS`) so the
    final modpost link succeeds; this is a compile smoke test — real load-time
    symbol resolution is validated on a live kernel (see `diag.sh`). The
-   resulting `.ko` is uploaded as a build artifact.
+   resulting `.ko` is uploaded as a build artifact. The same job also runs
+   `sparse` (`make C=2`, Kbuild's built-in static-analysis integration,
+   reusing the already-prepared tree — no separate fetch) over
+   `anticheat_module.c` and fails the build on any finding; the first-ever
+   run against this module came back completely clean, so this holds a
+   real, verified baseline rather than a hoped-for one.
 
 To run the same userspace checks locally: `make ci`.
 

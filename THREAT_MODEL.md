@@ -157,7 +157,11 @@ doc does **not** paper over:
 - The kernel module (`src/anticheat_module.c`) has had no independent
   security audit and no fuzzing of the ioctl interface — a memory-safety
   bug there is a ring-0 crash or exploit, a materially worse failure mode
-  than a userspace bug anywhere else in this project.
+  than a userspace bug anywhere else in this project. CI does run
+  `sparse` over it on every push (currently clean) — real, but narrow:
+  sparse catches type/context/locking-annotation violations, not general
+  logic bugs, use-after-free, or races. It closes a small slice of this
+  gap, not the gap itself.
 - No KASAN/lockdep-instrumented boot testing has been done — current
   testing is functional (does the detection work), not adversarial
   (does the module survive malformed/racing input to its own interfaces).

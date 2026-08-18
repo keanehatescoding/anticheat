@@ -118,21 +118,21 @@ jobs:
       # C=2/CF= flags alone are enough for Kbuild's .cmd dependency
       # tracking to recompile the object under sparse this time).
       #
-      # Non-blocking for now (reports findings, doesn't fail the job):
-      # this is the first static-analysis pass ever run against this
-      # module, so whether there are real pre-existing findings to triage
-      # isn't known yet -- see the project notes on tightening this to
-      # fail-on-warning once a clean baseline is established.
+      # Fails the job on any finding. The first run against this module
+      # (before this comment existed) came back completely clean -- zero
+      # warnings across the whole ~1400 lines of hand-rolled kprobe/
+      # syscall-table code -- so there's a real, verified-clean baseline
+      # to hold, not a guess that one exists.
       - name: Static analysis (sparse)
         run: |
           sudo apt-get install -y -qq sparse
           make KDIR="$PWD/linux-6.12" KBUILD_EXTRA_SYMBOLS="$PWD/ksymvers" \
             C=2 CF="-D__CHECK_ENDIAN__" module 2>&1 | tee sparse.log
           if grep -qE '(warning|error):' sparse.log; then
-            echo "::warning::sparse reported findings -- see the job log above"
-          else
-            echo "sparse: no findings"
+            echo "::error::sparse reported findings -- see the job log above"
+            exit 1
           fi
+          echo "sparse: no findings"
 
       - name: Upload sparse log
         uses: actions/upload-artifact@v7
