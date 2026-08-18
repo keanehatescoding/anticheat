@@ -121,16 +121,17 @@ fi
 # than a shared variable -- these run as separate background processes,
 # nothing else crosses that boundary.
 #
-# curl reports "000" for %{http_code} when it never received a complete
-# response (--max-time firing, a reset connection, etc.) -- under heavy
-# concurrent contention this can happen for a request the server actually
-# handled successfully but didn't answer quickly enough for this client's
-# patience, not just for a request the server genuinely failed. Counted
-# separately from "errors" (any other non-201 code, which -- with the
-# rate limit set sky-high above -- has no innocent explanation) so the
-# aggregation step below can tell "the server was just slow" apart from
-# "the server did something wrong" instead of conflating both as one
-# failure count.
+# curl reports "000" for %{http_code} whenever it never received a
+# complete response -- both for --max-time firing (a request the server
+# may well have actually completed) AND for a genuine transport failure
+# like connection-refused or a reset connection (a real error, not
+# ordinary load-induced latency). %{http_code} alone can't tell those
+# apart; curl's own exit status can -- 28 is specifically "operation
+# timeout" (this call's own --connect-timeout/--max-time firing), while
+# every other nonzero exit is a real transport failure. Classified on
+# that instead of the code string, so a connection failure doesn't get
+# silently miscounted as the same benign "server was just slow" bucket a
+# --max-time timeout belongs in.
 worker() {
     local id="$1"
     local cid="stress-worker-$id-$$"
@@ -144,11 +145,14 @@ worker() {
         code=$(curl -s "${CURL_TIMEOUT[@]}" -o /dev/null -w '%{http_code}' -X POST "$BASE/report" \
             -H "Authorization: Bearer $REPORT_KEY" -H 'Content-Type: application/json' \
             -d "{\"client_id\":\"$cid\",\"event_type\":\"X\",\"detail\":\"n=$n\",\"ts\":$n}")
-        case "$code" in
-            201) ok=$((ok + 1)) ;;
-            000) timeouts=$((timeouts + 1)) ;;
-            *)   errors=$((errors + 1)) ;;
-        esac
+        rc=$?
+        if [ "$rc" -eq 0 ] && [ "$code" = "201" ]; then
+            ok=$((ok + 1))
+        elif [ "$rc" -eq 28 ]; then
+            timeouts=$((timeouts + 1))
+        else
+            errors=$((errors + 1))
+        fi
     done
     printf '%s %d %d %d\n' "$cid" "$ok" "$timeouts" "$errors" > "$TESTDIR/worker-$id.result"
 }
