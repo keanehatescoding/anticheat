@@ -678,8 +678,8 @@ The mock is a development tool only — it never loads code into the kernel.
 
 ### ioctl fuzzing
 
-`make ioctl-fuzz` (or `./test/ioctl_fuzz.c` directly) hammers every
-`AC_IOCTL_*` command with malformed sizes, boundary values, and
+`make ioctl-fuzz` builds `test/ioctl_fuzz`. Run `./test/ioctl_fuzz` to
+hammer every `AC_IOCTL_*` command with malformed sizes, boundary values, and
 null/unmapped/wild pointers — the actual attack surface any local
 process holding an open fd to `/dev/anticheat` can reach (`ac_ioctl()`'s
 own per-call `CAP_SYS_ADMIN` recheck already covers who's allowed to
@@ -693,16 +693,24 @@ process that legitimately has it can throw at the interface itself):
 **Two very different things this can be run against, and they prove
 different things:**
 
-- **The mock** (`LD_PRELOAD=test/libmock_anticheat.so ... ./test/ioctl_fuzz`,
-  same setup as `test-mock` above) — proves the *harness* is correct
-  (calling conventions, exercises every ioctl, doesn't crash from its
-  own bugs) and needs no root. Set `IOCTL_FUZZ_SAFE_POINTERS_ONLY=1`
-  for this — the mock is plain userspace code with none of the kernel's
-  own `copy_from_user()`/`access_ok()` protecting it, so a NULL/unmapped/
-  wild pointer crashes the *mock* itself, not the module under test; that
-  variant only means something with a real kernel on the other end. CI
-  runs exactly this (mock, safe-pointers-only) on every push — a dry run,
-  not a kernel-robustness check.
+- **The mock** — proves the *harness* is correct (calling conventions,
+  exercises every ioctl, doesn't crash from its own bugs) and needs no
+  root:
+
+  ```sh
+  LD_PRELOAD=test/libmock_anticheat.so AC_MOCK_ROOT=1 \
+      IOCTL_FUZZ_SAFE_POINTERS_ONLY=1 ./test/ioctl_fuzz
+  ```
+
+  `AC_MOCK_ROOT=1` is the same privilege-simulation flag `test-mock`
+  above needs — without it the mock's own capability check rejects every
+  call before fuzzing even starts. `IOCTL_FUZZ_SAFE_POINTERS_ONLY=1` is
+  required here specifically: the mock is plain userspace code with none
+  of the kernel's own `copy_from_user()`/`access_ok()` protecting it, so
+  a NULL/unmapped/wild pointer crashes the *mock* itself, not the module
+  under test; that variant only means something with a real kernel on
+  the other end. CI runs exactly this (mock, safe-pointers-only) on
+  every push — a dry run, not a kernel-robustness check.
 - **A real loaded module, as root** — this is the run that actually
   matters, full pointer-corruption fuzzing included:
 
@@ -794,13 +802,14 @@ useful bug report.
 
 `.github/workflows/ci.yml` runs two jobs on every push / PR:
 
-1. **Userspace** (`make ci`): rebuilds the daemon and mock with
+1. **Userspace**: `make ci` rebuilds the daemon and mock with
    `-Wall -Wextra -Werror` (zero warnings required) and runs the full mock
 test suite — every CLI command, the compromised-syscall-table simulation, the
 hidden-module simulation, and the monitoring daemon — with no kernel module
-and no root. Also runs a `test/ioctl_fuzz.c` dry run against the mock
-(`IOCTL_FUZZ_SAFE_POINTERS_ONLY=1` — see "ioctl fuzzing" below for why) and
-the shell scripts are checked with `shellcheck`.
+and no root. A separate CI step (not part of `make ci` itself) then runs a
+`test/ioctl_fuzz` dry run against the mock
+(`IOCTL_FUZZ_SAFE_POINTERS_ONLY=1` — see "ioctl fuzzing" above for why), and
+another checks the shell scripts with `shellcheck`.
 2. **Kernel module**: fetches a pinned linux-6.12 LTS source tree, prepares
    it (`defconfig` + `scripts` + `modules_prepare`), and builds `anticheat.ko`
    against it. Because a prepared tree has no `Module.symvers`, CI synthesizes

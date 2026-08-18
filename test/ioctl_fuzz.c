@@ -28,17 +28,25 @@
  *   in explicitly.
  *
  * IOCTL_FUZZ_SAFE_POINTERS_ONLY=1 in the environment restricts every
- * call to a real, correctly-mapped payload buffer -- only the buffer's
- * *contents* (garbage values, boundary values, wrong size) are fuzzed,
- * never the pointer itself (no NULL/unmapped/wild-address variants).
- * This is what a mock dry-run should use: the mock is plain userspace
- * code with no copy_from_user()/access_ok() of its own, so handing it a
- * deliberately invalid pointer crashes the *mock*, not the module under
- * test -- a true positive for "this address is bad," just not a useful
- * one when there's no kernel on the other end to be checking it. The
- * real kernel module is expected to survive all of it; run without this
- * set for that.
+ * call to a real, correctly-mapped, correctly *sized* payload buffer --
+ * only the buffer's *contents* (garbage values, boundary values, wrong
+ * declared size but a real full-size allocation behind it) are fuzzed,
+ * never a pointer whose target could legitimately fault (no NULL/
+ * unmapped/wild-address variants, and no deliberately-too-short-behind-
+ * a-guard-page variant either -- same underlying reason). This is what
+ * a mock dry-run should use: the mock is plain userspace code with no
+ * copy_from_user()/copy_to_user()/access_ok() of its own, so handing it
+ * a pointer that's supposed to fault crashes the *mock*, not the module
+ * under test -- a true positive for "this access is invalid," just not
+ * a useful one when there's no kernel on the other end to be checking
+ * it. The real kernel module is expected to survive all of it; run
+ * without this set for that.
  */
+#define _GNU_SOURCE  /* MAP_ANONYMOUS under a strict -std= build; this
+                      * project's own Makefile doesn't set one (the GNU
+                      * dialect is already the default), but don't rely
+                      * on that staying true forever -- same reasoning
+                      * as render_hook_test.c/anon_exec_test.c. */
 #include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
@@ -156,18 +164,72 @@ static void *unmapped_pointer(void)
     return p;
 }
 
+/* Two pages: a writable one immediately followed by a PROT_NONE guard
+ * page, returning a pointer to the *last* byte of the writable page --
+ * exactly one real, accessible byte at that address. This is what an
+ * actually-undersized user allocation looks like: any copy_from_user()
+ * reading more than that one byte genuinely runs off the end into
+ * unmapped memory and must -EFAULT, not silently succeed.
+ *
+ * A plain stack buffer that's merely been "filled" with fewer bytes
+ * doesn't test this at all -- the memory past whatever was written is
+ * still fully mapped, valid stack space, so the kernel reading beyond
+ * it never faults; it just reads uninitialized-but-real bytes. That was
+ * this harness's original mistake here, caught in review: it fuzzed
+ * *values*, not the actual size boundary the case's own name claimed to
+ * test. *base_out receives the 2-page mapping to munmap() after the
+ * ioctl call; NULL (with *base_out set to NULL) on mmap/mprotect failure. */
+static void *short_buffer(void **base_out)
+{
+    long pagesize = sysconf(_SC_PAGESIZE);
+    unsigned char *base;
+
+    if (pagesize <= 0) {
+        *base_out = NULL;
+        return NULL;
+    }
+    base = mmap(NULL, (size_t)pagesize * 2, PROT_READ | PROT_WRITE,
+                MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (base == MAP_FAILED) {
+        *base_out = NULL;
+        return NULL;
+    }
+    if (mprotect(base + pagesize, (size_t)pagesize, PROT_NONE) < 0) {
+        munmap(base, (size_t)pagesize * 2);
+        *base_out = NULL;
+        return NULL;
+    }
+    *base_out = base;
+    return base + pagesize - 1;
+}
+
 int main(int argc, char **argv)
 {
     int fd;
-    long iterations = 2000;
+    long iterations = 2000, it;
     unsigned long seed;
-    size_t cmd_i, it;
+    size_t cmd_i;
     unsigned char payload[MAX_PAYLOAD];
     const char *safe_env = getenv("IOCTL_FUZZ_SAFE_POINTERS_ONLY");
     int safe_pointers_only = safe_env && *safe_env && strcmp(safe_env, "0") != 0;
 
-    if (argc > 1)
-        iterations = strtol(argv[1], NULL, 10);
+    if (argc > 1) {
+        char *end;
+
+        errno = 0;
+        iterations = strtol(argv[1], &end, 10);
+        /* A negative value here previously converted to a huge size_t
+         * in the loop condition below (it < (size_t)iterations), so a
+         * typo like "-1" silently turned into an effectively-unbounded
+         * run hammering privileged ioctls instead of failing cleanly.
+         * Kept signed throughout now specifically so that cast, and the
+         * bug it enabled, can't come back. */
+        if (errno != 0 || end == argv[1] || *end != '\0' || iterations <= 0) {
+            fprintf(stderr, "ioctl_fuzz: iterations-per-command must be a "
+                    "positive integer (got %s)\n", argv[1]);
+            return 2;
+        }
+    }
     seed = (argc > 2) ? strtoul(argv[2], NULL, 10) : (unsigned long)time(NULL);
     xorshift_state = seed ? seed : 1; /* xorshift's state must never be 0 */
 
@@ -201,16 +263,23 @@ int main(int argc, char **argv)
                c->name, c->request, c->payload_size);
         fflush(stdout);
 
-        for (it = 0; it < (size_t)iterations; it++) {
+        for (it = 0; it < iterations; it++) {
             int variant = xorshift() % 6;
 
-            /* Remap the pointer-corruption variants (1/2/4) to 0 rather
+            /* Remap every memory-safety-boundary variant to 0 rather
              * than skipping the iteration outright -- keeps the total
              * iteration count exactly what was asked for, still fuzzing
              * payload contents, just always through a real, correctly
-             * mapped buffer. See the safe_pointers_only comment above
-             * main() for why. */
-            if (safe_pointers_only && (variant == 1 || variant == 2 || variant == 4))
+             * mapped, correctly sized buffer. See the safe_pointers_only
+             * comment above main() for why NULL/unmapped/wild pointers
+             * (1/2/4) need this; case 3 needs it for the identical
+             * reason since its fix -- it now writes deliberately past a
+             * mapped region into a PROT_NONE guard page, which is just
+             * as fatal to the mock's unprotected memcpy/struct-write as
+             * a wild pointer is, for the same underlying reason (no
+             * copy_to_user()-style fault handling on that side). */
+            if (safe_pointers_only &&
+                (variant == 1 || variant == 2 || variant == 3 || variant == 4))
                 variant = 0;
 
             switch (variant) {
@@ -228,13 +297,20 @@ int main(int argc, char **argv)
                  * not fault the kernel */
                 ioctl(fd, c->request, unmapped_pointer());
                 break;
-            case 3:
-                /* deliberately undersized buffer: copy_from_user(&x,
-                 * uarg, sizeof(x)) in the kernel reads sizeof(x)
-                 * regardless of how much the caller actually allocated */
-                fill_payload(payload, 1);
-                ioctl(fd, c->request, payload);
+            case 3: {
+                /* genuinely undersized buffer -- see short_buffer()'s
+                 * own comment for why a stack array with only a few
+                 * bytes "filled" doesn't actually test this */
+                void *base;
+                void *shortp = short_buffer(&base);
+
+                if (shortp) {
+                    *(unsigned char *)shortp = (unsigned char)xorshift();
+                    ioctl(fd, c->request, shortp);
+                    munmap(base, (size_t)sysconf(_SC_PAGESIZE) * 2);
+                }
                 break;
+            }
             case 4:
                 /* wild, obviously-invalid, non-NULL pointer */
                 ioctl(fd, c->request, (void *)(0xdead0000UL + (xorshift() & 0xffff)));
