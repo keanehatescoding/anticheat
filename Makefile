@@ -93,6 +93,17 @@ anon-exec-test: test/anon_exec_test
 test/anon_exec_test: test/anon_exec_test.c
 	$(CC) $(CFLAGS) -o $@ $< $(LDFLAGS)
 
+# ioctl fuzz harness: hammers every AC_IOCTL_* with malformed sizes,
+# boundary values, and null/wild/unmapped pointers -- the actual attack
+# surface any local process holding an open fd can reach. Against the
+# mock this only proves the harness itself doesn't crash (see its own
+# header comment); the real run is against a loaded module, as root,
+# watching dmesg -- see README's "ioctl fuzzing" section.
+ioctl-fuzz: test/ioctl_fuzz
+
+test/ioctl_fuzz: test/ioctl_fuzz.c src/anticheat.h
+	$(CC) $(CFLAGS) -o $@ $< $(LDFLAGS)
+
 # run the daemon CLI against the userspace mock (no kernel module, no root)
 test-mock: mock daemon
 	./test/mock_test.sh
@@ -107,7 +118,7 @@ ci:
 
 clean:
 	@if [ -d $(KDIR) ]; then $(MAKE) -C $(KDIR) M=$(PWD) clean; fi
-	rm -f anticheat test/libmock_anticheat.so test/priv_drop_test test/render_hook_test test/mount_ns_probe test/anon_exec_test
+	rm -f anticheat test/libmock_anticheat.so test/priv_drop_test test/render_hook_test test/mount_ns_probe test/anon_exec_test test/ioctl_fuzz
 
 install: all
 	install -D -m 0755 anticheat /usr/local/sbin/anticheat
@@ -136,4 +147,4 @@ install-deck: all
 uninstall-deck:
 	rm -rf $(DECK_PREFIX)
 
-.PHONY: all module daemon mock test-mock priv-drop-test render-hook-test mount-ns-test ci clean install uninstall install-deck uninstall-deck
+.PHONY: all module daemon mock test-mock priv-drop-test render-hook-test mount-ns-test ioctl-fuzz ci clean install uninstall install-deck uninstall-deck

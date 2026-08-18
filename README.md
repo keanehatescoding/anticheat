@@ -676,6 +676,57 @@ path.
 
 The mock is a development tool only — it never loads code into the kernel.
 
+### ioctl fuzzing
+
+`make ioctl-fuzz` builds `test/ioctl_fuzz`. Run `./test/ioctl_fuzz` to
+hammer every `AC_IOCTL_*` command with malformed sizes, boundary values, and
+null/unmapped/wild pointers — the actual attack surface any local
+process holding an open fd to `/dev/anticheat` can reach (`ac_ioctl()`'s
+own per-call `CAP_SYS_ADMIN` recheck already covers who's allowed to
+hold that fd at all — see `priv_drop_test.c` — this is about what a
+process that legitimately has it can throw at the interface itself):
+
+```sh
+./test/ioctl_fuzz [iterations-per-command] [seed]   # seed always printed, for reproducing a run
+```
+
+**Two very different things this can be run against, and they prove
+different things:**
+
+- **The mock** — proves the *harness* is correct (calling conventions,
+  exercises every ioctl, doesn't crash from its own bugs) and needs no
+  root:
+
+  ```sh
+  LD_PRELOAD=test/libmock_anticheat.so AC_MOCK_ROOT=1 \
+      IOCTL_FUZZ_SAFE_POINTERS_ONLY=1 ./test/ioctl_fuzz
+  ```
+
+  `AC_MOCK_ROOT=1` is the same privilege-simulation flag `test-mock`
+  above needs — without it the mock's own capability check rejects every
+  call before fuzzing even starts. `IOCTL_FUZZ_SAFE_POINTERS_ONLY=1` is
+  required here specifically: the mock is plain userspace code with none
+  of the kernel's own `copy_from_user()`/`access_ok()` protecting it, so
+  a NULL/unmapped/wild pointer crashes the *mock* itself, not the module
+  under test; that variant only means something with a real kernel on
+  the other end. CI runs exactly this (mock, safe-pointers-only) on
+  every push — a dry run, not a kernel-robustness check.
+- **A real loaded module, as root** — this is the run that actually
+  matters, full pointer-corruption fuzzing included:
+
+  ```sh
+  sudo insmod ./anticheat.ko
+  sudo ./test/ioctl_fuzz
+  ```
+
+  The harness's own exit code only reflects whether *userspace* survived
+  — a crashed kernel doesn't necessarily crash the calling process
+  cleanly enough to be caught here at all. Check `dmesg` during/after the
+  run for any oops, `WARNING`, or lockdep splat; a clean exit with no
+  kernel-log findings is the actual pass condition, not just the process
+  returning 0. Not run in CI (needs a live loaded module and root — see
+  `THREAT_MODEL.md`'s production-readiness notes on this gap generally).
+
 ### Load / use
 
 ```sh
@@ -751,11 +802,14 @@ useful bug report.
 
 `.github/workflows/ci.yml` runs two jobs on every push / PR:
 
-1. **Userspace** (`make ci`): rebuilds the daemon and mock with
+1. **Userspace**: `make ci` rebuilds the daemon and mock with
    `-Wall -Wextra -Werror` (zero warnings required) and runs the full mock
 test suite — every CLI command, the compromised-syscall-table simulation, the
 hidden-module simulation, and the monitoring daemon — with no kernel module
-and no root. The shell scripts are also checked with `shellcheck`.
+and no root. A separate CI step (not part of `make ci` itself) then runs a
+`test/ioctl_fuzz` dry run against the mock
+(`IOCTL_FUZZ_SAFE_POINTERS_ONLY=1` — see "ioctl fuzzing" above for why), and
+another checks the shell scripts with `shellcheck`.
 2. **Kernel module**: fetches a pinned linux-6.12 LTS source tree, prepares
    it (`defconfig` + `scripts` + `modules_prepare`), and builds `anticheat.ko`
    against it. Because a prepared tree has no `Module.symvers`, CI synthesizes
@@ -893,6 +947,9 @@ test/render_hook_test.c  live test: self-hooks vkQueuePresentKHR or (given
 test/mount_ns_probe.c    live test: proves render-hook detection resolves a
                          target's real mount-namespace view of a path, not
                          the host's (root, real module -- run via test.sh)
+test/ioctl_fuzz.c        fuzzes every AC_IOCTL_* (malformed sizes, bad
+                         pointers): `make ioctl-fuzz` -- mock dry run
+                         no-root/CI, full run needs root + a real module
 src/anticheat.h          shared ioctl ABI
 src/anticheat_module.c   the kernel module
 src/anticheat_daemon.c   userspace daemon + CLI

@@ -25,6 +25,24 @@ jobs:
       - name: Build the mount-namespace test helper (compile check only)
         run: make CFLAGS="-O2 -Wall -Wextra -Werror" mount-ns-test
 
+      # Dry run only -- against the mock, not a real kernel module, so
+      # this proves the harness itself is correct (doesn't crash from its
+      # own bugs, exercises every ioctl), not that the kernel survives
+      # malformed input. IOCTL_FUZZ_SAFE_POINTERS_ONLY=1 because the mock
+      # is plain userspace code with no copy_from_user()/access_ok() of
+      # its own -- handing it a NULL/unmapped/wild pointer crashes the
+      # mock, not the module under test. See ioctl_fuzz.c's own header
+      # comment and README's "ioctl fuzzing" section for the real run
+      # (root, a loaded module, full pointer-corruption fuzzing included).
+      - name: ioctl fuzz harness dry run against the mock (no root)
+        run: |
+          make CFLAGS="-O2 -Wall -Wextra -Werror" ioctl-fuzz mock daemon
+          LD_PRELOAD="$PWD/test/libmock_anticheat.so" \
+            AC_MOCK_ROOT=1 \
+            AC_MOCK_STATE="/tmp/ac_mock_fuzz_state_ci" \
+            IOCTL_FUZZ_SAFE_POINTERS_ONLY=1 \
+            ./test/ioctl_fuzz 1000 20260818
+
       - name: Ban-pipeline server test (no root, pure Python + HTTP)
         run: ./server/test_server.sh
 
