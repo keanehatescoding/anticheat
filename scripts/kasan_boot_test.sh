@@ -56,7 +56,19 @@ cleanup() {
 trap cleanup EXIT
 
 echo "== fetching linux-$KVER =="
-curl -fsSL "https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-$KVER.tar.xz" | tar -xJ -C "$WORKDIR"
+# Download to a file with retries rather than piping straight into tar:
+# a real HTTP/2 PROTOCOL_ERROR from cdn.kernel.org has been observed
+# mid-transfer in practice, and curl's default retry logic doesn't cover
+# it (only clear-cut connect/timeout failures). Piping a retried request
+# into a live pipe is also a correctness risk on its own -- a retry
+# re-emits the full file from byte 0, landing after whatever partial
+# bytes the failed first attempt already wrote, corrupting the archive
+# instead of just failing loudly.
+curl -fsSL --retry 5 --retry-delay 3 --retry-all-errors \
+    -o "$WORKDIR/linux-$KVER.tar.xz" \
+    "https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-$KVER.tar.xz"
+tar -xJf "$WORKDIR/linux-$KVER.tar.xz" -C "$WORKDIR"
+rm -f "$WORKDIR/linux-$KVER.tar.xz"
 
 echo "== configuring: defconfig + KASAN/lockdep debug fragment =="
 make -C "$KDIR" ARCH=x86_64 defconfig
