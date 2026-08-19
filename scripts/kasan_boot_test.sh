@@ -66,23 +66,27 @@ make -C "$KDIR" ARCH=x86_64 defconfig
 # CONFIG_FRAME_WARN=0 because KASAN's redzones legitimately inflate stack
 # frame sizes past the default warning threshold; that's expected
 # instrumentation overhead, not a bug in this module's own code.
-cat > "$WORKDIR/kasan-lockdep.config" <<'EOF'
-CONFIG_KASAN=y
-CONFIG_KASAN_GENERIC=y
-CONFIG_KASAN_INLINE=y
-CONFIG_LOCKDEP=y
-CONFIG_PROVE_LOCKING=y
-CONFIG_DEBUG_ATOMIC_SLEEP=y
-CONFIG_FRAME_WARN=0
-EOF
-
-"$KDIR/scripts/kconfig/merge_config.sh" -O "$KDIR" "$KDIR/.config" "$WORKDIR/kasan-lockdep.config"
+#
+# scripts/config, not scripts/kconfig/merge_config.sh: the same tool
+# ci.yml's own module job already uses (for MODULE_SIG/MODULE_SIG_SHA256)
+# and has a real, verified-working track record in this exact CI
+# environment. merge_config.sh's own internal `make ... alldefconfig`
+# step failed here ("No rule to make target 'alldefconfig'") on a real
+# run -- not worth chasing when there's already a proven alternative.
+"$KDIR/scripts/config" --file "$KDIR/.config" \
+    --enable KASAN \
+    --enable KASAN_GENERIC \
+    --enable KASAN_INLINE \
+    --enable LOCKDEP \
+    --enable PROVE_LOCKING \
+    --enable DEBUG_ATOMIC_SLEEP \
+    --set-val FRAME_WARN 0
 make -C "$KDIR" ARCH=x86_64 olddefconfig
 
-# merge_config.sh doesn't fail the build if a requested symbol silently
-# didn't stick (e.g. a missing dependency) -- verify explicitly rather
-# than discovering a plain, uninstrumented boot later via absence of any
-# KASAN output at all.
+# scripts/config --enable doesn't fail the build if a requested symbol
+# silently didn't stick (e.g. a missing dependency) -- verify explicitly
+# rather than discovering a plain, uninstrumented boot later via absence
+# of any KASAN output at all.
 for sym in CONFIG_KASAN CONFIG_KASAN_GENERIC CONFIG_LOCKDEP CONFIG_PROVE_LOCKING; do
     grep -qx "${sym}=y" "$KDIR/.config" || {
         echo "FATAL: $sym did not stick after olddefconfig -- see $KDIR/.config" >&2
