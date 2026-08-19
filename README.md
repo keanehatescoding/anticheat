@@ -724,8 +724,40 @@ different things:**
   cleanly enough to be caught here at all. Check `dmesg` during/after the
   run for any oops, `WARNING`, or lockdep splat; a clean exit with no
   kernel-log findings is the actual pass condition, not just the process
-  returning 0. Not run in CI (needs a live loaded module and root — see
-  `THREAT_MODEL.md`'s production-readiness notes on this gap generally).
+  returning 0. This exact run — root, a real loaded module, no
+  `IOCTL_FUZZ_SAFE_POINTERS_ONLY` — is also automated nightly under KASAN
+  and lockdep instrumentation; see "KASAN + lockdep boot testing" below.
+
+### KASAN + lockdep boot testing
+
+`.github/workflows/kasan-boot.yml` runs `scripts/kasan_boot_test.sh`
+nightly and on-demand (`workflow_dispatch`): it builds a linux-6.12
+kernel with `CONFIG_KASAN`/`CONFIG_LOCKDEP`/`CONFIG_PROVE_LOCKING`
+enabled, boots it in a VM via [virtme-ng](https://github.com/arighi/virtme-ng),
+`insmod`s the real `anticheat.ko`, runs the daemon CLI through a basic
+smoke sequence, then runs the real ioctl fuzz harness above (full
+pointer-corruption fuzzing, no safe-pointers-only) against the real
+`/dev/anticheat`. The job fails if the console output shows a KASAN
+report, a lockdep splat, or any oops/warning/general-protection-fault —
+the same "watch the kernel log, not the exit code" pass condition as the
+manual real run above, just automated and instrumented.
+
+This is nightly, not part of `ci.yml`'s per-push jobs, deliberately:
+building a full instrumented kernel and booting it in a VM takes
+minutes, and GitHub-hosted runners don't officially or reliably offer
+`/dev/kvm` — a per-push gate on that would risk being slow and flaky
+rather than a real quality bar. Run it locally the same way CI does:
+
+```sh
+./scripts/kasan_boot_test.sh
+```
+
+Needs a Linux host (ideally with `/dev/kvm` — falls back to much slower
+QEMU/TCG software emulation without it), `virtme-ng`
+(`pipx install virtme-ng`, or `pip install virtme-ng` in a venv — recent
+distros mark the system Python as externally-managed), `qemu-system-x86`,
+and the same kernel build deps the `module` CI job uses (`bc flex bison
+libelf-dev libssl-dev dwarves`).
 
 ### Load / use
 
@@ -822,6 +854,13 @@ another checks the shell scripts with `shellcheck`.
    `anticheat_module.c` and fails the build on any finding; the first-ever
    run against this module came back completely clean, so this holds a
    real, verified baseline rather than a hoped-for one.
+
+Separately, `.github/workflows/kasan-boot.yml` runs
+`scripts/kasan_boot_test.sh` nightly (plus on-demand via
+`workflow_dispatch`) — same "real but heavy, don't gate every push"
+treatment `stress.yml` gets: a full KASAN+lockdep kernel build and VM
+boot takes minutes, not seconds, and GitHub-hosted runners don't
+reliably offer `/dev/kvm`. See "KASAN + lockdep boot testing" above.
 
 To run the same userspace checks locally: `make ci`.
 
@@ -950,6 +989,9 @@ test/mount_ns_probe.c    live test: proves render-hook detection resolves a
 test/ioctl_fuzz.c        fuzzes every AC_IOCTL_* (malformed sizes, bad
                          pointers): `make ioctl-fuzz` -- mock dry run
                          no-root/CI, full run needs root + a real module
+scripts/kasan_boot_test.sh  boots a KASAN+lockdep kernel in a VM, insmods
+                         the real module, runs the real ioctl_fuzz above
+                         against it -- nightly + on-demand, see README
 src/anticheat.h          shared ioctl ABI
 src/anticheat_module.c   the kernel module
 src/anticheat_daemon.c   userspace daemon + CLI

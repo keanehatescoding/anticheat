@@ -1,0 +1,88 @@
+name: KASAN/lockdep boot test
+
+# Boots a KASAN + lockdep instrumented kernel, insmods the real module,
+# and runs the real (non-safe-mode) ioctl fuzz harness against it --
+# closes the gap ci.yml's per-push jobs deliberately leave open: sparse
+# only proves the module compiles clean, and the per-push ioctl-fuzz
+# dry run only proves the harness is correct against a mock with none of
+# a real kernel's copy_from_user()/access_ok() to stress.
+#
+# Deliberately separate from ci.yml and NOT run on every push/PR: this
+# builds a full instrumented kernel from source and boots it in a VM,
+# minutes not seconds, and GitHub-hosted runners don't officially or
+# reliably offer /dev/kvm -- without it this falls back to much slower
+# QEMU/TCG software emulation. Nightly + on-demand only, same reasoning
+# stress.yml already uses for its own "real but heavy" load test.
+on:
+  schedule:
+    - cron: "43 4 * * *" # nightly, offset from stress.yml's own 3:17 slot
+  workflow_dispatch:
+    inputs:
+      iterations:
+        description: "ioctl_fuzz iterations per command"
+        default: "300"
+
+permissions:
+  contents: read
+
+jobs:
+  kasan-boot:
+    name: boot a KASAN+lockdep kernel, insmod the module, real ioctl fuzz run
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install kernel build deps, QEMU, and virtme-ng
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq bc flex bison libelf-dev libssl-dev dwarves qemu-system-x86
+          # pipx, not pip: recent Ubuntu images mark the system Python as
+          # externally-managed (PEP 668), so a plain `pip install --user`
+          # fails outright; pipx is GitHub's own documented workaround for
+          # installing a CLI tool like this without a hand-rolled venv.
+          pipx install virtme-ng
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      # Best-effort only: GitHub doesn't document or guarantee /dev/kvm
+      # on hosted runners. When this doesn't pan out, kasan_boot_test.sh
+      # still runs -- vng transparently falls back to QEMU/TCG, just
+      # much slower. Never fail the job over this step itself.
+      - name: Attempt to enable /dev/kvm (best effort, non-fatal)
+        run: |
+          if [ -e /dev/kvm ]; then
+            echo "/dev/kvm already present"
+          else
+            echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+              | sudo tee /etc/udev/rules.d/99-kvm4all.rules >/dev/null
+            sudo udevadm control --reload-rules || true
+            sudo udevadm trigger --name-match=kvm || true
+          fi
+          if [ -e /dev/kvm ] && [ -r /dev/kvm ] && [ -w /dev/kvm ]; then
+            echo "kvm=available"
+          else
+            echo "kvm=unavailable -- falling back to QEMU/TCG (slower, not fatal)"
+          fi
+
+      - name: Boot the KASAN+lockdep kernel and run the real ioctl fuzz harness
+        env:
+          IOCTL_FUZZ_ITERATIONS: ${{ inputs.iterations || '300' }}
+        run: |
+          # A fresh seed every run so repeated nightly runs accumulate
+          # fuzzing coverage instead of replaying the identical sequence
+          # forever -- printed up front so any failure is reproducible
+          # locally via the same IOCTL_FUZZ_SEED value.
+          export IOCTL_FUZZ_SEED
+          IOCTL_FUZZ_SEED="$(date +%s)"
+          echo "IOCTL_FUZZ_SEED=$IOCTL_FUZZ_SEED"
+          ./scripts/kasan_boot_test.sh
+
+      - name: Upload console log and built module on failure
+        if: ${{ failure() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: kasan-boot-failure
+          path: |
+            kasan-console.log
+            anticheat.ko
+          if-no-files-found: ignore

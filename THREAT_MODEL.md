@@ -160,16 +160,28 @@ doc does **not** paper over:
   else in this project. CI does run `sparse` over it on every push
   (currently clean) — real, but narrow: sparse catches type/context/
   locking-annotation violations, not general logic bugs, use-after-free,
-  or races. A fuzz harness for the ioctl interface now exists
-  (`test/ioctl_fuzz.c`) and runs in CI — but only a dry run against the
+  or races. A fuzz harness for the ioctl interface exists
+  (`test/ioctl_fuzz.c`); every push only runs its dry run against the
   userspace mock, which proves the harness itself is correct, not that
   the kernel survives malformed input (the mock has none of the kernel's
-  own `copy_from_user()`/`access_ok()` to stress). The run that would
-  actually close this gap — root, a real loaded module, watching `dmesg`
-  for oops/warnings — hasn't happened yet.
-- No KASAN/lockdep-instrumented boot testing has been done — current
-  testing is functional (does the detection work), not adversarial
-  (does the module survive malformed/racing input to its own interfaces).
+  own `copy_from_user()`/`access_ok()` to stress). The real run — root,
+  a real loaded module, full pointer-corruption fuzzing, watching
+  `dmesg` — now happens too, automated, just not on every push: see the
+  next point.
+- KASAN/lockdep-instrumented boot testing now runs, nightly plus
+  on-demand (`.github/workflows/kasan-boot.yml`,
+  `scripts/kasan_boot_test.sh`): a KASAN+lockdep kernel boots in a VM,
+  the real module loads, the daemon CLI and the real (non-safe-mode)
+  ioctl fuzz harness both run against it, and the job fails on any
+  KASAN report, lockdep splat, or oops/warning/GPF in the console log.
+  This is nightly rather than per-push deliberately — it builds a full
+  instrumented kernel from source and boots it in a VM (minutes, not
+  seconds), and GitHub-hosted runners don't officially or reliably offer
+  `/dev/kvm`, so a per-push gate on that infrastructure risked being
+  slow and flaky rather than a real quality bar. Until this has actually
+  run clean a meaningful number of times, treat it as recently-added
+  coverage, not yet a long-proven baseline the way `sparse`'s clean run
+  is.
 
 Until those close, "production-ready" means: safe to run in the
 deployment this project has actually been built and tested against — a
