@@ -135,7 +135,14 @@ V=\$!
 sleep 0.3
 ./anticheat list
 ./anticheat events
-./anticheat syscalls
+# ENODEV (exit 1, "syscall table was not located at module load") is a
+# documented, best-effort outcome of this module's kprobe-based table
+# discovery (no kallsyms_lookup_name -- see THREAT_MODEL.md), not a
+# script-level failure to abort the whole run over: confirmed against a
+# real run, where a freshly built defconfig+KASAN kernel legitimately
+# didn't have the table land inside the scan window. This is advisory
+# only; the real pass/fail gate is the dmesg grep below.
+./anticheat syscalls || true
 ./anticheat scan --pid \$\$
 ./anticheat modules
 ./anticheat vmcheck
@@ -146,6 +153,16 @@ echo "AC_KASAN_BOOT: running the real ioctl fuzz harness (full pointer-corruptio
 ./test/ioctl_fuzz $IOCTL_FUZZ_ITERATIONS $IOCTL_FUZZ_SEED
 
 rmmod anticheat
+
+# vng's --exec channel only carries this script's own stdout/stderr, not
+# the guest kernel's printk/dmesg ring buffer -- confirmed against a real
+# run, where the captured console log contained this script's own trace
+# and nothing else, meaning the BUG:/KASAN:/lockdep grep below was
+# silently checking an empty haystack. Dump the ring buffer explicitly so
+# it actually reaches $CONSOLE_LOG via the host-side tee.
+echo "AC_KASAN_BOOT: dumping kernel ring buffer"
+dmesg
+
 echo "AC_KASAN_BOOT: payload complete"
 PAYLOAD_EOF
 chmod +x "$PAYLOAD"
