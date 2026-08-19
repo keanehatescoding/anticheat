@@ -31,7 +31,12 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 90
     steps:
+      # persist-credentials: false -- no later step needs authenticated
+      # git access, so there's no reason to leave the checkout token
+      # configured in local git config for the rest of the job.
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
       - name: Install kernel build deps, QEMU, and virtme-ng
         run: |
@@ -78,7 +83,12 @@ jobs:
           ./scripts/kasan_boot_test.sh
 
       - name: Upload console log and built module on failure
-        if: ${{ failure() }}
+        # cancelled(), not just failure(): a timeout-minutes cancellation
+        # (a real, expected outcome here given the KVM-availability
+        # uncertainty) is a distinct workflow conclusion from failure()
+        # and would otherwise skip this step precisely when the partial
+        # console log is most useful for diagnosing where it hung.
+        if: ${{ failure() || cancelled() }}
         uses: actions/upload-artifact@v7
         with:
           name: kasan-boot-failure

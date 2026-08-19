@@ -43,7 +43,12 @@ fi
 KVER=6.12
 WORKDIR="$(mktemp -d /tmp/ac_kasan_boot.XXXXXXXX)"
 KDIR="$WORKDIR/linux-$KVER"
-CONSOLE_LOG="$WORKDIR/console.log"
+# Written directly here, not under $WORKDIR: the EXIT trap below deletes
+# $WORKDIR on every exit path, including a mid-run cancellation (CI's
+# timeout-minutes, or a local Ctrl-C) -- a log that only reached its
+# final home via a post-vng `cp` would be lost in exactly the cases
+# where the partial output matters most for diagnosis.
+CONSOLE_LOG="$REPO_ROOT/kasan-console.log"
 
 cleanup() {
     rm -rf "$WORKDIR"
@@ -101,7 +106,15 @@ cat > "$PAYLOAD" <<PAYLOAD_EOF
 #!/bin/bash
 # Runs as root inside the guest, against the host filesystem virtme-ng
 # shares in -- \$REPO_ROOT below is the real repo path, not a copy.
-set -x
+#
+# -e, not just -x: without it, any command here failing (a CLI command,
+# the fuzz harness itself segfaulting, rmmod) would still fall through
+# to the "payload complete" echo below, and the host side would read
+# that marker as a pass regardless. The two spots below where a nonzero
+# exit is expected/racy rather than a real failure (a kill against a
+# background sleep that may have already been reaped) are guarded
+# explicitly with "|| true" for that reason.
+set -ex
 cd "$REPO_ROOT" || exit 1
 
 insmod ./anticheat.ko ac_verbose=1 || { echo "AC_KASAN_BOOT: insmod failed"; exit 1; }
@@ -123,7 +136,7 @@ sleep 0.3
 ./anticheat modules
 ./anticheat vmcheck
 ./anticheat unprotect --pid "\$V"
-kill "\$V" 2>/dev/null
+kill "\$V" 2>/dev/null || true
 
 echo "AC_KASAN_BOOT: running the real ioctl fuzz harness (full pointer-corruption fuzzing, no safe-pointers-only)"
 ./test/ioctl_fuzz $IOCTL_FUZZ_ITERATIONS $IOCTL_FUZZ_SEED
@@ -141,17 +154,15 @@ echo "== booting via virtme-ng =="
 # `|| true`: vng's own exit code isn't the pass/fail signal here (same
 # reasoning as the ioctl_fuzz harness's own exit code below) -- under
 # `set -e`/pipefail a nonzero here would abort the script immediately,
-# before the console log is copied out of $WORKDIR and before the real
-# grep-based checks below ever run.
+# before the real grep-based checks below ever run. tee already writes
+# $CONSOLE_LOG directly at its final ($REPO_ROOT) location as output
+# arrives, so a cancellation partway through still leaves a real partial
+# log on disk -- see the CONSOLE_LOG assignment above for why that's not
+# just under $WORKDIR.
 vng --run "$KDIR" --memory 3072M --exec "$PAYLOAD" 2>&1 | tee "$CONSOLE_LOG" || true
 
-# Copy out of $WORKDIR now, unconditionally -- the EXIT trap deletes
-# $WORKDIR on every exit path including failure, and CI needs this file
-# to still exist afterward to upload it as an artifact.
-cp "$CONSOLE_LOG" "$REPO_ROOT/kasan-console.log"
-
 if ! grep -q "AC_KASAN_BOOT: payload complete" "$CONSOLE_LOG"; then
-    echo "FAIL: payload never reported completion -- boot, insmod, or the in-VM script likely crashed/hung before finishing. See $REPO_ROOT/kasan-console.log." >&2
+    echo "FAIL: payload never reported completion -- boot, insmod, or the in-VM script likely crashed/hung before finishing. See $CONSOLE_LOG." >&2
     exit 1
 fi
 

@@ -165,18 +165,21 @@ doc does **not** paper over:
   userspace mock, which proves the harness itself is correct, not that
   the kernel survives malformed input (the mock has none of the kernel's
   own `copy_from_user()`/`access_ok()` to stress). The real run — root,
-  a real loaded module, full pointer-corruption fuzzing, watching
-  `dmesg` — now happens too, automated, just not on every push: see the
-  next point.
+  a real loaded module, full pointer-corruption fuzzing, watching the
+  kernel's own console/`dmesg` output — now happens too, automated, just
+  not on every push: see the next point.
 - KASAN/lockdep-instrumented boot testing now runs, nightly plus
   on-demand (`.github/workflows/kasan-boot.yml`,
   `scripts/kasan_boot_test.sh`): a KASAN+lockdep kernel boots in a VM,
   the real module loads, the daemon CLI and the real (non-safe-mode)
-  ioctl fuzz harness both run against it, and the job fails on any
-  KASAN report, lockdep splat, or oops/warning/GPF in the console log.
-  This is nightly rather than per-push deliberately — it builds a full
-  instrumented kernel from source and boots it in a VM (minutes, not
-  seconds), and GitHub-hosted runners don't officially or reliably offer
+  ioctl fuzz harness both run against it, and the job fails if the
+  in-VM run never reaches its own completion marker (something crashed
+  or hung partway through) or if the captured VM console log (which
+  includes the kernel's printk/dmesg stream) shows a KASAN report,
+  lockdep splat, or oops/warning/GPF. This is nightly rather than
+  per-push deliberately — it builds a full instrumented kernel from
+  source and boots it in a VM (minutes, not seconds), and GitHub-hosted
+  runners don't officially or reliably offer
   `/dev/kvm`, so a per-push gate on that infrastructure risked being
   slow and flaky rather than a real quality bar. Until this has actually
   run clean a meaningful number of times, treat it as recently-added

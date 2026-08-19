@@ -737,10 +737,14 @@ enabled, boots it in a VM via [virtme-ng](https://github.com/arighi/virtme-ng),
 `insmod`s the real `anticheat.ko`, runs the daemon CLI through a basic
 smoke sequence, then runs the real ioctl fuzz harness above (full
 pointer-corruption fuzzing, no safe-pointers-only) against the real
-`/dev/anticheat`. The job fails if the console output shows a KASAN
-report, a lockdep splat, or any oops/warning/general-protection-fault —
-the same "watch the kernel log, not the exit code" pass condition as the
-manual real run above, just automated and instrumented.
+`/dev/anticheat`. The job captures the VM's console output (which
+includes the kernel's own printk/dmesg stream) to a log; it fails if
+the in-VM script never reaches its own completion marker (boot, insmod,
+or one of the CLI/fuzz steps crashed or hung partway through) or if
+that captured log shows a KASAN report, a lockdep splat, or any
+oops/warning/general-protection-fault — the same "watch the kernel log,
+not the exit code" pass condition as the manual real run above, just
+automated, instrumented, and with the additional completion check.
 
 This is nightly, not part of `ci.yml`'s per-push jobs, deliberately:
 building a full instrumented kernel and booting it in a VM takes
