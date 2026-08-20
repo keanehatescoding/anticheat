@@ -857,10 +857,25 @@ static void ac_free_fd_state(struct ac_fd_state *st)
     kfree(st);
 }
 
+/* Guards the check-then-set of file->private_data below. Without this,
+ * two threads sharing one open file description (SCM_RIGHTS, or fork()
+ * without O_CLOEXEC) calling SCAN_BEGIN/MODS_BEGIN concurrently for the
+ * first time on that fd can both observe private_data == NULL, both
+ * allocate, and race to publish -- the loser's ac_fd_state (and its
+ * kvmalloc_array'd snapshot) is silently overwritten with nothing left
+ * pointing at it, a permanent kernel memory leak, and its own BEGIN's
+ * result becomes unreachable via the fd's later GET calls. Global, not
+ * per-file: this only serializes the rare first-BEGIN-on-an-fd moment,
+ * never the SCAN/MODS hot path, which already has its own per-state
+ * st->lock below. */
+static DEFINE_MUTEX(ac_fd_state_alloc_lock);
+
 static struct ac_fd_state *ac_get_fd_state(struct file *file)
 {
-    struct ac_fd_state *st = file->private_data;
+    struct ac_fd_state *st;
 
+    mutex_lock(&ac_fd_state_alloc_lock);
+    st = file->private_data;
     if (!st) {
         st = kzalloc(sizeof(*st), GFP_KERNEL);
         if (st) {
@@ -868,6 +883,7 @@ static struct ac_fd_state *ac_get_fd_state(struct file *file)
             file->private_data = st;
         }
     }
+    mutex_unlock(&ac_fd_state_alloc_lock);
     return st;
 }
 
