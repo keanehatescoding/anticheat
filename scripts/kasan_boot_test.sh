@@ -142,6 +142,7 @@ insmod ./anticheat.ko ac_verbose=1 || { echo "AC_KASAN_BOOT: insmod failed"; exi
 sleep 0.3
 
 ./anticheat status
+echo "AC_KASAN_BOOT: status exited \$?"
 
 # Same smoke sequence diag.sh already uses interactively: protect a
 # throwaway child, exercise the read paths, unprotect, before moving on
@@ -149,14 +150,22 @@ sleep 0.3
 sleep 300 &
 V=\$!
 ./anticheat protect --pid "\$V"
+echo "AC_KASAN_BOOT: protect exited \$?"
 sleep 0.3
 ./anticheat list
+echo "AC_KASAN_BOOT: list exited \$?"
 ./anticheat events
+echo "AC_KASAN_BOOT: events exited \$?"
 ./anticheat syscalls
+echo "AC_KASAN_BOOT: syscalls exited \$?"
 ./anticheat scan --pid \$\$
+echo "AC_KASAN_BOOT: scan exited \$?"
 ./anticheat modules
+echo "AC_KASAN_BOOT: modules exited \$?"
 ./anticheat vmcheck
+echo "AC_KASAN_BOOT: vmcheck exited \$?"
 ./anticheat unprotect --pid "\$V"
+echo "AC_KASAN_BOOT: unprotect exited \$?"
 kill "\$V" 2>/dev/null
 
 echo "AC_KASAN_BOOT: running the real ioctl fuzz harness (full pointer-corruption fuzzing, no safe-pointers-only)"
