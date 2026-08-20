@@ -203,6 +203,17 @@ class Store:
 def make_handler(store, report_keys, admin_keys, rate_limiter, trust_proxy=False):
     class Handler(http.server.BaseHTTPRequestHandler):
         server_version = "ac_server/1"
+        # Bounds every blocking socket read on this connection (the request
+        # line, headers, and _read_json_body()'s rfile.read()) via
+        # StreamRequestHandler.setup(), which is the ONLY thing standing
+        # between a client that opens a connection and sends nothing (or
+        # trickles bytes) and a permanently parked ThreadingHTTPServer
+        # worker thread. Without this, such a connection never reaches
+        # _rate_limited() at all -- handle_one_request() parses the request
+        # line/headers before any handler code runs -- so a handful of idle
+        # connections exhausts server threads regardless of the per-IP
+        # rate limiter below.
+        timeout = 10
 
         def log_message(self, fmt, *args):
             sys.stderr.write("%s - %s\n" % (self.address_string(), fmt % args))
@@ -528,6 +539,16 @@ def main():
         store, report_keys, admin_keys, rate_limiter, args.trust_proxy
     )
     httpd = http.server.ThreadingHTTPServer((args.host, args.port), handler)
+    # Drain in-flight requests on shutdown instead of abandoning them.
+    # ThreadingHTTPServer defaults daemon_threads=True, under which
+    # server_close() below does NOT wait for handler threads still running
+    # when serve_forever() returns (see socketserver.ThreadingMixIn) -- a
+    # request accepted just before SIGTERM/systemctl-stop would have its
+    # connection torn down mid-handling with no response ever sent. Setting
+    # this False makes server_close() join every still-running handler
+    # thread first; each handler's own worst-case latency is bounded by
+    # Store's 5s SQLite busy-timeout, so this can't hang indefinitely.
+    httpd.daemon_threads = False
 
     def _handle_sigterm(signum, frame):
         sys.stderr.write("ac_server: received SIGTERM, shutting down\n")
