@@ -72,6 +72,7 @@ jobs:
     name: kernel module build (linux-6.12 headers)
     needs: check-version
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v7
 
@@ -82,7 +83,16 @@ jobs:
 
       - name: Fetch and prepare kernel headers (6.12 LTS, x86_64)
         run: |
-          curl -fsSL https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.12.tar.xz | tar -xJ
+          # See ci.yml's own module job for why this downloads to a file
+          # with retries rather than piping straight into tar (a real
+          # HTTP/2 PROTOCOL_ERROR from cdn.kernel.org observed in
+          # practice, and piping a retried request risks corrupting the
+          # archive rather than just failing loudly).
+          curl -fsSL --retry 5 --retry-delay 3 --retry-all-errors \
+            -o linux-6.12.tar.xz \
+            https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.12.tar.xz
+          tar -xJf linux-6.12.tar.xz
+          rm -f linux-6.12.tar.xz
           make -C linux-6.12 ARCH=x86_64 defconfig
           ./linux-6.12/scripts/config --file linux-6.12/.config \
             --enable MODULE_SIG \
