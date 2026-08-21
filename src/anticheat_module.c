@@ -857,17 +857,48 @@ static void ac_free_fd_state(struct ac_fd_state *st)
     kfree(st);
 }
 
+/* Guards the check-then-set of file->private_data below. Without this,
+ * two threads sharing one open file description (SCM_RIGHTS, or fork()
+ * without O_CLOEXEC) calling SCAN_BEGIN/MODS_BEGIN concurrently for the
+ * first time on that fd can both observe private_data == NULL, both
+ * allocate, and race to publish -- the loser's ac_fd_state (and its
+ * kvmalloc_array'd snapshot) is silently overwritten with nothing left
+ * pointing at it, a permanent kernel memory leak, and its own BEGIN's
+ * result becomes unreachable via the fd's later GET calls. Global, not
+ * per-file: this only serializes the rare first-BEGIN-on-an-fd moment,
+ * never the SCAN/MODS hot path, which already has its own per-state
+ * st->lock below. */
+static DEFINE_MUTEX(ac_fd_state_alloc_lock);
+
 static struct ac_fd_state *ac_get_fd_state(struct file *file)
 {
-    struct ac_fd_state *st = file->private_data;
+    /* Fast path: once published below, an fd's state never changes again
+     * for the life of the fd, so every BEGIN after the first on a given
+     * fd -- the overwhelming majority of calls -- can skip the global
+     * lock entirely instead of serializing against every other fd's
+     * first BEGIN too. The acquire pairs with the release store below:
+     * seeing a non-NULL pointer here also guarantees this thread observes
+     * every write (kzalloc's zeroing, mutex_init()) that happened-before
+     * that store, on any CPU. */
+    struct ac_fd_state *st = smp_load_acquire(&file->private_data);
 
+    if (st)
+        return st;
+
+    mutex_lock(&ac_fd_state_alloc_lock);
+    st = file->private_data;
     if (!st) {
         st = kzalloc(sizeof(*st), GFP_KERNEL);
         if (st) {
             mutex_init(&st->lock);
-            file->private_data = st;
+            /* Release store: publishes the pointer only after the state
+             * it points to is fully initialized, so the fast-path load
+             * above can never observe a partially-initialized
+             * ac_fd_state. */
+            smp_store_release(&file->private_data, st);
         }
     }
+    mutex_unlock(&ac_fd_state_alloc_lock);
     return st;
 }
 
@@ -1125,7 +1156,7 @@ static long ac_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
     }
     case AC_IOCTL_SCAN_GET: {
         struct ac_scan_get g;
-        struct ac_fd_state *st = file->private_data;
+        struct ac_fd_state *st = smp_load_acquire(&file->private_data);
         int rc = 0;
 
         if (copy_from_user(&g, uarg, sizeof(g)))
@@ -1146,10 +1177,10 @@ static long ac_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
             return -EFAULT;
         return 0;
     }
-    case AC_IOCTL_SCAN_END:
-        if (file->private_data) {
-            struct ac_fd_state *st = file->private_data;
+    case AC_IOCTL_SCAN_END: {
+        struct ac_fd_state *st = smp_load_acquire(&file->private_data);
 
+        if (st) {
             mutex_lock(&st->lock);
             kvfree(st->vmas);
             st->vmas = NULL;
@@ -1157,6 +1188,7 @@ static long ac_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
             mutex_unlock(&st->lock);
         }
         return 0;
+    }
     case AC_IOCTL_CHECK_SYSCALLS: {
         struct ac_syscall_check c;
 
@@ -1187,7 +1219,7 @@ static long ac_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
     }
     case AC_IOCTL_MODS_GET: {
         struct ac_mod_get g;
-        struct ac_fd_state *st = file->private_data;
+        struct ac_fd_state *st = smp_load_acquire(&file->private_data);
         int rc = 0;
 
         if (copy_from_user(&g, uarg, sizeof(g)))
@@ -1208,10 +1240,10 @@ static long ac_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
             return -EFAULT;
         return 0;
     }
-    case AC_IOCTL_MODS_END:
-        if (file->private_data) {
-            struct ac_fd_state *st = file->private_data;
+    case AC_IOCTL_MODS_END: {
+        struct ac_fd_state *st = smp_load_acquire(&file->private_data);
 
+        if (st) {
             mutex_lock(&st->lock);
             kvfree(st->mods);
             st->mods = NULL;
@@ -1219,6 +1251,7 @@ static long ac_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
             mutex_unlock(&st->lock);
         }
         return 0;
+    }
     case AC_IOCTL_GET_EVENTS: {
         /* kzalloc, not kmalloc: ac_drain_events() only fills events[0..count),
          * leaving events[count..AC_MAX_EVENTS) untouched. The ioctl below
