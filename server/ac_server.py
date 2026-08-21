@@ -38,6 +38,7 @@ import ipaddress
 import json
 import re
 import signal
+import socket
 import sqlite3
 import sys
 import threading
@@ -203,17 +204,49 @@ class Store:
 def make_handler(store, report_keys, admin_keys, rate_limiter, trust_proxy=False):
     class Handler(http.server.BaseHTTPRequestHandler):
         server_version = "ac_server/1"
-        # Bounds every blocking socket read on this connection (the request
-        # line, headers, and _read_json_body()'s rfile.read()) via
-        # StreamRequestHandler.setup(), which is the ONLY thing standing
-        # between a client that opens a connection and sends nothing (or
-        # trickles bytes) and a permanently parked ThreadingHTTPServer
-        # worker thread. Without this, such a connection never reaches
-        # _rate_limited() at all -- handle_one_request() parses the request
-        # line/headers before any handler code runs -- so a handful of idle
-        # connections exhausts server threads regardless of the per-IP
-        # rate limiter below.
+        # Bounds every INDIVIDUAL blocking socket read on this connection
+        # (one request-line/header readline(), or one _read_json_body()
+        # rfile.read()) via StreamRequestHandler.setup(). This alone is not
+        # enough: it resets on every call, so a client sending one byte
+        # every N < timeout seconds keeps each read individually within
+        # bounds while never completing a request -- see
+        # CONNECTION_DEADLINE_SEC below for the absolute bound that closes
+        # that gap.
         timeout = 10
+
+        # Absolute wall-clock bound on one connection's total lifetime,
+        # covering every request-line/header/body read across a keep-alive
+        # connection -- not just a single blocking read the way `timeout`
+        # above does. Without this, a client trickling bytes just under the
+        # per-read timeout keeps a worker thread parked indefinitely, and
+        # since daemon_threads=False below (see main()), an attacker doing
+        # this could also block clean shutdown indefinitely: server_close()
+        # waits for every handler thread, including this stuck one.
+        CONNECTION_DEADLINE_SEC = 30
+
+        def handle(self):
+            watchdog = threading.Timer(
+                self.CONNECTION_DEADLINE_SEC, self._deadline_exceeded
+            )
+            watchdog.daemon = True
+            watchdog.start()
+            try:
+                super().handle()
+            finally:
+                watchdog.cancel()
+
+        def _deadline_exceeded(self):
+            # Runs on the watchdog's own thread, not the handler thread.
+            # Shutting down the raw socket from here unblocks whatever
+            # blocking read the handler thread is currently stuck in (it
+            # raises ConnectionError/OSError there, the same as a peer
+            # disconnecting would), so the handler thread -- and therefore
+            # server_close()'s join -- actually finishes instead of hanging
+            # on a slow-trickling client forever.
+            try:
+                self.connection.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
 
         def log_message(self, fmt, *args):
             sys.stderr.write("%s - %s\n" % (self.address_string(), fmt % args))
