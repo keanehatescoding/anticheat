@@ -34,10 +34,13 @@ echo "strace -p non-protected rc=$rc   (0 = attach worked, 124 = hung/timed out)
 
 echo
 echo "== protected process + attach =="
-bash -c 'sleep 300 & echo $! > /tmp/ac_diag_child; wait' & V=$!
+# mktemp, not a fixed /tmp/ac_diag_child path: a predictable name in
+# world-writable /tmp is a symlink-race hazard for a script run as root.
+CHILD_PIDFILE="$(mktemp)"
+bash -c 'sleep 300 & echo $! > "$1"; wait' _ "$CHILD_PIDFILE" & V=$!
 ./anticheat protect --pid $V
 sleep 0.5
-C=$(cat /tmp/ac_diag_child); rm -f /tmp/ac_diag_child
+C=$(cat "$CHILD_PIDFILE"); rm -f "$CHILD_PIDFILE"
 echo "victim=$V child=$C"
 timeout 2 strace -p $V -e trace=none >/dev/null 2>&1; rc=$?
 echo "strace -p protected rc=$rc"
