@@ -534,8 +534,19 @@ def main():
 
     import os
 
-    report_key = args.report_key or os.environ.get("AC_SERVER_REPORT_KEY")
-    admin_key = args.admin_key or os.environ.get("AC_SERVER_ADMIN_KEY")
+    def _key_arg(cli_value, env_name):
+        # `cli_value or os.environ.get(...)` would treat an explicitly
+        # passed `--report-key ""` the same as not passing the flag at
+        # all (empty string is falsy), silently falling through to the
+        # env var instead of honoring what was actually typed. Checking
+        # `is not None` respects an explicit value, including an empty
+        # one -- argparse's own default for these flags is None, so this
+        # still falls through to the env var exactly when the flag was
+        # never passed.
+        return cli_value if cli_value is not None else os.environ.get(env_name)
+
+    report_key = _key_arg(args.report_key, "AC_SERVER_REPORT_KEY")
+    admin_key = _key_arg(args.admin_key, "AC_SERVER_ADMIN_KEY")
     if not report_key or not admin_key:
         sys.stderr.write(
             "ac_server: --report-key/--admin-key (or AC_SERVER_REPORT_KEY/"
@@ -544,8 +555,8 @@ def main():
         )
         sys.exit(1)
 
-    report_key_old = args.report_key_old or os.environ.get("AC_SERVER_REPORT_KEY_OLD")
-    admin_key_old = args.admin_key_old or os.environ.get("AC_SERVER_ADMIN_KEY_OLD")
+    report_key_old = _key_arg(args.report_key_old, "AC_SERVER_REPORT_KEY_OLD")
+    admin_key_old = _key_arg(args.admin_key_old, "AC_SERVER_ADMIN_KEY_OLD")
     report_keys = frozenset({report_key} | ({report_key_old} if report_key_old else set()))
     admin_keys = frozenset({admin_key} | ({admin_key_old} if admin_key_old else set()))
 

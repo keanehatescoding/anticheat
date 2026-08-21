@@ -34,10 +34,23 @@ echo "strace -p non-protected rc=$rc   (0 = attach worked, 124 = hung/timed out)
 
 echo
 echo "== protected process + attach =="
-bash -c 'sleep 300 & echo $! > /tmp/ac_diag_child; wait' & V=$!
+# mktemp, not a fixed /tmp/ac_diag_child path: a predictable name in
+# world-writable /tmp is a symlink-race hazard for a script run as root.
+# Checked and trap-cleaned rather than assumed to succeed: this runs
+# under `set -u` only (no `set -e`), so an unchecked mktemp/cat failure
+# here wouldn't abort the script -- it would silently continue with an
+# empty pidfile path or an empty $C, producing a diagnostic run that
+# looks like it worked but didn't actually test fork inheritance.
+CHILD_PIDFILE="$(mktemp)" || { echo "mktemp failed"; exit 1; }
+trap 'rm -f "$CHILD_PIDFILE"' EXIT
+bash -c 'sleep 300 & echo $! > "$1"; wait' _ "$CHILD_PIDFILE" & V=$!
 ./anticheat protect --pid $V
 sleep 0.5
-C=$(cat /tmp/ac_diag_child); rm -f /tmp/ac_diag_child
+C=$(cat "$CHILD_PIDFILE")
+if [ -z "$C" ]; then
+    echo "warning: could not read child pid from $CHILD_PIDFILE" >&2
+fi
+rm -f "$CHILD_PIDFILE"
 echo "victim=$V child=$C"
 timeout 2 strace -p $V -e trace=none >/dev/null 2>&1; rc=$?
 echo "strace -p protected rc=$rc"

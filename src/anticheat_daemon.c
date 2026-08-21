@@ -2608,16 +2608,33 @@ static void ac_report(const char *event_type, const char *detail)
         return;
     }
 
-    snprintf(req, sizeof(req),
-             "POST /report HTTP/1.1\r\n"
-             "Host: %s\r\n"
-             "Authorization: Bearer %s\r\n"
-             "Content-Type: application/json\r\n"
-             "Content-Length: %zu\r\n"
-             "Connection: close\r\n"
-             "\r\n"
-             "%s",
-             host, key, strlen(body), body);
+    {
+        int reqn = snprintf(req, sizeof(req),
+                 "POST /report HTTP/1.1\r\n"
+                 "Host: %s\r\n"
+                 "Authorization: Bearer %s\r\n"
+                 "Content-Type: application/json\r\n"
+                 "Content-Length: %zu\r\n"
+                 "Connection: close\r\n"
+                 "\r\n"
+                 "%s",
+                 host, key, strlen(body), body);
+
+        /* snprintf() returns the length the fully-formatted request would
+         * have needed, even when it truncated req[] to fit -- an
+         * unusually long AC_REPORT_KEY (an operator-controlled env var,
+         * but nothing bounds its length before this point) could
+         * otherwise silently truncate the request while Content-Length
+         * still names the full, untruncated body's size: a malformed
+         * request whose own framing header lies about what follows it.
+         * Bail out instead of sending that. */
+        if (reqn < 0 || (size_t)reqn >= sizeof(req)) {
+            fprintf(stderr, "ac_report: request too large to send "
+                    "(AC_REPORT_KEY/AC_REPORT_URL too long?)\n");
+            close(fd);
+            return;
+        }
+    }
 
     {
         size_t reqlen = strlen(req);
