@@ -194,6 +194,12 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y -qq dkms
 
+          # Read from dkms.conf rather than hardcoding "1.0.0" here: unlike
+          # release.yml's check-version job, nothing else in this workflow
+          # would catch this drifting from dkms.conf's own PACKAGE_VERSION
+          # if it's ever bumped without updating this step too.
+          PKG_VER="$(awk -F'"' '/^PACKAGE_VERSION=/{print $2}' dkms.conf)"
+
           # Point DKMS at the prepared tree via a synthetic version + a
           # /lib/modules/<ver>/build symlink -- the same shape a real
           # kernel-postinst hook sees for a just-installed, not-yet-booted
@@ -214,18 +220,18 @@ jobs:
           printf 'mok_signing_key="/var/lib/anticheat/mok/mok.priv"\nmok_certificate="/var/lib/anticheat/mok/mok.der"\n' \
             | sudo tee /etc/dkms/framework.conf.d/anticheat.conf >/dev/null
 
-          sudo mkdir -p /usr/src/anticheat-1.0.0
-          sudo cp -a Makefile dkms.conf src /usr/src/anticheat-1.0.0/
+          sudo mkdir -p "/usr/src/anticheat-${PKG_VER}"
+          sudo cp -a Makefile dkms.conf src "/usr/src/anticheat-${PKG_VER}/"
 
-          sudo dkms add -m anticheat -v 1.0.0
+          sudo dkms add -m anticheat -v "$PKG_VER"
 
           # Same undefined-symbol workaround as the manual build above: the
           # prepared-but-never-linked tree has no Module.symvers.
           sudo env KBUILD_EXTRA_SYMBOLS="$PWD/ksymvers" \
-            dkms build -m anticheat -v 1.0.0 -k "$KVER"
+            dkms build -m anticheat -v "$PKG_VER" -k "$KVER"
 
           sudo dkms status -m anticheat
-          built_ko="$(find "/var/lib/dkms/anticheat/1.0.0/${KVER}" \
+          built_ko="$(find "/var/lib/dkms/anticheat/${PKG_VER}/${KVER}" \
             -name 'anticheat.ko' -print -quit)"
           test -n "$built_ko" && test -s "$built_ko"
           # sig_id alone only proves *some* signature was applied, not
