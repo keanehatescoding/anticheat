@@ -335,20 +335,16 @@ static char *proc_exe_path(int pid)
     return link;
 }
 
-/* hash [start, start+size) of /proc/<pid>/mem; returns 0 on success */
-static int hash_proc_mem(int pid, uint64_t start, uint64_t size,
+/* hash [start, start+size) as read through `mem_fd`, an already-open
+ * /proc/<pid>/mem fd; returns 0 on success. Takes an fd rather than a pid
+ * so callers hashing several VMAs of the same process open it once
+ * instead of once per VMA. */
+static int hash_proc_mem(int mem_fd, uint64_t start, uint64_t size,
                          char out_hex[65])
 {
-    char path[64];
     ac_sha256_ctx ctx;
-    int fd;
     uint64_t done = 0;
     uint8_t buf[AC_READ_CHUNK];
-
-    snprintf(path, sizeof(path), "/proc/%d/mem", pid);
-    fd = open(path, O_RDONLY);
-    if (fd < 0)
-        return -1;
 
     ac_sha256_init(&ctx);
     while (done < size) {
@@ -357,18 +353,25 @@ static int hash_proc_mem(int pid, uint64_t start, uint64_t size,
 
         if (want > sizeof(buf))
             want = sizeof(buf);
-        r = pread(fd, buf, want, (off_t)(start + done));
+        r = pread(mem_fd, buf, want, (off_t)(start + done));
         if (r < 0) {
-            /* skip unreadable page-aligned chunk */
-            done += want;
-            continue;
+            /* Part of the range is unreadable (swapped, a hole, or made
+             * unreadable on purpose): the digest would silently cover only
+             * part of the range, so fail the whole hash instead of
+             * reporting a false match/mismatch against the baseline. */
+            return -1;
         }
         if (r == 0)
-            break;
+            break;   /* short read: handled below, same as any other gap */
         ac_sha256_update(&ctx, buf, (size_t)r);
         done += (uint64_t)r;
     }
-    close(fd);
+    if (done < size) {
+        /* pread() hit EOF before covering the whole requested range --
+         * the same silent-partial-coverage case as the r < 0 branch
+         * above, just via a short read instead of an error. */
+        return -1;
+    }
     {
         uint8_t d[32];
         static const char hexd[] = "0123456789abcdef";
@@ -690,23 +693,54 @@ static int compare_render_symbol(int pid, const char *libpath,
     return memcmp(expected, actual, checklen) != 0 ? 1 : 0;
 }
 
-/* Single streaming pass over the target's VMAs to find the load base of
- * whichever mapped library's basename starts with `prefix` (e.g.
- * "libvulkan.so", "libGL.so"), without collecting the (potentially
- * thousands-of-entries) VMA list into memory -- same "don't build a big
- * buffer you don't need" discipline as the rest of this file. Returns 1
- * if found (and fills libpath/lib_base), 0 if not loaded in this
- * process, -1 on ioctl failure. */
-static int find_lib_by_basename(int pid, const char *prefix, char *libpath,
-                                 size_t libpath_sz, unsigned long long *lib_base)
+/* Every rendering API a Linux game is realistically using -- native
+ * Vulkan (and Proton D3D9/10/11/12 via DXVK/VKD3D, which translate down
+ * to Vulkan too) via vkQueuePresentKHR; native OpenGL or older Proton
+ * titles still on wined3d's GL backend via glXSwapBuffers; and anything
+ * using EGL instead of GLX to create its GL/GLES context (increasingly
+ * common under Wayland, and for GLES-based engines) via eglSwapBuffers.
+ * Single source of truth for both check_render_hooks() and its periodic
+ * counterpart below, so the two can't drift on which APIs/symbols they
+ * check. */
+static const struct {
+    const char *lib_prefix;
+    const char *symbol;
+    const char *label;
+} AC_RENDER_APIS[] = {
+    { "libvulkan.so", "vkQueuePresentKHR", "Vulkan" },
+    { "libGL.so",     "glXSwapBuffers",    "GLX/OpenGL" },
+    { "libEGL.so",    "eglSwapBuffers",    "EGL" },
+};
+#define AC_RENDER_APIS_COUNT \
+    (sizeof(AC_RENDER_APIS) / sizeof(AC_RENDER_APIS[0]))
+
+struct ac_lib_result {
+    int found;                    /* 1 = located, 0 = not loaded */
+    unsigned long long lib_base;
+    char libpath[AC_VMA_PATH];
+};
+
+/* Single streaming pass over the target's VMAs that locates the load
+ * base of every AC_RENDER_APIS[] library at once -- one
+ * SCAN_BEGIN/SCAN_GET/SCAN_END cycle for all n prefixes instead of one
+ * per prefix, without collecting the (potentially thousands-of-entries)
+ * VMA list into memory -- same "don't build a big buffer you don't
+ * need" discipline as the rest of this file. results[] must have n
+ * entries, index-aligned with prefixes[]/prefix_lens[]. Returns 0 on
+ * success (each results[k].found reports whether that prefix matched
+ * anything), -1 on ioctl failure. */
+static int find_libs_by_basenames(int pid, const char *const *prefixes,
+                                   const size_t *prefix_lens, unsigned int n,
+                                   struct ac_lib_result *results)
 {
     struct ac_scan_begin b;
-    unsigned int v;
-    size_t prefix_len = strlen(prefix);
-    int found = 0;
+    unsigned int v, k;
 
-    libpath[0] = '\0';
-    *lib_base = 0;
+    for (k = 0; k < n; k++) {
+        results[k].found = 0;
+        results[k].lib_base = 0;
+        results[k].libpath[0] = '\0';
+    }
 
     memset(&b, 0, sizeof(b));
     b.pid = pid;
@@ -728,38 +762,59 @@ static int find_lib_by_basename(int pid, const char *prefix, char *libpath,
             continue;
         base = strrchr(vi->path, '/');
         base = base ? base + 1 : vi->path;
-        if (strncmp(base, prefix, prefix_len) != 0)
-            continue;
-        if (!found || vi->start < *lib_base) {
-            *lib_base = vi->start;
-            snprintf(libpath, libpath_sz, "%s", vi->path);
-            found = 1;
+        for (k = 0; k < n; k++) {
+            if (strncmp(base, prefixes[k], prefix_lens[k]) != 0)
+                continue;
+            if (!results[k].found || vi->start < results[k].lib_base) {
+                results[k].lib_base = vi->start;
+                snprintf(results[k].libpath, sizeof(results[k].libpath),
+                         "%s", vi->path);
+                results[k].found = 1;
+            }
         }
     }
     ioctl(dev_fd, AC_IOCTL_SCAN_END, NULL);
-    return found;
+    return 0;
 }
 
-/* render_hook_status_for(): the single source of truth both the one-shot
- * CLI check and the periodic daemon check build on, for a given
- * (library basename prefix, exported symbol) pair -- e.g.
- * ("libvulkan.so", "vkQueuePresentKHR") or ("libGL.so",
- * "glXSwapBuffers"). Returns -2 (that library not loaded in this
- * process -- not an error, most processes only use one rendering API),
- * -1 (inconclusive), 0 (clean), or 1 (hooked); fills libpath on any
- * non-(-2) result. */
-static int render_hook_status_for(int pid, const char *lib_prefix,
-                                   const char *symbol, char *libpath,
-                                   size_t libpath_sz)
+/* render_hook_statuses_for(): the single source of truth both the
+ * one-shot CLI check and the periodic daemon check build on -- locates
+ * every AC_RENDER_APIS[] library in one VMA pass via
+ * find_libs_by_basenames(), then compares each one that's actually
+ * loaded against a freshly-loaded reference copy. statuses[] must have
+ * AC_RENDER_APIS_COUNT entries. Each status is -2 (that library not
+ * loaded in this process -- not an error, most processes only use one
+ * rendering API), -1 (inconclusive), 0 (clean), or 1 (hooked); libpaths[]
+ * (same length, each AC_VMA_PATH bytes) is filled on any non-(-2)
+ * status. */
+static void render_hook_statuses_for(int pid, int *statuses,
+                                      char libpaths[][AC_VMA_PATH])
 {
-    unsigned long long lib_base;
-    int found = find_lib_by_basename(pid, lib_prefix, libpath, libpath_sz, &lib_base);
+    struct ac_lib_result results[AC_RENDER_APIS_COUNT];
+    const char *prefixes[AC_RENDER_APIS_COUNT];
+    size_t prefix_lens[AC_RENDER_APIS_COUNT];
+    unsigned int k;
+    int rc;
 
-    if (found < 0)
-        return -1;
-    if (found == 0)
-        return -2;
-    return compare_render_symbol(pid, libpath, lib_base, symbol);
+    for (k = 0; k < AC_RENDER_APIS_COUNT; k++) {
+        prefixes[k] = AC_RENDER_APIS[k].lib_prefix;
+        prefix_lens[k] = strlen(AC_RENDER_APIS[k].lib_prefix);
+    }
+    rc = find_libs_by_basenames(pid, prefixes, prefix_lens,
+                                 AC_RENDER_APIS_COUNT, results);
+    for (k = 0; k < AC_RENDER_APIS_COUNT; k++) {
+        libpaths[k][0] = '\0';
+        if (rc < 0) {
+            statuses[k] = -1;
+        } else if (!results[k].found) {
+            statuses[k] = -2;
+        } else {
+            snprintf(libpaths[k], AC_VMA_PATH, "%s", results[k].libpath);
+            statuses[k] = compare_render_symbol(pid, results[k].libpath,
+                                                 results[k].lib_base,
+                                                 AC_RENDER_APIS[k].symbol);
+        }
+    }
 }
 
 /* Shared presentation for one (api, symbol) check's result -- used by
@@ -793,34 +848,23 @@ static int print_render_hook_result(int pid, const char *api_label,
     }
 }
 
-/* CLI-facing wrapper for `scan --check-hooks`: checks every rendering
- * API a Linux game is realistically using -- native Vulkan (and Proton
- * D3D9/10/11/12 via DXVK/VKD3D, which translate down to Vulkan too) via
- * vkQueuePresentKHR; native OpenGL or older Proton titles still on
- * wined3d's GL backend via glXSwapBuffers; and anything using EGL
- * instead of GLX to create its GL/GLES context (increasingly common
- * under Wayland, and for GLES-based engines) via eglSwapBuffers. A
- * process only using one or two of the three cleanly reports the rest
- * as "not loaded", not an error. */
+/* CLI-facing wrapper for `scan --check-hooks`. A process only using one
+ * or two of the APIs above cleanly reports the rest as "not loaded", not
+ * an error. */
 static int check_render_hooks(int pid)
 {
-    char libpath[AC_VMA_PATH];
-    int status, hooked = 0;
+    int statuses[AC_RENDER_APIS_COUNT];
+    char libpaths[AC_RENDER_APIS_COUNT][AC_VMA_PATH];
+    int hooked = 0;
+    unsigned int i;
 
-    status = render_hook_status_for(pid, "libvulkan.so", "vkQueuePresentKHR",
-                                     libpath, sizeof(libpath));
-    if (print_render_hook_result(pid, "Vulkan", "vkQueuePresentKHR", libpath, status))
-        hooked = 1;
-
-    status = render_hook_status_for(pid, "libGL.so", "glXSwapBuffers",
-                                     libpath, sizeof(libpath));
-    if (print_render_hook_result(pid, "GLX/OpenGL", "glXSwapBuffers", libpath, status))
-        hooked = 1;
-
-    status = render_hook_status_for(pid, "libEGL.so", "eglSwapBuffers",
-                                     libpath, sizeof(libpath));
-    if (print_render_hook_result(pid, "EGL", "eglSwapBuffers", libpath, status))
-        hooked = 1;
+    render_hook_statuses_for(pid, statuses, libpaths);
+    for (i = 0; i < AC_RENDER_APIS_COUNT; i++) {
+        if (print_render_hook_result(pid, AC_RENDER_APIS[i].label,
+                                      AC_RENDER_APIS[i].symbol,
+                                      libpaths[i], statuses[i]))
+            hooked = 1;
+    }
 
     return hooked;
 }
@@ -835,38 +879,24 @@ static int check_render_hooks(int pid)
 static void check_render_hooks_periodic(void)
 {
     struct ac_prot_list pl;
-    unsigned int i;
+    unsigned int i, j;
 
     memset(&pl, 0, sizeof(pl));
     if (ioctl(dev_fd, AC_IOCTL_LIST_PROTECTED, &pl) < 0)
         return;
     for (i = 0; i < pl.count; i++) {
-        char libpath[AC_VMA_PATH];
-        int status;
+        int statuses[AC_RENDER_APIS_COUNT];
+        char libpaths[AC_RENDER_APIS_COUNT][AC_VMA_PATH];
 
-        status = render_hook_status_for(pl.items[i].pid, "libvulkan.so",
-                                         "vkQueuePresentKHR", libpath, sizeof(libpath));
-        if (status == 1)
-            logmsg(LOG_CRIT, "pid %d (%s): render hook detected in %s "
-                   "(vkQueuePresentKHR differs from a freshly-loaded reference "
-                   "copy -- possible ESP/overlay/render hijack)",
-                   pl.items[i].pid, pl.items[i].comm, libpath);
-
-        status = render_hook_status_for(pl.items[i].pid, "libGL.so",
-                                         "glXSwapBuffers", libpath, sizeof(libpath));
-        if (status == 1)
-            logmsg(LOG_CRIT, "pid %d (%s): render hook detected in %s "
-                   "(glXSwapBuffers differs from a freshly-loaded reference "
-                   "copy -- possible ESP/overlay/render hijack)",
-                   pl.items[i].pid, pl.items[i].comm, libpath);
-
-        status = render_hook_status_for(pl.items[i].pid, "libEGL.so",
-                                         "eglSwapBuffers", libpath, sizeof(libpath));
-        if (status == 1)
-            logmsg(LOG_CRIT, "pid %d (%s): render hook detected in %s "
-                   "(eglSwapBuffers differs from a freshly-loaded reference "
-                   "copy -- possible ESP/overlay/render hijack)",
-                   pl.items[i].pid, pl.items[i].comm, libpath);
+        render_hook_statuses_for(pl.items[i].pid, statuses, libpaths);
+        for (j = 0; j < AC_RENDER_APIS_COUNT; j++) {
+            if (statuses[j] == 1)
+                logmsg(LOG_CRIT, "pid %d (%s): render hook detected in %s "
+                       "(%s differs from a freshly-loaded reference copy -- "
+                       "possible ESP/overlay/render hijack)",
+                       pl.items[i].pid, pl.items[i].comm, libpaths[j],
+                       AC_RENDER_APIS[j].symbol);
+        }
     }
 }
 
@@ -976,6 +1006,7 @@ static int cmd_scan(int argc, char **argv)
     char exe[PATH_MAX] = "";
     char *exe_link;
     unsigned int v;
+    int mem_fd = -1;
 
     for (i = 0; i < argc; i++) {
         if (strcmp(argv[i], "--pid") == 0 && i + 1 < argc)
@@ -1016,6 +1047,27 @@ static int cmd_scan(int argc, char **argv)
     if (b.truncated)
         printf("  (VMA snapshot truncated at %u entries)\n", AC_MAX_VMAS);
 
+    if (do_hash) {
+        char mem_path[64];
+
+        exe_link = proc_exe_path(pid);
+        if (exe_link)
+            snprintf(exe, sizeof(exe), "%s", exe_link);
+
+        /* Opened once here rather than once per VMA inside the loop
+         * below: a process can have many executable file-backed VMAs,
+         * and they all read through the same /proc/<pid>/mem fd. */
+        snprintf(mem_path, sizeof(mem_path), "/proc/%d/mem", pid);
+        mem_fd = open(mem_path, O_RDONLY);
+        if (mem_fd < 0)
+            fprintf(stderr, "cannot open %s: %s\n", mem_path, strerror(errno));
+    }
+
+    /* Single pass over the VMA snapshot: the default print/RWX/anon-exec
+     * report and the --hash walk both need "every executable, file-backed
+     * VMA", so branch into hash/save/check handling from the same loop
+     * instead of re-running AC_IOCTL_SCAN_BEGIN/GET/END a second time to
+     * re-walk VMAs already fetched above. */
     for (v = 0; v < b.n_vmas; v++) {
         struct ac_scan_get g;
         struct ac_vma_info *vi;
@@ -1035,8 +1087,65 @@ static int cmd_scan(int argc, char **argv)
         else if ((vi->flags & AC_VM_EXEC) && g_verbose)
             printf("  exec [%#llx-%#llx] %s\n",
                    vi->start, vi->end, vi->path[0] ? vi->path : "(anonymous)");
+
+        if (do_hash && (vi->flags & AC_VM_EXEC) && vi->is_file) {
+            char hex[65], blpath[PATH_MAX], line[512];
+            uint64_t size;
+            FILE *f;
+            int changed = 0;
+
+            size = vi->end - vi->start;
+            if (size > AC_HASH_CAP)
+                size = AC_HASH_CAP;
+            if (mem_fd < 0 || hash_proc_mem(mem_fd, vi->start, size, hex) < 0) {
+                printf("  hash failed for %s\n", vi->path);
+                continue;
+            }
+            baseline_path_for(vi->path, blpath);
+            printf("  %s [%#llx..%#llx] %s\n",
+                   vi->path, vi->start, vi->start + size, hex);
+
+            if (do_save) {
+                ac_mkdir_baselines();
+                f = fopen(blpath, "w");
+                if (!f) {
+                    fprintf(stderr, "cannot write baseline %s: %s\n",
+                            blpath, strerror(errno));
+                    continue;
+                }
+                fprintf(f, "%llx %llx %s\n",
+                        (unsigned long long)vi->start,
+                        (unsigned long long)size, hex);
+                fclose(f);
+                printf("    baseline saved: %s\n", blpath);
+            }
+            if (do_check) {
+                f = fopen(blpath, "r");
+                if (!f) {
+                    printf("    no baseline for %s (run with --save first)\n",
+                           vi->path);
+                    continue;
+                }
+                if (fgets(line, sizeof(line), f)) {
+                    unsigned long long bs, bsz;
+                    char bhex[65];
+                    if (sscanf(line, "%llx %llx %64s", &bs, &bsz, bhex) == 3) {
+                        if (strcmp(bhex, hex) != 0)
+                            changed = 1;
+                    }
+                }
+                fclose(f);
+                if (changed)
+                    printf("    [ALERT] memory content differs from baseline"
+                           " (possible runtime patching)\n");
+                else
+                    printf("    ok: matches baseline\n");
+            }
+        }
     }
     ioctl(dev_fd, AC_IOCTL_SCAN_END, NULL);
+    if (mem_fd >= 0)
+        close(mem_fd);
 
     if (do_hooks)
         check_render_hooks(pid);
@@ -1050,82 +1159,6 @@ static int cmd_scan(int argc, char **argv)
     if (do_implicit)
         check_implicit_layers(pid);
 
-    if (do_hash) {
-        exe_link = proc_exe_path(pid);
-        if (exe_link)
-            snprintf(exe, sizeof(exe), "%s", exe_link);
-
-        memset(&b, 0, sizeof(b));
-        b.pid = pid;
-        b.emit_events = 1;
-        if (ioctl(dev_fd, AC_IOCTL_SCAN_BEGIN, &b) == 0) {
-            for (v = 0; v < b.n_vmas; v++) {
-                struct ac_scan_get g;
-                struct ac_vma_info *vi;
-                char hex[65], blpath[PATH_MAX], line[512];
-                uint64_t size;
-                FILE *f;
-                int changed = 0;
-
-                memset(&g, 0, sizeof(g));
-                g.pid = pid;
-                g.index = v;
-                if (ioctl(dev_fd, AC_IOCTL_SCAN_GET, &g) < 0)
-                    break;
-                vi = &g.vma;
-                if (!(vi->flags & AC_VM_EXEC) || !vi->is_file)
-                    continue;
-                size = vi->end - vi->start;
-                if (size > AC_HASH_CAP)
-                    size = AC_HASH_CAP;
-                if (hash_proc_mem(pid, vi->start, size, hex) < 0) {
-                    printf("  hash failed for %s\n", vi->path);
-                    continue;
-                }
-                baseline_path_for(vi->path, blpath);
-                printf("  %s [%#llx..%#llx] %s\n",
-                       vi->path, vi->start, vi->start + size, hex);
-
-                if (do_save) {
-                    ac_mkdir_baselines();
-                    f = fopen(blpath, "w");
-                    if (!f) {
-                        fprintf(stderr, "cannot write baseline %s: %s\n",
-                                blpath, strerror(errno));
-                        continue;
-                    }
-                    fprintf(f, "%llx %llx %s\n",
-                            (unsigned long long)vi->start,
-                            (unsigned long long)size, hex);
-                    fclose(f);
-                    printf("    baseline saved: %s\n", blpath);
-                }
-                if (do_check) {
-                    f = fopen(blpath, "r");
-                    if (!f) {
-                        printf("    no baseline for %s (run with --save first)\n",
-                               vi->path);
-                        continue;
-                    }
-                    if (fgets(line, sizeof(line), f)) {
-                        unsigned long long bs, bsz;
-                        char bhex[65];
-                        if (sscanf(line, "%llx %llx %64s", &bs, &bsz, bhex) == 3) {
-                            if (strcmp(bhex, hex) != 0)
-                                changed = 1;
-                        }
-                    }
-                    fclose(f);
-                    if (changed)
-                        printf("    [ALERT] memory content differs from baseline"
-                               " (possible runtime patching)\n");
-                    else
-                        printf("    ok: matches baseline\n");
-                }
-            }
-            ioctl(dev_fd, AC_IOCTL_SCAN_END, NULL);
-        }
-    }
     ac_close();
     return 0;
 }
@@ -2361,6 +2394,8 @@ static int check_baselines_periodic(void)
     for (i = 0; i < pl.count; i++) {
         struct ac_scan_begin b;
         unsigned int v;
+        int mem_fd = -1;
+        int mem_open_failed = 0;
 
         memset(&b, 0, sizeof(b));
         b.pid = pl.items[i].pid;
@@ -2395,16 +2430,41 @@ static int check_baselines_periodic(void)
             if (sscanf(line, "%llx %llx %64s", &bs, &bsz, bhex) != 3)
                 continue;
 
+            /* Opened lazily on the first VMA that actually has a saved
+             * baseline, and reused for the rest of this pid's VMAs --
+             * most protected processes have at most a handful of
+             * baselined mappings out of possibly many VMAs, so this
+             * avoids an open() for every single one. mem_open_failed
+             * distinguishes "not tried yet" from "tried and failed" so a
+             * permission/ENOENT failure (the pid is gone, or raced past
+             * yama ptrace_scope) isn't retried on every remaining VMA of
+             * this same pid. */
+            if (mem_fd < 0) {
+                char mem_path[64];
+
+                if (mem_open_failed)
+                    continue;
+                snprintf(mem_path, sizeof(mem_path), "/proc/%d/mem",
+                         pl.items[i].pid);
+                mem_fd = open(mem_path, O_RDONLY);
+                if (mem_fd < 0) {
+                    mem_open_failed = 1;
+                    continue;
+                }
+            }
+
             size = vi->end - vi->start;
             if (size > AC_HASH_CAP)
                 size = AC_HASH_CAP;
-            if (hash_proc_mem(pl.items[i].pid, vi->start, size, hex) < 0)
+            if (hash_proc_mem(mem_fd, vi->start, size, hex) < 0)
                 continue;
             if (strcmp(bhex, hex) != 0)
                 logmsg(LOG_CRIT, "pid %d (%s): memory content of %s differs "
                        "from saved baseline (possible runtime patching)",
                        pl.items[i].pid, pl.items[i].comm, vi->path);
         }
+        if (mem_fd >= 0)
+            close(mem_fd);
         ioctl(dev_fd, AC_IOCTL_SCAN_END, NULL);
     }
     return 0;
@@ -2485,6 +2545,115 @@ static int ac_connect_timeout(int fd, const struct sockaddr *addr,
     return 0;
 }
 
+#define AC_RESOLVE_MAX 8
+
+struct ac_resolved_addr {
+    int family;
+    int socktype;
+    int protocol;
+    socklen_t addrlen;
+    struct sockaddr_storage addr;
+};
+
+/* getaddrinfo() has no built-in timeout: against a slow or blackholed DNS
+ * path it can block for the resolver's own timeout, which runs well past
+ * AC_REPORT_TIMEOUT_SEC. ac_report() runs synchronously in the daemon's
+ * only thread, so an unbounded resolve here would stall AC_IOCTL_GET_EVENTS
+ * polling and let the kernel-side event ring fill and start dropping real
+ * detections. Resolve in a short-lived child and bound how long we wait
+ * for it with poll(), the same technique ac_connect_timeout() above uses
+ * to bound connect(). Returns the number of addresses resolved (>=0), or
+ * -1 on failure/timeout; the child is always reaped before returning. */
+static int ac_resolve_timeout(const char *host, const char *port,
+                               struct ac_resolved_addr *out, int max,
+                               int timeout_sec)
+{
+    int pfd[2];
+    pid_t pid;
+    int n = 0;
+
+    if (pipe(pfd) < 0)
+        return -1;
+
+    pid = fork();
+    if (pid < 0) {
+        close(pfd[0]);
+        close(pfd[1]);
+        return -1;
+    }
+    if (pid == 0) {
+        struct addrinfo hints, *res, *rp;
+
+        close(pfd[0]);
+        /* fork() without exec() carries every inherited fd into the
+         * child, O_CLOEXEC or not -- including dev_fd, the daemon's
+         * held-open /dev/anticheat handle (see ac_open()'s comment on
+         * what keeping it open does: pins the module for as long as an
+         * fd is held). This child only needs the write end of its own
+         * pipe; drop the rest before doing anything else so a resolve
+         * triggered mid-scan doesn't leave a second, redundant reference
+         * to the device alive in a second process. */
+        if (dev_fd >= 0)
+            close(dev_fd);
+        memset(&hints, 0, sizeof(hints));
+        hints.ai_family = AF_UNSPEC;
+        hints.ai_socktype = SOCK_STREAM;
+        if (getaddrinfo(host, port, &hints, &res) == 0) {
+            for (rp = res; rp; rp = rp->ai_next) {
+                struct ac_resolved_addr a;
+
+                if (rp->ai_addrlen > sizeof(a.addr))
+                    continue;
+                memset(&a, 0, sizeof(a));
+                a.family = rp->ai_family;
+                a.socktype = rp->ai_socktype;
+                a.protocol = rp->ai_protocol;
+                a.addrlen = rp->ai_addrlen;
+                memcpy(&a.addr, rp->ai_addr, rp->ai_addrlen);
+                if (write(pfd[1], &a, sizeof(a)) != (ssize_t)sizeof(a))
+                    break;
+            }
+            freeaddrinfo(res);
+        }
+        close(pfd[1]);
+        _exit(0);
+    }
+
+    close(pfd[1]);
+    /* An absolute deadline, not a per-call timeout_sec passed to every
+     * poll(): restarting the full timeout on each iteration would let a
+     * resolver trickling out one address per interval (or a slow child)
+     * keep the parent here for up to (max + 1) * timeout_sec -- exactly
+     * the unbounded stall this whole function exists to prevent. */
+    struct timespec deadline;
+    clock_gettime(CLOCK_MONOTONIC, &deadline);
+    deadline.tv_sec += timeout_sec;
+    for (;;) {
+        struct pollfd p = { .fd = pfd[0], .events = POLLIN };
+        struct ac_resolved_addr a;
+        struct timespec now;
+        long remaining_ms;
+        ssize_t r;
+
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        remaining_ms = (deadline.tv_sec - now.tv_sec) * 1000L +
+                       (deadline.tv_nsec - now.tv_nsec) / 1000000L;
+        if (remaining_ms <= 0)
+            break;   /* overall resolve deadline exceeded */
+        if (poll(&p, 1, (int)remaining_ms) <= 0)
+            break;   /* timed out waiting on the resolver, or poll error */
+        r = read(pfd[0], &a, sizeof(a));
+        if (r <= 0)
+            break;   /* child is done (successfully or not) */
+        if (r == (ssize_t)sizeof(a) && n < max)
+            out[n++] = a;
+    }
+    close(pfd[0]);
+    kill(pid, SIGKILL);
+    waitpid(pid, NULL, 0);
+    return n;
+}
+
 /* Escapes a string for embedding in a JSON string literal. event_type and
  * detail both ultimately derive from formatted log messages that can
  * contain attacker-influenced bytes (a process's comm name, a file path
@@ -2550,8 +2719,8 @@ static void ac_report(const char *event_type, const char *detail)
     char body[1024], req[2048], resp[64];
     const char *port;
     char *colon;
-    struct addrinfo hints, *res, *rp;
-    int fd = -1, rc;
+    struct ac_resolved_addr addrs[AC_RESOLVE_MAX];
+    int fd = -1, naddrs, ai;
     struct timeval tv;
     ssize_t n;
 
@@ -2575,34 +2744,30 @@ static void ac_report(const char *event_type, const char *detail)
              "\"ts\":%lld}",
              client_id, et_esc, detail_esc, (long long)time(NULL));
 
-    memset(&hints, 0, sizeof(hints));
-    hints.ai_family = AF_UNSPEC;
-    hints.ai_socktype = SOCK_STREAM;
-    rc = getaddrinfo(host, port, &hints, &res);
-    if (rc != 0) {
-        fprintf(stderr, "ac_report: getaddrinfo(%s:%s): %s\n",
-                host, port, gai_strerror(rc));
+    naddrs = ac_resolve_timeout(host, port, addrs, AC_RESOLVE_MAX,
+                                 AC_REPORT_TIMEOUT_SEC);
+    if (naddrs <= 0) {
+        fprintf(stderr, "ac_report: could not resolve %s:%s\n", host, port);
         return;
     }
     /* A hung/unreachable report server must never stall the security
      * monitoring loop -- ac_connect_timeout() bounds connect() itself
      * (which SO_SNDTIMEO/SO_RCVTIMEO do not, on Linux), and those two
      * still bound the subsequent send/recv on whichever address works. */
-    for (rp = res; rp; rp = rp->ai_next) {
-        fd = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
+    for (ai = 0; ai < naddrs; ai++) {
+        fd = socket(addrs[ai].family, addrs[ai].socktype, addrs[ai].protocol);
         if (fd < 0)
             continue;
         tv.tv_sec = AC_REPORT_TIMEOUT_SEC;
         tv.tv_usec = 0;
         setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
         setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-        if (ac_connect_timeout(fd, rp->ai_addr, rp->ai_addrlen,
-                                AC_REPORT_TIMEOUT_SEC) == 0)
+        if (ac_connect_timeout(fd, (struct sockaddr *)&addrs[ai].addr,
+                                addrs[ai].addrlen, AC_REPORT_TIMEOUT_SEC) == 0)
             break;
         close(fd);
         fd = -1;
     }
-    freeaddrinfo(res);
     if (fd < 0) {
         fprintf(stderr, "ac_report: could not connect to %s:%s\n", host, port);
         return;

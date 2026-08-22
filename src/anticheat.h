@@ -89,7 +89,6 @@ struct ac_status {
     unsigned int        events_dropped;   /* ring buffer drops since load */
     unsigned int        locked;           /* module pinned by lock ioctl */
     unsigned int        syscall_hook_count; /* from last CHECK_SYSCALLS */
-    unsigned int        hidden_modules;     /* from last module check */
 };
 
 struct ac_proc_id {
