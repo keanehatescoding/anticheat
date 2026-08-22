@@ -402,7 +402,7 @@ def make_handler(store, report_keys, admin_keys, rate_limiter, trust_proxy=False
             body and pull out a valid client_id, sending the appropriate
             400 response and returning None if either step fails."""
             body = self._read_json_body()
-            if not body:
+            if not isinstance(body, dict) or not body:
                 self._send_json(400, {"error": "bad request"})
                 return None
             if not self._valid_client_id(body.get("client_id")):

@@ -362,9 +362,15 @@ static int hash_proc_mem(int mem_fd, uint64_t start, uint64_t size,
             return -1;
         }
         if (r == 0)
-            break;
+            break;   /* short read: handled below, same as any other gap */
         ac_sha256_update(&ctx, buf, (size_t)r);
         done += (uint64_t)r;
+    }
+    if (done < size) {
+        /* pread() hit EOF before covering the whole requested range --
+         * the same silent-partial-coverage case as the r < 0 branch
+         * above, just via a short read instead of an error. */
+        return -1;
     }
     {
         uint8_t d[32];
@@ -2595,12 +2601,27 @@ static int ac_resolve_timeout(const char *host, const char *port,
     }
 
     close(pfd[1]);
+    /* An absolute deadline, not a per-call timeout_sec passed to every
+     * poll(): restarting the full timeout on each iteration would let a
+     * resolver trickling out one address per interval (or a slow child)
+     * keep the parent here for up to (max + 1) * timeout_sec -- exactly
+     * the unbounded stall this whole function exists to prevent. */
+    struct timespec deadline;
+    clock_gettime(CLOCK_MONOTONIC, &deadline);
+    deadline.tv_sec += timeout_sec;
     for (;;) {
         struct pollfd p = { .fd = pfd[0], .events = POLLIN };
         struct ac_resolved_addr a;
+        struct timespec now;
+        long remaining_ms;
         ssize_t r;
 
-        if (poll(&p, 1, timeout_sec * 1000) <= 0)
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        remaining_ms = (deadline.tv_sec - now.tv_sec) * 1000L +
+                       (deadline.tv_nsec - now.tv_nsec) / 1000000L;
+        if (remaining_ms <= 0)
+            break;   /* overall resolve deadline exceeded */
+        if (poll(&p, 1, (int)remaining_ms) <= 0)
             break;   /* timed out waiting on the resolver, or poll error */
         r = read(pfd[0], &a, sizeof(a));
         if (r <= 0)
