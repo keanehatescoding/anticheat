@@ -2395,6 +2395,7 @@ static int check_baselines_periodic(void)
         struct ac_scan_begin b;
         unsigned int v;
         int mem_fd = -1;
+        int mem_open_failed = 0;
 
         memset(&b, 0, sizeof(b));
         b.pid = pl.items[i].pid;
@@ -2433,15 +2434,23 @@ static int check_baselines_periodic(void)
              * baseline, and reused for the rest of this pid's VMAs --
              * most protected processes have at most a handful of
              * baselined mappings out of possibly many VMAs, so this
-             * avoids an open() for every single one. */
+             * avoids an open() for every single one. mem_open_failed
+             * distinguishes "not tried yet" from "tried and failed" so a
+             * permission/ENOENT failure (the pid is gone, or raced past
+             * yama ptrace_scope) isn't retried on every remaining VMA of
+             * this same pid. */
             if (mem_fd < 0) {
                 char mem_path[64];
 
+                if (mem_open_failed)
+                    continue;
                 snprintf(mem_path, sizeof(mem_path), "/proc/%d/mem",
                          pl.items[i].pid);
                 mem_fd = open(mem_path, O_RDONLY);
-                if (mem_fd < 0)
+                if (mem_fd < 0) {
+                    mem_open_failed = 1;
                     continue;
+                }
             }
 
             size = vi->end - vi->start;
@@ -2576,6 +2585,16 @@ static int ac_resolve_timeout(const char *host, const char *port,
         struct addrinfo hints, *res, *rp;
 
         close(pfd[0]);
+        /* fork() without exec() carries every inherited fd into the
+         * child, O_CLOEXEC or not -- including dev_fd, the daemon's
+         * held-open /dev/anticheat handle (see ac_open()'s comment on
+         * what keeping it open does: pins the module for as long as an
+         * fd is held). This child only needs the write end of its own
+         * pipe; drop the rest before doing anything else so a resolve
+         * triggered mid-scan doesn't leave a second, redundant reference
+         * to the device alive in a second process. */
+        if (dev_fd >= 0)
+            close(dev_fd);
         memset(&hints, 0, sizeof(hints));
         hints.ai_family = AF_UNSPEC;
         hints.ai_socktype = SOCK_STREAM;
