@@ -356,6 +356,7 @@ static struct ac_event ac_ring[AC_RING_SIZE];
 static unsigned int ac_ring_head, ac_ring_tail, ac_ring_count;
 static DEFINE_SPINLOCK(ac_ring_lock);
 static unsigned int ac_dropped;
+static unsigned int ac_last_hook_count;
 
 static void ac_emit(unsigned int type, int pid, const char *comm,
                     const char *fmt, ...)
@@ -664,19 +665,29 @@ static void ac_schedule_kill(struct task_struct *victim)
 /* ------------------------------------------------------------------ */
 /* kprobes                                                             */
 /* ------------------------------------------------------------------ */
+static struct kprobe ac_kp_ptrace32;
+
 static int ac_ptrace_pre(struct kprobe *p, struct pt_regs *regs)
 {
     /*
      * Modern x86-64 syscall wrappers (__x64_sys_*, __ia32_sys_*) are
      * `long f(const struct pt_regs *regs)`: %rdi at entry points to the
      * syscall's pt_regs frame, and the wrapper unpacks the arguments
-     * from it.  The prologue loads args->di (offset 0x70) as the request
-     * and args->si (offset 0x68) as the pid, so regs->di is the frame
-     * pointer, not the request.
+     * from it.  regs->di is the frame pointer, not the request.
+     *
+     * The native (__x64_sys_ptrace) wrapper unpacks its first two
+     * arguments from args->di/args->si (the x86-64 argument registers).
+     * The compat (__ia32_sys_ptrace) wrapper instead unpacks them from
+     * args->bx/args->cx, since ia32 syscall entry passes arguments in
+     * ebx, ecx, edx, esi, edi, ebp rather than the native ABI's rdi,
+     * rsi, rdx, r10, r8, r9. Reading di/si for the compat probe would
+     * pick up the wrong register (ia32 arg5/arg4), silently mismatching
+     * every compat ptrace() call.
      */
     struct pt_regs *args = (struct pt_regs *)regs->di;
-    long request = args->di;
-    long target = args->si;
+    bool is_compat = (p == &ac_kp_ptrace32);
+    long request = is_compat ? args->bx : args->di;
+    long target = is_compat ? args->cx : args->si;
     char tcomm[AC_MAX_COMM] = "?";
     bool deny = false, kill = false;
 
@@ -708,7 +719,10 @@ static int ac_ptrace_pre(struct kprobe *p, struct pt_regs *regs)
     /* Neutralise the syscall: rewrite the request slot in the frame to an
      * invalid value.  ptrace() rejects unknown requests with -EIO and
      * performs no side effects, so the tracer sees a clean failure. */
-    args->di = -1;
+    if (is_compat)
+        args->bx = -1;
+    else
+        args->di = -1;
     return 0;
 }
 
@@ -1098,6 +1112,7 @@ static long ac_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
         st.active_procs = ac_protected_count();
         st.events_dropped = READ_ONCE(ac_dropped);
         st.locked = atomic_read(&ac_lock_count) > 0 ? 1 : 0;
+        st.syscall_hook_count = READ_ONCE(ac_last_hook_count);
         if (copy_to_user(uarg, &st, sizeof(st)))
             return -EFAULT;
         return 0;
@@ -1195,6 +1210,7 @@ static long ac_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
         ret = ac_check_syscalls(&c);
         if (ret)
             return ret;
+        WRITE_ONCE(ac_last_hook_count, c.hooked);
         if (copy_to_user(uarg, &c, sizeof(c)))
             return -EFAULT;
         return 0;

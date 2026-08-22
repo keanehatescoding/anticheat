@@ -243,7 +243,6 @@ static int do_ioctl(unsigned long req, void *arg)
         st->events_dropped = S.events_dropped_total;
         st->locked = S.locked;
         st->syscall_hook_count = getenv("AC_MOCK_HOOKED") ? 1 : 0;
-        st->hidden_modules = 1;
         return 0;
     }
     case AC_IOCTL_ADD_PROC: {
