@@ -94,6 +94,24 @@ def now_ts():
     return int(time.time())
 
 
+def _requires_auth(keys):
+    """Method decorator for a Handler._handle_*() method: send 401 and
+    skip the wrapped handler if the request's bearer token isn't in
+    `keys`. Structural rather than a copy-pasted `if not self._authed(...)`
+    at the top of each handler, so a new endpoint that forgets this
+    doesn't silently ship unauthenticated."""
+
+    def deco(fn):
+        def wrapper(self, *args, **kwargs):
+            if not self._authed(keys):
+                return self._send_json(401, {"error": "unauthorized"})
+            return fn(self, *args, **kwargs)
+
+        return wrapper
+
+    return deco
+
+
 class Store:
     """One SQLite connection per request (see handler) -- simplest way to
     be correct under ThreadingHTTPServer without sharing a connection
@@ -379,6 +397,19 @@ def make_handler(store, report_keys, admin_keys, rate_limiter, trust_proxy=False
         def _valid_client_id(v):
             return isinstance(v, str) and CLIENT_ID_RE.match(v) is not None
 
+        def _require_body_client_id(self):
+            """Shared by every POST handler below: read+parse the JSON
+            body and pull out a valid client_id, sending the appropriate
+            400 response and returning None if either step fails."""
+            body = self._read_json_body()
+            if not body:
+                self._send_json(400, {"error": "bad request"})
+                return None
+            if not self._valid_client_id(body.get("client_id")):
+                self._send_json(400, {"error": "invalid client_id"})
+                return None
+            return body
+
         def do_POST(self):
             self._dispatch(self._do_POST)
 
@@ -405,18 +436,15 @@ def make_handler(store, report_keys, admin_keys, rate_limiter, trust_proxy=False
                 return self._handle_reports(self.path[len("/reports/"):])
             self._send_json(404, {"error": "not found"})
 
+        @_requires_auth(report_keys)
         def _handle_report(self):
-            if not self._authed(report_keys):
-                return self._send_json(401, {"error": "unauthorized"})
-            body = self._read_json_body()
-            if not body:
-                return self._send_json(400, {"error": "bad request"})
-            client_id = body.get("client_id")
+            body = self._require_body_client_id()
+            if body is None:
+                return
+            client_id = body["client_id"]
             event_type = body.get("event_type")
             detail = body.get("detail")
             client_ts = body.get("ts")
-            if not self._valid_client_id(client_id):
-                return self._send_json(400, {"error": "invalid client_id"})
             if not isinstance(event_type, str) or len(event_type) > 64:
                 return self._send_json(400, {"error": "invalid event_type"})
             if not isinstance(detail, str) or len(detail) > 2000:
@@ -428,43 +456,34 @@ def make_handler(store, report_keys, admin_keys, rate_limiter, trust_proxy=False
             )
             self._send_json(201, {"ok": True})
 
+        @_requires_auth(admin_keys)
         def _handle_ban(self):
-            if not self._authed(admin_keys):
-                return self._send_json(401, {"error": "unauthorized"})
-            body = self._read_json_body()
-            if not body:
-                return self._send_json(400, {"error": "bad request"})
-            client_id = body.get("client_id")
+            body = self._require_body_client_id()
+            if body is None:
+                return
+            client_id = body["client_id"]
             reason = body.get("reason")
-            if not self._valid_client_id(client_id):
-                return self._send_json(400, {"error": "invalid client_id"})
             if not isinstance(reason, str) or not (0 < len(reason) <= 500):
                 return self._send_json(400, {"error": "invalid reason"})
             store.ban(client_id, reason)
             self._send_json(200, {"ok": True})
 
+        @_requires_auth(admin_keys)
         def _handle_unban(self):
-            if not self._authed(admin_keys):
-                return self._send_json(401, {"error": "unauthorized"})
-            body = self._read_json_body()
-            if not body:
-                return self._send_json(400, {"error": "bad request"})
-            client_id = body.get("client_id")
-            if not self._valid_client_id(client_id):
-                return self._send_json(400, {"error": "invalid client_id"})
-            existed = store.unban(client_id)
+            body = self._require_body_client_id()
+            if body is None:
+                return
+            existed = store.unban(body["client_id"])
             self._send_json(200, {"ok": True, "was_banned": existed})
 
+        @_requires_auth(admin_keys)
         def _handle_banned(self, client_id):
-            if not self._authed(admin_keys):
-                return self._send_json(401, {"error": "unauthorized"})
             if not self._valid_client_id(client_id):
                 return self._send_json(400, {"error": "invalid client_id"})
             self._send_json(200, store.ban_status(client_id))
 
+        @_requires_auth(admin_keys)
         def _handle_reports(self, client_id):
-            if not self._authed(admin_keys):
-                return self._send_json(401, {"error": "unauthorized"})
             if not self._valid_client_id(client_id):
                 return self._send_json(400, {"error": "invalid client_id"})
             self._send_json(200, {"reports": store.list_reports(client_id)})
