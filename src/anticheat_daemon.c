@@ -353,7 +353,9 @@ static int hash_proc_mem(int mem_fd, uint64_t start, uint64_t size,
 
         if (want > sizeof(buf))
             want = sizeof(buf);
-        r = pread(mem_fd, buf, want, (off_t)(start + done));
+        do {
+            r = pread(mem_fd, buf, want, (off_t)(start + done));
+        } while (r < 0 && errno == EINTR);
         if (r < 0) {
             /* Part of the range is unreadable (swapped, a hole, or made
              * unreadable on purpose): the digest would silently cover only
@@ -2628,9 +2630,18 @@ static int ac_resolve_timeout(const char *host, const char *port,
     struct timespec deadline;
     clock_gettime(CLOCK_MONOTONIC, &deadline);
     deadline.tv_sec += timeout_sec;
-    for (;;) {
+    /* read()/poll() on this fd can return early on a signal, and a pipe
+     * gives no guarantee that a writer's single write() shows up as a
+     * single reader-side read() -- so accumulate into a byte buffer
+     * until a full record is available instead of assuming one read()
+     * call yields one struct. The loop also stops as soon as `max`
+     * addresses are collected rather than draining every record the
+     * child sends, so a host with more than `max` records doesn't cost
+     * extra poll()/read() round trips just to discard the rest. */
+    unsigned char buf[sizeof(struct ac_resolved_addr)];
+    size_t have = 0;
+    while (n < max) {
         struct pollfd p = { .fd = pfd[0], .events = POLLIN };
-        struct ac_resolved_addr a;
         struct timespec now;
         long remaining_ms;
         ssize_t r;
@@ -2642,11 +2653,14 @@ static int ac_resolve_timeout(const char *host, const char *port,
             break;   /* overall resolve deadline exceeded */
         if (poll(&p, 1, (int)remaining_ms) <= 0)
             break;   /* timed out waiting on the resolver, or poll error */
-        r = read(pfd[0], &a, sizeof(a));
+        r = read(pfd[0], buf + have, sizeof(buf) - have);
         if (r <= 0)
             break;   /* child is done (successfully or not) */
-        if (r == (ssize_t)sizeof(a) && n < max)
-            out[n++] = a;
+        have += (size_t)r;
+        if (have == sizeof(buf)) {
+            memcpy(&out[n++], buf, sizeof(buf));
+            have = 0;
+        }
     }
     close(pfd[0]);
     kill(pid, SIGKILL);

@@ -60,19 +60,19 @@ jobs:
       - name: Verify scripts kept their executable bit
         run: |
           fail=0
-          for f in test.sh server/test_server.sh server/stress_test.sh diag.sh test/mock_test.sh scripts/dkms-install.sh scripts/kasan_boot_test.sh; do
+          while IFS= read -r f; do
             if [ ! -x "$f" ]; then
               echo "::error file=$f::executable bit missing (mode $(stat -c%a "$f"))"
               fail=1
             fi
-          done
+          done < <(git ls-files '*.sh')
           exit "$fail"
 
       - name: Shellcheck the shell scripts
         run: |
           command -v shellcheck >/dev/null 2>&1 || \
             { sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck; }
-          shellcheck test.sh server/test_server.sh server/stress_test.sh diag.sh test/mock_test.sh scripts/dkms-install.sh scripts/kasan_boot_test.sh
+          git ls-files '*.sh' | xargs shellcheck
 
   # --- kernel module: compile smoke test against a pinned modern tree ---
   # The module targets kernels >= 6.12 (uses sized_strscpy, the _noprof

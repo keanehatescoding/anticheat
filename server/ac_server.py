@@ -97,9 +97,10 @@ def now_ts():
 def _requires_auth(keys):
     """Method decorator for a Handler._handle_*() method: send 401 and
     skip the wrapped handler if the request's bearer token isn't in
-    `keys`. Structural rather than a copy-pasted `if not self._authed(...)`
-    at the top of each handler, so a new endpoint that forgets this
-    doesn't silently ship unauthenticated."""
+    `keys`. Centralizes the `if not self._authed(...)` check that would
+    otherwise be copy-pasted at the top of each handler -- but it's still
+    opt-in per handler, not enforced by the dispatch table, so a new
+    endpoint still has to remember to apply this decorator."""
 
     def deco(fn):
         def wrapper(self, *args, **kwargs):
@@ -397,6 +398,15 @@ def make_handler(store, report_keys, admin_keys, rate_limiter, trust_proxy=False
         def _valid_client_id(v):
             return isinstance(v, str) and CLIENT_ID_RE.match(v) is not None
 
+        def _require_valid_client_id(self, v):
+            """Shared by every handler below that takes a client_id
+            (whether from a JSON body or a URL path segment): sends the
+            400 response and returns False if it isn't valid."""
+            if not self._valid_client_id(v):
+                self._send_json(400, {"error": "invalid client_id"})
+                return False
+            return True
+
         def _require_body_client_id(self):
             """Shared by every POST handler below: read+parse the JSON
             body and pull out a valid client_id, sending the appropriate
@@ -405,8 +415,7 @@ def make_handler(store, report_keys, admin_keys, rate_limiter, trust_proxy=False
             if not isinstance(body, dict) or not body:
                 self._send_json(400, {"error": "bad request"})
                 return None
-            if not self._valid_client_id(body.get("client_id")):
-                self._send_json(400, {"error": "invalid client_id"})
+            if not self._require_valid_client_id(body.get("client_id")):
                 return None
             return body
 
@@ -478,14 +487,14 @@ def make_handler(store, report_keys, admin_keys, rate_limiter, trust_proxy=False
 
         @_requires_auth(admin_keys)
         def _handle_banned(self, client_id):
-            if not self._valid_client_id(client_id):
-                return self._send_json(400, {"error": "invalid client_id"})
+            if not self._require_valid_client_id(client_id):
+                return
             self._send_json(200, store.ban_status(client_id))
 
         @_requires_auth(admin_keys)
         def _handle_reports(self, client_id):
-            if not self._valid_client_id(client_id):
-                return self._send_json(400, {"error": "invalid client_id"})
+            if not self._require_valid_client_id(client_id):
+                return
             self._send_json(200, {"reports": store.list_reports(client_id)})
 
     return Handler

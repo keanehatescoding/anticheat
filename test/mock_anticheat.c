@@ -139,6 +139,15 @@ static void read_comm(int pid, char *out, size_t n)
 static struct ac_vma_info *snap;
 static unsigned int snap_n;
 
+/* Mirrors ac_last_hook_count in the real module: only CHECK_SYSCALLS sets
+ * it, and STATUS just reports whatever it was last set to (0 if
+ * CHECK_SYSCALLS has never run). Deriving this straight from
+ * AC_MOCK_HOOKED in the STATUS handler instead would make the mock report
+ * a hook count before any check ever ran -- a real caller that reads
+ * STATUS before triggering a check would never observe that with the
+ * real module. */
+static unsigned int last_hook_count;
+
 static void do_scan(int pid)
 {
     char path[64], line[512];
@@ -242,7 +251,7 @@ static int do_ioctl(unsigned long req, void *arg)
         st->active_procs = S.nprots;
         st->events_dropped = S.events_dropped_total;
         st->locked = S.locked;
-        st->syscall_hook_count = getenv("AC_MOCK_HOOKED") ? 1 : 0;
+        st->syscall_hook_count = last_hook_count;
         return 0;
     }
     case AC_IOCTL_ADD_PROC: {
@@ -341,6 +350,7 @@ static int do_ioctl(unsigned long req, void *arg)
             c->hooked = 0;
             c->ok = 1;
         }
+        last_hook_count = c->hooked;
         return 0;
     }
     case AC_IOCTL_GET_EVENTS: {
