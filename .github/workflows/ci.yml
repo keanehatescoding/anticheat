@@ -50,6 +50,24 @@ jobs:
       - name: RateLimiter bucket-pruning unit test (no root, no network)
         run: python3 server/test_ratelimiter_unit.py
 
+      # A rebase, auto-fix commit, or artifact re-download can silently
+      # drop a script's mode from 100755 to 100644 (this happened to
+      # scripts/kasan_boot_test.sh once, and only surfaced when the
+      # nightly kasan-boot.yml workflow failed trying to exec it). Catch
+      # that regression class here, in the PR that introduces it, rather
+      # than waiting on whichever scheduled workflow happens to invoke
+      # the affected script next.
+      - name: Verify scripts kept their executable bit
+        run: |
+          fail=0
+          for f in test.sh server/test_server.sh server/stress_test.sh diag.sh test/mock_test.sh scripts/dkms-install.sh scripts/kasan_boot_test.sh; do
+            if [ ! -x "$f" ]; then
+              echo "::error file=$f::executable bit missing (mode $(stat -c%a "$f"))"
+              fail=1
+            fi
+          done
+          exit "$fail"
+
       - name: Shellcheck the shell scripts
         run: |
           command -v shellcheck >/dev/null 2>&1 || \
